@@ -884,6 +884,17 @@ static int vk_pick_device(void)
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
+    {   /* GitHub #27: the character shadow masks read their own pixel on AMD by default */
+        static int told;
+        const int how = rsx_fp_set_host_vendor(p.vendorID);
+        if (!told) { told = 1;
+            VK_LOG("RSX_FP_OWNPX: %s\n",
+                   how == 1 ? "on (AMD GPU default: shadow masks c70407ba5c029d1c, 25f427a67ef667f7 read their own pixel; RSX_FP_OWNPX=0 turns it off)"
+                 : how == 2 ? "on (the RSX_FP_OWNPX list set)"
+                 : how == 3 ? "off (RSX_FP_OWNPX=0)"
+                 : how == 0 ? "off (not an AMD GPU)"
+                            : "decided before the device was known"); }
+    }
     return 0;
 }
 
@@ -7351,7 +7362,23 @@ static void vk_eng_image_infos(VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], VkDes
         VkImageView v = h ? vk_eng_sample_view(h) : VK_NULL_HANDLE;
         const int is_cube = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].faces == 6;
         const int is_vol  = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].depth > 1;
-        if ((cube_mask >> u) & 1u) { if (!v || !is_cube) v = vk_eng_dummy_view(0); }
+        if ((cube_mask >> u) & 1u) {
+            if (!v || !is_cube) {
+                /* Reported once per unit and cause (2026-11-14: the lighting
+                 * composite's ambient cube on unit 8 read as this black cube
+                 * leaves every unlit pixel at RGB 0; the draw engine's
+                 * "cube unit ... shares its address" line names the lookup).
+                 * Since v0.5.5 the engine binds the guest cube there; only the
+                 * first case is reported. */
+                static int said;   /* one line a session (v0.5.5: quiet by default) */
+                if (!said) { said = 1;
+                    if (h && v) VK_LOG("engine: unit %u reads a cube but h%u is a %ux%u 2D image: 1x1 black cube instead\n",
+                                       u, h, h < VK_ENG_MAX_OBJ ? s_eobj[h].w : 0u, h < VK_ENG_MAX_OBJ ? s_eobj[h].h : 0u);
+                    else VK_LOG("engine: unit %u reads a cube but %s: 1x1 black cube instead\n",
+                                u, !h ? "no texture is bound" : "the bound texture has no view"); }
+                v = vk_eng_dummy_view(0);
+            }
+        }
         else if ((vol_mask >> u) & 1u) {
             if (v && !is_vol) { static int said; if (said++ < 4)
                 VK_LOG("engine: unit %u reads a volume but a %ux%u 2D texture is bound (compressed volume?): black stand-in\n",

@@ -661,6 +661,117 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
     return units;
 }
 
+/* GitHub #27 (AMD RDNA3, Windows: spots and hatching on characters in the
+ * cutscenes) DIAGNOSTICS, read once before the first program; unset = the
+ * helpers exactly as before (same text, same shader keys).
+ *   RSX_FP_SHADOW_FORCE=lit|dark  every shadow-map compare returns 1.0 (lit)
+ *       or 0.0 (shadowed): gone with lit = the spots come from the shadow
+ *       lookups (their inputs or their sampling), else from elsewhere.
+ *   RSX_FP_SHADOW_FORCE_FP=<hash>[,<hash>...]  only in those programs (the
+ *       structural hashes the engine logs as fp=...; up to 8); also limits
+ *       RSX_FP_SHADOW_BIAS.
+ *   RSX_FP_SHADOW_BIAS=<depth>  every compare's reference moved that far
+ *       (shadow-map depth, 0..1) towards passing (lit): gone with a small
+ *       value = the receiver and the map disagree by a little on that GPU
+ *       (precision), not by a broken fetch or program.
+ *   RSX_FP_SHADOW_FETCH=load  the map's texels read with Load at their
+ *       integer coordinates (clamped to the edge) instead of SampleLevel /
+ *       Gather through the guest's sampler: same taps, same weights, no
+ *       sampler -- gone = the driver's filtered or gathered fetch of the R32F
+ *       map differs from the hardware we test on. */
+static int s_shf_init, s_shf_mode, s_shf_load, s_shf_nfp;
+static float s_shf_bias;
+static u64 s_shf_fp[8];
+static _Thread_local int s_shf_here;   /* this program's force (programs translate on several threads) */
+static _Thread_local int s_shb_here;   /* this program takes RSX_FP_SHADOW_BIAS */
+static void fp_shadow_diag_init(void)
+{
+    int st = __atomic_load_n(&s_shf_init, __ATOMIC_ACQUIRE);
+    if (st == 1) return;
+    int expect = 0;
+    if (st == 0 && __atomic_compare_exchange_n(&s_shf_init, &expect, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const char* e = getenv("RSX_FP_SHADOW_FORCE");
+        s_shf_mode = !e ? 0 : !strcmp(e, "lit") ? 1 : !strcmp(e, "dark") ? 2 : 0;
+        e = getenv("RSX_FP_SHADOW_FETCH");
+        s_shf_load = e && !strcmp(e, "load");
+        e = getenv("RSX_FP_SHADOW_BIAS");
+        s_shf_bias = e ? (float)atof(e) : 0.0f;
+        if (!(s_shf_bias > 0.0f && s_shf_bias < 1.0f)) s_shf_bias = 0.0f;
+        e = getenv("RSX_FP_SHADOW_FORCE_FP");
+        while (e && *e && s_shf_nfp < 8) {
+            char* d; const u64 h = strtoull(e, &d, 16);
+            if (d == e) break;
+            s_shf_fp[s_shf_nfp++] = h;
+            e = *d == ',' ? d + 1 : NULL;
+        }
+        __atomic_store_n(&s_shf_init, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&s_shf_init, __ATOMIC_ACQUIRE) != 1) { }   /* another thread is reading them */
+}
+
+/* RSX_FP_OWNPX=<hash>:<unit>[,<hash>:<unit>...] (GitHub #27): in that
+ * program, TEX / TXP on that unit read the texel at the fragment's own pixel
+ * (Load at SV_POSITION) instead of sampling at the coordinate the program
+ * computed. For the deferred passes that rebuild a position from the depth
+ * buffer's bytes at their own pixel -- inFAMOUS 2's character shadow masks
+ * c70407ba5c029d1c and 25f427a67ef667f7, unit 0, the point-sampled depth copy
+ * on the same pixel grid as their target: on RADV the picture is identical,
+ * and moving their fetch by a fifth of a texel changes it broadly, so those
+ * fetches sit near texel edges, where a GPU's coordinate rounding picks the
+ * neighbour -- a neighbour's depth bytes then misplace the receiver against
+ * the shadow map (the black spots on faces in the cutscenes on RDNA3).
+ * Up to 8 pairs.
+ *
+ * Default (v0.5.5): unset on an AMD device (Vulkan vendorID 0x1002, handed
+ * over by rsx_fp_set_host_vendor before the first program) = FP_OWNPX_AMD;
+ * unset on any other GPU = off (the shaders as before). RSX_FP_OWNPX=0 or
+ * empty = off everywhere. The changed programs' HLSL differs, so their
+ * shader-cache keys (the whole text is hashed) differ too. */
+#define FP_OWNPX_AMD "c70407ba5c029d1c:0,25f427a67ef667f7:0"
+static int s_opx_init, s_opx_n, s_opx_how;   /* how: 0 off, 1 AMD default, 2 the user's list, 3 the user's off */
+static u32 s_opx_vendor;
+static u64 s_opx_fp[8]; static u32 s_opx_unit[8];
+static void fp_ownpx_init(void)
+{
+    int st = __atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE);
+    if (st == 1) return;
+    int expect = 0;
+    if (st == 0 && __atomic_compare_exchange_n(&s_opx_init, &expect, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const char* e = getenv("RSX_FP_OWNPX");
+        if (!e && __atomic_load_n(&s_opx_vendor, __ATOMIC_ACQUIRE) == 0x1002u) { e = FP_OWNPX_AMD; s_opx_how = 1; }
+        while (e && *e && s_opx_n < 8) {
+            char* d; const u64 h = strtoull(e, &d, 16);
+            if (d == e || *d != ':') break;
+            const unsigned long u = strtoul(d + 1, &d, 10);
+            if (u < 16) { s_opx_fp[s_opx_n] = h; s_opx_unit[s_opx_n] = (u32)u; s_opx_n++; }
+            e = *d == ',' ? d + 1 : NULL;
+        }
+        if (s_opx_how != 1) s_opx_how = !getenv("RSX_FP_OWNPX") ? 0 : s_opx_n ? 2 : 3;
+        __atomic_store_n(&s_opx_init, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE) != 1) { }
+}
+
+int rsx_fp_set_host_vendor(u32 vendor_id)
+{
+    const int late = __atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE) != 0;
+    if (!late) __atomic_store_n(&s_opx_vendor, vendor_id, __ATOMIC_RELEASE);
+    fp_ownpx_init();
+    return late ? -1 : s_opx_how;
+}
+
+static u32 fp_ownpx_units(const u8* ucode, u32 max_bytes)
+{
+    fp_ownpx_init();
+    if (!s_opx_n) return 0;
+    const u64 h = rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull);
+    u32 m = 0;
+    for (int k = 0; k < s_opx_n; k++) if (s_opx_fp[k] == h) m |= 1u << s_opx_unit[k];
+    return m;
+}
+
 static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
                               const rsx_fp_shadow_desc* d)
 {
@@ -669,12 +780,20 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
         "reference <= depth", "reference > depth", "reference != depth",
         "reference >= depth", "1.0" };
+    const char* ctext = s_shf_here == 1 ? "1.0" : s_shf_here == 2 ? "0.0" : cmp[d->func];   /* RSX_FP_SHADOW_FORCE */
+    const int load = s_shf_load && !d->grid;   /* RSX_FP_SHADOW_FETCH=load (not with the D24 diagnostic) */
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
         "    float reference = saturate(coordinate.z);\n",
-        unit, cmp[d->func], unit);
+        unit, ctext, unit);
     out_puts(p, text);
+    /* RSX_FP_SHADOW_BIAS: towards passing -- down for < and <=, up for > and >= */
+    if (s_shb_here && s_shf_bias > 0.0f && !d->grid && (d->func == 1 || d->func == 3 || d->func == 4 || d->func == 6)) {
+        snprintf(text, sizeof text, "    reference %s %.9g;\n", (d->func == 1 || d->func == 3) ? "-=" : "+=",
+                 (double)s_shf_bias);
+        out_puts(p, text);
+    }
     /* PS3RECOMP_ENG_SHADOW_D24: the reference and the taps in the map's
      * fixed-point steps (exact integers in a float up to 2^24). */
     const char* grid = d->grid == 2 ? "65535.0" : "16777215.0";
@@ -685,7 +804,7 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     }
     char tq0[32] = "", tq1[48] = "";
     if (d->grid) { snprintf(tq0, sizeof tq0, "floor(saturate("); snprintf(tq1, sizeof tq1, ") * %s + 0.5)", grid); }
-    if (d->linear || d->unnormalized || d->soft) {
+    if (d->linear || d->unnormalized || d->soft || load) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
             "    float2 size = float2(width, height);\n", tex);
         out_puts(p, text);
@@ -701,6 +820,13 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     } else
         out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
                                          "    float2 uv = coordinate.xy;\n");
+    if (load && !d->linear && !d->soft) {   /* RSX_FP_SHADOW_FETCH=load: the texel the point lookup takes */
+        snprintf(text, sizeof text,
+            "    int2 texel = clamp(int2(floor(uv * size)), int2(0, 0), int2(size) - 1);\n"
+            "    return (float4)_rsx_shadow_cmp%u(reference, %s.Load(int3(texel, 0)).r);\n}\n", unit, tex);
+        out_puts(p, text);
+        return;
+    }
     if (!d->linear && !(d->soft && !d->grid)) {
         snprintf(text, sizeof text,
             "    float depth = %s%s.SampleLevel(rsx_samp[%u], uv, 0.0).r%s;\n"
@@ -719,6 +845,19 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
      * addressing is the same as the RSX form's. */
     if (d->soft && !d->grid) {
         const int R = d->soft + 1;
+        /* the 2x2 texels one Gather returns: x (i0,j1), y (i1,j1), z (i1,j0), w (i0,j0) */
+        char gline[640];
+        if (load)   /* RSX_FP_SHADOW_FETCH=load: the same four texels read one by one */
+            snprintf(gline, sizeof gline,
+                "            int2 t0 = int2(base) + int2((int)k0, (int)l0); int2 hi = int2(size) - 1;\n"
+                "            float4 g = float4(%s.Load(int3(clamp(t0 + int2(0, 1), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0 + int2(1, 1), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0 + int2(1, 0), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0, int2(0, 0), hi), 0)).r);\n",
+                tex, tex, tex, tex);
+        else
+            snprintf(gline, sizeof gline,
+                "            float4 g = %s.Gather(rsx_samp[%u], (base + float2(k0, l0) + 1.0) / size);\n", tex, unit);
         snprintf(text, sizeof text,
             "    float2 position = uv * size - 0.5;\n"
             "    float2 base = floor(position); float2 fraction = position - base;\n"
@@ -729,13 +868,13 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
             "        [unroll] for (int gx = 0; gx < %d; gx++) {\n"
             "            float k0 = (float)(2 * gx - %d);\n"
             "            float wx0 = %d.0 - abs(k0 - fraction.x), wx1 = %d.0 - abs(k0 + 1.0 - fraction.x);\n"
-            "            float4 g = %s.Gather(rsx_samp[%u], (base + float2(k0, l0) + 1.0) / size);\n"
+            "%s"
             "            sum += _rsx_shadow_cmp%u(reference, g.w) * (wx0 * wy0) + _rsx_shadow_cmp%u(reference, g.z) * (wx1 * wy0)\n"
             "                 + _rsx_shadow_cmp%u(reference, g.x) * (wx0 * wy1) + _rsx_shadow_cmp%u(reference, g.y) * (wx1 * wy1);\n"
             "        }\n"
             "    }\n"
             "    return (float4)(sum * %.9g);\n}\n",
-            R, R - 1, R, R, R, R - 1, R, R, tex, unit, unit, unit, unit, unit,
+            R, R - 1, R, R, R, R - 1, R, R, gline, unit, unit, unit, unit,
             1.0 / (double)(R * R * R * R));
         out_puts(p, text);
         return;
@@ -743,9 +882,14 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     out_puts(p, "    float2 position = uv * size - 0.5;\n"
         "    float2 base = floor(position); float2 fraction = position - base;\n");
     for (u32 tap = 0; tap < 4; tap++) {
-        snprintf(text, sizeof text,
-            "    float d%u = %s%s.SampleLevel(rsx_samp[%u], (base + float2(%s, %s)) / size, 0.0).r%s;\n",
-            tap, tq0, tex, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5", tq1);
+        if (load)   /* RSX_FP_SHADOW_FETCH=load: the texel at the tap's centre */
+            snprintf(text, sizeof text,
+                "    float d%u = %s.Load(int3(clamp(int2(base) + int2(%d, %d), int2(0, 0), int2(size) - 1), 0)).r;\n",
+                tap, tex, (int)(tap & 1), (int)((tap >> 1) & 1));
+        else
+            snprintf(text, sizeof text,
+                "    float d%u = %s%s.SampleLevel(rsx_samp[%u], (base + float2(%s, %s)) / size, 0.0).r%s;\n",
+                tap, tq0, tex, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5", tq1);
         out_puts(p, text);
         if (d->mode != 2) {
             snprintf(text, sizeof text, "    float c%u = _rsx_shadow_cmp%u(reference, d%u);\n", tap, unit, tap);
@@ -946,6 +1090,7 @@ static int rsx_fp_decompile_internal(
         rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull) == flip_hash;
     u32 dbg_count = 0; int dbg_done = 0;
     if (dbg_here) out_puts(&o, "    float4 _rsx_dbg = (float4)0;\n");
+    const u32 ownpx_mask = fp_ownpx_units(ucode, max_bytes);   /* RSX_FP_OWNPX */
 
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
@@ -1232,6 +1377,11 @@ static int rsx_fp_decompile_internal(
         case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
         case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
+            if ((ownpx_mask >> tex_unit) & 1u) {   /* RSX_FP_OWNPX: the texel at this pixel */
+                snprintf(rhs, sizeof(rhs), tex_sep_mask ? "rsx_tex%u.Load(int3(int2(input.position.xy), 0))"
+                                                        : "rsx_tex[%u].Load(int3(int2(input.position.xy), 0))", tex_unit);
+                break;
+            }
             if (shadow && shadow[tex_unit].enabled) {
                 snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz)", tex_unit, a);
                 break;
@@ -1251,6 +1401,11 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
+            if ((ownpx_mask >> tex_unit) & 1u) {   /* RSX_FP_OWNPX: the texel at this pixel */
+                snprintf(rhs, sizeof(rhs), tex_sep_mask ? "rsx_tex%u.Load(int3(int2(input.position.xy), 0))"
+                                                        : "rsx_tex[%u].Load(int3(int2(input.position.xy), 0))", tex_unit);
+                break;
+            }
             if (shadow && shadow[tex_unit].enabled) {
                 snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
                 break;
@@ -1627,9 +1782,20 @@ static int rsx_fp_decompile_internal(
         "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
         "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+    fp_shadow_diag_init();   /* RSX_FP_SHADOW_FORCE / _FP / RSX_FP_SHADOW_FETCH */
+    s_shf_here = 0; s_shb_here = 0;
+    if ((s_shf_mode || s_shf_bias > 0.0f) && shadow) {
+        int in_list = !s_shf_nfp;
+        if (!in_list) {
+            const u64 h = rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull);
+            for (int k = 0; k < s_shf_nfp; k++) if (s_shf_fp[k] == h) in_list = 1;
+        }
+        if (in_list) { s_shf_here = s_shf_mode; s_shb_here = s_shf_bias > 0.0f; }
+    }
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
+    s_shf_here = 0; s_shb_here = 0;
     if (gamma_units) fp_gamma_helper(&p);
     if (expand_units || bx2_units) fp_expand_helper(&p);
     if (targets == 1) {

@@ -98,6 +98,7 @@ enum ps3_toggle_id {
     PS3T_METAL_ENCODE_THREAD,/* rsx_metal_backend.m: presents encoded on a thread  */
     PS3T_VK_BIAS_RESET,      /* rsx_vulkan_backend.c: depth bias set again after a static-bias pipeline */
     PS3T_ENG_SOFT_BIAS,      /* rsx_draw_engine.c: caster slope offset x the soft-shadow radius */
+    PS3T_ENG_CUBE_GUEST,     /* rsx_draw_engine.c: cube units read guest memory, never a target (default on) */
     PS3T_COUNT
 };
 
@@ -166,6 +167,7 @@ static inline const ps3_toggle_def* ps3_toggle_def_of(int id)
         { "PS3RECOMP_METAL_ENCODE_THREAD", PS3_TK_ATOI, 0 },
         { "PS3RECOMP_VK_BIAS_RESET",    PS3_TK_NOT0, 1 },
         { "PS3RECOMP_ENG_SOFT_BIAS",    PS3_TK_NOT0, 1 },
+        { "PS3RECOMP_ENG_CUBE_GUEST",   PS3_TK_NOT0, 1 },
     };
     return &d[id];
 }

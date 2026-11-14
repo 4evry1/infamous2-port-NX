@@ -123,6 +123,11 @@ static void eng_soft_bias_set(int id, int v) { (void)id; __atomic_store_n(&s_sof
 static int s_shade_backface = -1;
 static void eng_shade_backface_set(int id, int v) { (void)id; __atomic_store_n(&s_shade_backface, v != 0, __ATOMIC_RELAXED); }
 #define ENG_SHADE_BACKFACE_FP 0xf384f111ad5956baull
+/* PS3RECOMP_ENG_CUBE_GUEST (live, after PS3T_ENG_CUBE_GUEST; default on since
+ * v0.5.5, =0 = the old lookup order) and PS3RECOMP_ENG_CUBELOG=1 (read once, diagnostic):
+ * see eng_cube_unit, before sink_bind_textures. */
+static int s_cube_guest = -1;
+static void eng_cube_guest_set(int id, int v) { (void)id; __atomic_store_n(&s_cube_guest, v != 0, __ATOMIC_RELAXED); }
 /* PS3RECOMP_DOF=0 / PS3RECOMP_EDGE_BLUR=0 (live, the PC menu's Graphics
  * page): inFAMOUS 2's depth of field and its screen-edge blur turned off.
  * Unset or 1 = the game's own picture.
@@ -6463,6 +6468,140 @@ static u32 eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs, u3
     return tex_mask | (1u << unit);
 }
 
+/* ---- cube units (2026-11-14, the New Marais dusk report) -------------------
+ * inFAMOUS 2's deferred composite (FP f384f111ad5956ba) takes ALL of its
+ * ambient from an 8x8 A8R8G8B8 cube on unit 8 (local 0x0F2EAF00, linear,
+ * pitch 32, crossbar 0xAA93 -- bytes the title writes, not a render target),
+ * sampled by the normal, times fpc[9].x (1: stencil bit 7, the characters) or
+ * fpc[11].x (0.35: the world); unit 9 is the reflection cube. Without it every
+ * pixel that neither the sun nor a point light reaches is RGB 0 -- a street in
+ * shadow, a facade, Cole's unlit side -- while the lit ones look right.
+ *
+ * sink_bind_textures tries, before the guest texture, a depth buffer, a colour
+ * target, a GPU light or SSAO output at the unit's address. Each of those is a
+ * 2D image, and a TextureCube slot given a 2D image gets the backend's 1x1
+ * black cube (vk_eng_image_infos). A colour target matches at ANY size, and a
+ * target is only forgotten when the 64-slot table is full (a session peaks at
+ * ~27), so a target the title once placed at a cube's address would take that
+ * cube for the rest of the session.
+ *
+ * Each (unit, address, kind) found is reported once with PS3RECOMP_ENG_CUBELOG=1;
+ * without it, only the first one and only with PS3RECOMP_ENG_CUBE_GUEST=0 (the
+ * case that leaves the unit black).
+ * PS3RECOMP_ENG_CUBE_GUEST (live, default on since v0.5.5; =0 = the old order):
+ * a square cube unit reads the cube in guest memory whatever else is at its
+ * address (a 2D image can never serve it). v0.5.4 players saw shadowed streets
+ * go black after a long session: the composite's ambient cube took a target.
+ * PS3RECOMP_ENG_CUBELOG=1: F9 (the playlog MARK; this takes the key from
+ * PS3RECOMP_ENG_HUDLOG_KEY) reports the composite's next draw: per cube unit
+ * the registers, what shares its address, the guest bytes per byte lane
+ * (min/max/mean: is the title's cube itself black?), the handle bound, and the
+ * ambient scales fpc[9]/fpc[11] and sun colour fpc[15] it was handed. */
+static int s_cubelog = -1;     /* -1 unread */
+static int s_cube_armed;       /* F9 seen: report the composite's next draw */
+static int s_cube_rep;         /* this draw reports */
+static const char* const k_cube_kind[] = { "nothing", "colour target", "depth buffer", "GPU light output", "GPU SSAO output" };
+
+/* What else sits at a cube's address: 0 nothing, 1 a colour target (the
+ * newest), 2 a depth buffer, 3 a GPU light output, 4 the GPU SSAO output. */
+static int eng_cube_alias(const rsx_dsp_texture* t, u32* sw, u32* sh, u32* age)
+{
+    *sw = *sh = *age = 0;
+    if (t->location == RSX_LOCATION_MAIN && s_gl.on > 0 && (t->offset == s_gl.diff_off || t->offset == s_gl.spec_off)) return 3;
+    if (t->location == RSX_LOCATION_LOCAL && s_gs.on > 0 && t->offset == s_gs.off) return 4;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].handle && g.zdepths[i].location == t->location && g.zdepths[i].offset == t->offset) {
+            *sw = g.zdepths[i].w; *sh = g.zdepths[i].h; *age = s_surf_clock - g.zdepths[i].stamp;
+            return 2;
+        }
+    if (eng_surface_maybe(t->location, t->offset)) {
+        int best = -1;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == t->location && g.surfaces[i].offset == t->offset &&
+                (best < 0 || g.surfaces[i].stamp > g.surfaces[best].stamp)) best = (int)i;
+        if (best >= 0) {
+            *sw = g.surfaces[best].w; *sh = g.surfaces[best].h; *age = s_surf_clock - g.surfaces[best].stamp;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Once a draw, before its units: the env, the toggle, F9. */
+static void eng_cube_draw_begin(void)
+{
+    if (__builtin_expect(s_cubelog < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_CUBE_GUEST");
+        __atomic_store_n(&s_cube_guest, !(e && *e == '0'), __ATOMIC_RELAXED);   /* default on */
+        ps3_toggle_watch(PS3T_ENG_CUBE_GUEST, eng_cube_guest_set);
+        const char* l = getenv("PS3RECOMP_ENG_CUBELOG");
+        s_cubelog = l && *l && *l != '0';
+        if (s_cubelog) fprintf(stderr, "[cubelog] on: F9 reports the next lighting composite's cube units\n");
+    }
+    s_cube_rep = 0;
+    if (!s_cubelog) return;
+    if (__atomic_load_n(&g_rsx_hudlog_key, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_rsx_hudlog_key, 0, __ATOMIC_RELAXED);
+        s_cube_armed = 1;
+        rsx_logf("[cubelog] F9 at frame %u: the next composite draw (fp %016llx) follows\n",
+                 g.frames, (unsigned long long)ENG_SHADE_BACKFACE_FP);
+    }
+    s_cube_rep = s_cube_armed && eng_current_fp_structural() == ENG_SHADE_BACKFACE_FP;
+}
+
+/* A cube unit's lookup: reports what shares its address; 1 = bind the guest
+ * cube now (PS3RECOMP_ENG_CUBE_GUEST), 0 = the usual lookups. */
+static int eng_cube_unit(u32 u, const rsx_dsp_texture* t)
+{
+    const int square = t->width && t->width == t->height;
+    const int guest = square && __atomic_load_n(&s_cube_guest, __ATOMIC_RELAXED) > 0;
+    static struct { u32 key, gen, zgen; int kind; } m[RSX_BE_MAX_TEXTURES];
+    const u32 key = t->offset ^ (t->location << 31);
+    u32 sw = 0, sh = 0, age = 0;
+    int kind;
+    if (u < RSX_BE_MAX_TEXTURES && !s_cube_rep && m[u].key == key && m[u].gen == s_surf_gen && m[u].zgen == s_dl_zgen) {
+        kind = m[u].kind;
+    } else {
+        kind = eng_cube_alias(t, &sw, &sh, &age);
+        if (u < RSX_BE_MAX_TEXTURES) { m[u].key = key; m[u].gen = s_surf_gen; m[u].zgen = s_dl_zgen; m[u].kind = kind; }
+        static u64 seen[16]; static u32 ns;
+        const u64 sk = ((u64)key << 8) ^ ((u64)u << 3) ^ (u64)kind;
+        u32 i = 0; while (i < ns && seen[i] != sk) i++;
+        /* quiet by default: every new one with PS3RECOMP_ENG_CUBELOG=1, else
+         * one line a session and only when the guest cube is off */
+        if (kind && i == ns && ns < 16 && (s_cubelog > 0 || (!guest && ns == 0))) { seen[ns++] = sk;
+            fprintf(stderr, "[rsx engine] cube unit %u (%u:0x%08X %ux%u fmt 0x%02X, fp %016llx) shares its address with a %s"
+                            " %ux%u (last bound %u target binds ago): %s\n",
+                    u, t->location, t->offset, t->width, t->height, t->format,
+                    (unsigned long long)eng_current_fp_structural(), k_cube_kind[kind], sw, sh, age,
+                    guest ? "PS3RECOMP_ENG_CUBE_GUEST reads the guest cube"
+                          : "the unit is given that 2D image and reads a 1x1 black cube (PS3RECOMP_ENG_CUBE_GUEST=0; unset = the guest cube)");
+        }
+    }
+    if (s_cube_rep) {
+        const u32 span = eng_texture_span(t->format, t->width, t->height, t->mipmaps, t->pitch, 1);
+        const u8* src = span ? eng_guest_ptr(NULL, t->location, t->offset, span) : NULL;
+        u32 mn[4] = { 255, 255, 255, 255 }, mx[4] = { 0, 0, 0, 0 }; double sum[4] = { 0, 0, 0, 0 };
+        for (u32 i = 0; src && i < span; i++) {
+            const u32 v = src[i], l = i & 3u;
+            if (v < mn[l]) mn[l] = v;
+            if (v > mx[l]) mx[l] = v;
+            sum[l] += v;
+        }
+        const double n = span ? span / 4.0 : 1.0;
+        rsx_logf("[cubelog] frame %u unit %u: loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u remap 0x%08X ctl0 0x%08X;"
+                 " at its address: %s %ux%u (%u binds ago); %s\n",
+                 g.frames, u, t->location, t->offset, t->format, t->width, t->height, t->mipmaps, t->pitch, t->remap,
+                 t->control0, k_cube_kind[kind], sw, sh, age,
+                 guest ? "CUBE_GUEST on: guest cube bound" : (kind ? "CUBE_GUEST off: that 2D image is bound" : "guest cube bound"));
+        if (src)
+            rsx_logf("[cubelog]   guest bytes (%u, byte lanes 0..3 in memory order): min %u %u %u %u  max %u %u %u %u  mean %.1f %.1f %.1f %.1f\n",
+                     span, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+        else rsx_logf("[cubelog]   guest bytes: not readable (span %u)\n", span);
+    }
+    return guest;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -6471,6 +6610,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     s_fbf.cand = 0; s_fbf.applied = 0;
     s_tex_volatile = 0;   /* (rnd1) PS3RECOMP_ENG_DELTA: set below by every state-dependent path */
+    eng_cube_draw_begin();   /* PS3RECOMP_ENG_CUBE_GUEST / _CUBELOG */
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
     const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
@@ -6527,6 +6667,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                   fprintf(stderr, "[sign] unit %u signed=0x%X biased=%u fmt 0x%02X %ux%u loc %u off 0x%08X remap 0x%08X filter 0x%08X addr 0x%08X\n",
                           u, t.filter >> 28, (t.wrap >> 12) & 1u, t.format, t.width, t.height, t.location, t.offset, t.remap, t.filter, t.wrap); } } }
 
+        /* A cube unit reads the guest cube straight away (eng_cube_unit;
+         * default since v0.5.5). PS3RECOMP_ENG_CUBE_GUEST=0: the lookups
+         * below, as before. */
+        if (t.cubemap && eng_cube_unit(u, &t)) {
+            textures[u] = eng_texture_slot(t.location, t.offset, t.format, t.width, t.height,
+                                           t.mipmaps, t.pitch, 1, t.remap & 0x1FFFFu, 1u);
+            if (!textures[u]) s_tex_volatile = 1;   /* (rnd1) a failed texture may be made at the next bind */
+            continue;
+        }
         /* A depth-format texture over a depth buffer reads that depth buffer,
          * even when a colour target is bound at the same address too: a
          * depth-only pass (inFAMOUS 2's sun shadow cascades) leaves a dummy
@@ -7575,6 +7724,23 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
                     g.surfaces[targets[0]].offset, g.surfaces[targets[0]].w, g.surfaces[targets[0]].h,
                     (unsigned long long)eng_current_fp_structural(), g.zdepths[zslot].offset);
         }
+    }
+    /* PS3RECOMP_ENG_CUBELOG=1 (eng_cube_unit): the reporting composite draw's
+     * bound handles and the ambient constants it was handed. */
+    if (__builtin_expect(s_cube_rep, 0)) {
+        s_cube_rep = 0; s_cube_armed = 0;
+        const float* k = (const float*)g.fp_cb;
+        const u32 nk = g.fp_constants ? g.fp_constants->count : 0u;
+        char tb[256]; int tp = 0; tb[0] = 0;
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && tp < (int)sizeof tb - 16; u++)
+            if (tex_mask & (1u << u)) tp += snprintf(tb + tp, sizeof tb - (size_t)tp, " u%u=h%u", u, textures[u]);
+        rsx_logf("[cubelog]   bound:%s\n", tb);
+        if (k && nk > 15u)
+            rsx_logf("[cubelog]   ambient scale fpc[9].x %g (stencil bit 7) fpc[11].x %g (world); sun fpc[15] (%g %g %g); fpc[22] (%g %g %g %g)%s\n",
+                     k[9 * 4], k[11 * 4], k[15 * 4], k[15 * 4 + 1], k[15 * 4 + 2],
+                     nk > 22u ? k[22 * 4] : 0.0f, nk > 22u ? k[22 * 4 + 1] : 0.0f, nk > 22u ? k[22 * 4 + 2] : 0.0f,
+                     nk > 22u ? k[22 * 4 + 3] : 0.0f, nk > 22u ? "" : " (fewer than 23 constants)");
+        else rsx_logf("[cubelog]   fragment constants: %u (not the composite's layout)\n", nk);
     }
     /* PS3RECOMP_ENG_HUDLOG=<sec>: DIAGNOSTIC (PS3_ASPECT). Every draw without
      * a depth test into a single target, for the first world frame <sec>

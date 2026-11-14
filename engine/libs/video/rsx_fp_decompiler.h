@@ -176,6 +176,12 @@ void rsx_fp_set_shadow_d24(int mode);
  * The caller re-keys its pipelines (a new desc). */
 void rsx_fp_set_shadow_soft(int level);
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);
+/* The host GPU's PCI vendor ID (Vulkan vendorID), before the first program:
+ * picks RSX_FP_OWNPX's default (GitHub #27: on for AMD 0x1002, off for the
+ * rest). Returns how it went: 0 off (not AMD, unset), 1 on (AMD default),
+ * 2 the user's RSX_FP_OWNPX list, 3 off by the user (RSX_FP_OWNPX=0/empty),
+ * -1 programs were translated before the vendor was known (already decided). */
+int rsx_fp_set_host_vendor(u32 vendor_id);
 int rsx_fp_decompile_buffered_shadow_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const rsx_fp_shadow_desc shadow[16],
