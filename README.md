@@ -31,6 +31,9 @@ No emulator while you play.
 
 ## 🆕 What's new
 
+**v0.5.7**
+- 🐧 **Linux:** installing from a launcher (RecompLauncher and others) no longer stops with "unknown option --prepare" ([#44](../../issues/44)). Nothing changes in the game itself.
+
 **v0.5.6**
 - 🔴 **AMD Radeon RX 7000 / 780M:** a new fix for the flickering black spots on faces in cutscenes ([#27](../../issues/27)): on AMD cards the game's shaders now handle invalid numbers (NaN) the way the PS3 does. Other graphics cards are unchanged. To turn it off, add `PS3RECOMP_AMD_NAN_FIX=0` to `settings.ini`.
 

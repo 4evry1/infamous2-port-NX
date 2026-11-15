@@ -5,6 +5,9 @@
 #   ./setup.sh --setup            build (or rebuild after an update) without playing
 #   ./setup.sh --play [...]       play only (tools/play.sh and its options)
 #   ./setup.sh --disc <folder> [tools/setup.sh options]   say where your game folder is (the one holding PS3_GAME)
+#   ./setup.sh --prepare --disc <folder> [--dry-run]   for launchers (recomplauncher.json, as Setup.exe --prepare):
+#                                 build only, no message boxes, no desktop entry, Setup.exe's exit codes
+#                                 (71 no PS3_GAME, 79 the build failed: play/setup.log); --game = --disc
 # The game is built from YOUR copy, here, once: nothing of the game is in this download. You need RPCS3 with the
 # PS3 firmware and the game's 1.04 update installed (RPCS3: File > Install Firmware / Install Packages).
 # Your game folder is found in RPCS3's game list (games.yml) when you added it there; otherwise you are asked.
@@ -15,9 +18,11 @@ exe="$here/work/port/build/Infamous2Recomp"
 stamp="$here/work/setup-built-from"
 current="$(cat "$here/port-version.txt" 2>/dev/null | tail -n 1)"
 
+prepare=0; dry=0   # --prepare: a launcher's setup step (see the top)
+
 say() { printf '%s\n' "$*"; }
 gui_msg() {   # a message box when there is no terminal (a launcher started us), else the terminal
-    if [ -t 1 ]; then say "$1"; return; fi
+    if [ -t 1 ] || [ $prepare = 1 ]; then say "$1"; return; fi   # --prepare: the launcher shows the exit code's message
     if command -v zenity >/dev/null 2>&1; then zenity --info --title="inFAMOUS 2" --width=520 --text="$1" 2>/dev/null
     elif command -v kdialog >/dev/null 2>&1; then kdialog --title "inFAMOUS 2" --msgbox "$1" 2>/dev/null
     else say "$1"; fi
@@ -71,27 +76,60 @@ build() {
         say "Your game folder: $disc"
         args=(--disc "$disc" "${args[@]}")
     fi
-    mkdir -p "$here/work/logs"
+    mkdir -p "$here/work/logs" "$here/play"
+    local failcode=1; [ $prepare = 1 ] && { failcode=79; args+=(--no-desktop); }
     say "Building inFAMOUS 2 from your copy (once; 15-60 minutes). The log: work/logs/setup.log"
     if ! bash "$here/tools/setup.sh" "${args[@]}" 2>&1 | tee "$here/work/logs/setup.log"; then
+        cp -f "$here/work/logs/setup.log" "$here/play/setup.log" 2>/dev/null   # a launcher's Logs button opens play/
         gui_msg "Setup stopped. The reason is at the end of $here/work/logs/setup.log"
-        exit 1
+        exit $failcode
     fi
-    [ -x "$exe" ] || { gui_msg "Setup finished without the game program. See $here/work/logs/setup.log"; exit 1; }
+    cp -f "$here/work/logs/setup.log" "$here/play/setup.log" 2>/dev/null
+    [ -x "$exe" ] || { gui_msg "Setup finished without the game program. See $here/work/logs/setup.log"; exit $failcode; }
     printf '%s\n' "$current" > "$stamp"
 }
+
+# Launchers start us the way they start Setup.exe on Windows (GitHub #44: "unknown option --prepare"):
+# --prepare anywhere on the line, --game for --disc, --dry-run; --pgo is Windows-only and ignored.
+for a in "$@"; do [ "$a" = "--prepare" ] && prepare=1; done
+if [ $prepare = 1 ]; then
+    rest=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --prepare|--pgo) ;;
+            --dry-run) dry=1 ;;
+            --game) rest+=(--disc) ;;
+            *) rest+=("$1") ;;
+        esac
+        shift
+    done
+    set -- ${rest[@]+"${rest[@]}"}
+    disc=""; prev=""
+    for a in "$@"; do [ "$prev" = "--disc" ] && disc="${a%/}"; prev="$a"; done
+    if [ -z "$disc" ] && [ -f "$here/game/disc/PS3_GAME/PARAM.SFO" ]; then disc="$(readlink -f "$here/game/disc")"; set -- --disc "$disc" "$@"; fi
+    if [ -z "$disc" ] || [ ! -f "$disc/PS3_GAME/PARAM.SFO" ]; then
+        say "No PS3_GAME/PARAM.SFO in the game folder: ${disc:-(none given)}. Pick the folder that holds PS3_GAME."
+        exit 71
+    fi
+    if [ $dry = 1 ]; then say "Dry run: the game folder is $disc. Nothing was built."; exit 0; fi
+    build "$@"
+    say "Done."
+    exit 0
+fi
 
 mode="auto"
 case "${1:-}" in
     --setup) mode="setup"; shift ;;
     --play) mode="play"; shift ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     "") ;;
     *) mode="setup-then-play" ;;   # tools/setup.sh options, e.g. --disc <folder>
 esac
 
 case "$mode" in
-    play) exec bash "$here/tools/play.sh" "$@" ;;
+    play)
+        [ -x "$exe" ] || { say "The game isn't built yet: run ./setup.sh first."; exit 80; }   # Setup.exe --play's code
+        exec bash "$here/tools/play.sh" "$@" ;;
     setup) build "$@"; say "Done. Play with ./setup.sh (or ./setup.sh --play)."; exit 0 ;;
     setup-then-play) build "$@"; exec bash "$here/tools/play.sh" ;;
     auto)
