@@ -48,7 +48,81 @@ bool glslang_ready()
     return true;
 }
 
+/* rsx_spirv_set_nan_preserve / rsx_spirv_set_denorm: see rsx_shader_spirv.h. */
+int g_nan_preserve = 0;
+int g_denorm = 0;      /* 0 none, 1 DenormPreserve, 2 DenormFlushToZero (fp32) */
+
+/* Declare the fp32 float-controls execution modes asked for --
+ * SignedZeroInfNanPreserve (g_nan_preserve) and DenormPreserve or
+ * DenormFlushToZero (g_denorm) -- on every entry point (SPV_KHR_float_controls;
+ * SPIR-V 1.0 needs the extension named). In the module's section order: the
+ * capabilities after the last OpCapability, the extension after them
+ * (OpExtension comes before OpExtInstImport), the execution modes after the
+ * last OpEntryPoint (before any existing OpExecutionMode, which is also
+ * allowed). A mode whose capability the module already has is left alone.
+ * False on a module this does not understand (left as it was). */
+bool add_float_controls(std::vector<unsigned int>& m)
+{
+    enum { OpExtension = 10, OpCapability = 17, OpEntryPoint = 15, OpExecutionMode = 16 };
+    /* capability, execution mode */
+    enum { CapSZINP = 4466, ModeSZINP = 4461, CapDenormPreserve = 4464, ModeDenormPreserve = 4459,
+           CapDenormFTZ = 4465, ModeDenormFTZ = 4460 };
+    unsigned want[2][2]; int nwant = 0;
+    if (g_nan_preserve) { want[nwant][0] = CapSZINP; want[nwant][1] = ModeSZINP; nwant++; }
+    if (g_denorm == 1)  { want[nwant][0] = CapDenormPreserve; want[nwant][1] = ModeDenormPreserve; nwant++; }
+    if (g_denorm == 2)  { want[nwant][0] = CapDenormFTZ; want[nwant][1] = ModeDenormFTZ; nwant++; }
+    if (!nwant) return true;
+    if (m.size() < 5 || m[0] != 0x07230203u) return false;
+    size_t cap_end = 0, ep_end = 0;
+    std::vector<unsigned int> entries;
+    for (size_t i = 5; i < m.size();) {
+        const unsigned op = m[i] & 0xFFFFu, n = m[i] >> 16;
+        if (n == 0 || i + n > m.size()) return false;
+        if (op == OpCapability) {
+            for (int k = 0; k < nwant; k++)
+                if (n >= 2 && m[i + 1] == want[k][0]) want[k][0] = 0;   /* already there */
+            cap_end = i + n;
+        } else if (op == OpEntryPoint) {
+            if (n < 3) return false;
+            entries.push_back(m[i + 2]);
+            ep_end = i + n;
+        } else if (op != OpExtension && op != 11 /* OpExtInstImport */ && op != 14 /* OpMemoryModel */ &&
+                   op != OpExecutionMode) {
+            break;   /* past the module's head */
+        }
+        i += n;
+    }
+    int nadd = 0;
+    for (int k = 0; k < nwant; k++) {
+        if (!want[k][0]) continue;
+        want[nadd][0] = want[k][0]; want[nadd][1] = want[k][1]; nadd++;
+    }
+    if (!nadd) return true;
+    if (!cap_end || !ep_end || entries.empty() || cap_end > ep_end) return false;
+    static const char ext[] = "SPV_KHR_float_controls";          /* 22 chars + NUL: 6 words */
+    std::vector<unsigned int> ext_ins(1 + (sizeof ext + 3) / 4, 0u);
+    ext_ins[0] = ((unsigned)ext_ins.size() << 16) | OpExtension;
+    memcpy(&ext_ins[1], ext, sizeof ext);
+    std::vector<unsigned int> out;
+    out.reserve(m.size() + 2u * (unsigned)nadd + ext_ins.size() + 4u * (unsigned)nadd * entries.size());
+    out.insert(out.end(), m.begin(), m.begin() + (long)cap_end);
+    for (int k = 0; k < nadd; k++) { out.push_back((2u << 16) | OpCapability); out.push_back(want[k][0]); }
+    out.insert(out.end(), ext_ins.begin(), ext_ins.end());
+    out.insert(out.end(), m.begin() + (long)cap_end, m.begin() + (long)ep_end);
+    for (unsigned id : entries)
+        for (int k = 0; k < nadd; k++) {
+            out.push_back((4u << 16) | OpExecutionMode); out.push_back(id);
+            out.push_back(want[k][1]); out.push_back(32u);
+        }
+    out.insert(out.end(), m.begin() + (long)ep_end, m.end());
+    m.swap(out);
+    return true;
+}
+
 } // namespace
+
+extern "C" void rsx_spirv_set_nan_preserve(int on) { g_nan_preserve = on ? 1 : 0; }
+extern "C" void rsx_spirv_set_denorm(int mode) { g_denorm = (mode == 1 || mode == 2) ? mode : 0; }
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
 
@@ -117,6 +191,10 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
     glslang::GlslangToSpv(*program.getIntermediate(lang), spirv, &logger, &opts);
     if (spirv.empty()) {
         put_log(log, log_size, "SPIR-V generation", logger.getAllMessages().c_str());
+        return -1;
+    }
+    if ((g_nan_preserve || g_denorm) && !add_float_controls(spirv)) {
+        put_log(log, log_size, "SPIR-V float controls", "unexpected module head");
         return -1;
     }
     if (spirv.size() > max_words) {
@@ -199,6 +277,9 @@ extern "C" int rsx_glsl_to_spirv(const char* glsl, int stage,
 }
 
 #else /* !PS3RECOMP_HAVE_SPIRV_TRANSLATION */
+
+extern "C" void rsx_spirv_set_nan_preserve(int on) { (void)on; }
+extern "C" void rsx_spirv_set_denorm(int mode) { (void)mode; }
 
 extern "C" int rsx_hlsl_to_spirv_available(void) { return 0; }
 

@@ -31,6 +31,9 @@ No emulator while you play.
 
 ## 🆕 What's new
 
+**v0.5.6**
+- 🔴 **AMD Radeon RX 7000 / 780M:** a new fix for the flickering black spots on faces in cutscenes ([#27](../../issues/27)): on AMD cards the game's shaders now handle invalid numbers (NaN) the way the PS3 does. Other graphics cards are unchanged. To turn it off, add `PS3RECOMP_AMD_NAN_FIX=0` to `settings.ini`.
+
 **v0.5.5**
 - 🌃 **Shadowed streets no longer turn pitch black after a long session.**
 - 🔴 **AMD Radeon RX 7000 / 780M:** a fix for the black spots on faces in cutscenes ([#27](../../issues/27)). To
@@ -291,7 +294,7 @@ runs directly on your CPU, with its graphics drawn through Vulkan.
 |---|---|
 | ✅ Tested copies | Played and confirmed by players: the **Europe** disc (**BCES01143**), the **Turkey** disc (**BCES01229**) and the **US** disc (**BCUS98125**), each with the **1.04** update, and the **digital (PSN)** version 01.03. |
 | 🖥️ Tested PCs | The test PC: i5-13600K, RTX 2070 Super, 32 GB, Windows 11, 1080p to 4K. Players: Windows 10 and 11 PCs, up to an RTX 5070 at 1440p. Linux: Ubuntu 22.04 with an AMD GPU, and the Steam Deck ([#24](../../issues/24)). |
-| ⚠️ Known issues | • Views over a big part of the city (the top of the cathedral spire) are the heaviest: about 83 fps there on the test PC with v0.5.2 (it was 67). On 4- and 6-core CPUs the game's SPU jobs set the pace there.<br>• In one long session (about 90 minutes), a big fight had a few freezes of up to one second; the hitch catcher now records what causes them.<br>• On AMD graphics cards, close-up faces in cutscenes could show black spots ([#27](../../issues/27)): v0.5.5 has a fix. If you still see them, please report it in #27. |
+| ⚠️ Known issues | • Views over a big part of the city (the top of the cathedral spire) are the heaviest: about 83 fps there on the test PC with v0.5.2 (it was 67). On 4- and 6-core CPUs the game's SPU jobs set the pace there.<br>• In one long session (about 90 minutes), a big fight had a few freezes of up to one second; the hitch catcher now records what causes them.<br>• On AMD graphics cards, close-up faces in cutscenes could show black spots ([#27](../../issues/27)): v0.5.6 has a new fix. If you still see them, please report it in #27. |
 
 ## 🧰 What you need
 

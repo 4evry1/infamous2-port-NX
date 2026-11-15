@@ -10121,9 +10121,52 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char* dev_exts[2];
+    const char* dev_exts[3];
     u32 ndext = 0;
     if (s_vk.windowed) dev_exts[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    /* (amdnan) PS3RECOMP_VK_NAN_PRESERVE: the guest programs declare
+     * SignedZeroInfNanPreserve (rsx_shader_spirv.h). Without it a driver may
+     * compile them as if no value were ever NaN or infinite, and the
+     * decompiler's NaN handling -- SAT's flush to 0, MIN/MAX's other operand,
+     * the IEEE compares, NRM's zero guard, the export guards -- and the
+     * game's own NaN filters are then free to vanish or turn around; GitHub
+     * #27: flickering black spots on the cutscene faces on AMD's Windows
+     * driver (RDNA3), not on NVIDIA or RADV. Default (#27): on for an AMD GPU
+     * (vendorID 0x1002), off for every other GPU (their SPIR-V as before);
+     * =0 off, =1 on. Needs VK_KHR_shader_float_controls (before the budget
+     * extension: a failed device creation drops the last one) and the 32-bit
+     * property.
+     * PS3RECOMP_VK_DENORM=preserve|ftz (test switch; unset = the driver's own
+     * choice, on every GPU): every guest program also declares DenormPreserve
+     * (the RSX keeps fp32 denormals, RPCS3 #20078) or DenormFlushToZero (what
+     * NVIDIA does) for fp32, when the device offers it. */
+    int nanp = 0, denorm = 0, nanp_how;   /* how: 0 default off, 1 AMD default, 2 set on, 3 set off */
+    { VkPhysicalDeviceProperties dp;
+      pvkGetPhysicalDeviceProperties(s_vk.phys, &dp);
+      const char* e = getenv("PS3RECOMP_VK_NAN_PRESERVE");
+      const char* all = getenv("PS3RECOMP_AMD_NAN_FIX");   /* =0: every #27 AMD default off */
+      const int amd_fix = dp.vendorID == 0x1002u &&
+                          !(all && (!*all || !strcmp(all, "0") || !strcmp(all, "off")));
+      const int want = e ? (*e && *e != '0') : amd_fix;
+      nanp_how = e ? (want ? 2 : 3) : want;
+      const char* d = getenv("PS3RECOMP_VK_DENORM");
+      const int want_d = !d ? 0 : !strcmp(d, "preserve") ? 1 : !strcmp(d, "ftz") ? 2 : 0;
+      if ((want || want_d) && props2 &&
+          vk_has_device_extension(s_vk.phys, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) {
+          PFN_vkGetPhysicalDeviceProperties2KHR gp2 = (PFN_vkGetPhysicalDeviceProperties2KHR)
+              pvkGetInstanceProcAddr(s_vk.instance, "vkGetPhysicalDeviceProperties2KHR");
+          VkPhysicalDeviceFloatControlsPropertiesKHR fc = {
+              .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR };
+          VkPhysicalDeviceProperties2KHR p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR,
+                                                .pNext = &fc };
+          if (gp2) {
+              gp2(s_vk.phys, &p2);
+              nanp = want && fc.shaderSignedZeroInfNanPreserveFloat32 ? 1 : 0;
+              denorm = want_d == 1 ? (fc.shaderDenormPreserveFloat32 ? 1 : 0)
+                     : want_d == 2 ? (fc.shaderDenormFlushToZeroFloat32 ? 2 : 0) : 0;
+          }
+      }
+      if (nanp || denorm) dev_exts[ndext++] = VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME; }
     /* (lowend) VK_EXT_memory_budget: the heap's use and budget (vk_vram.inc) */
     s_vram.budget_ok = s_vram.props2 && vk_has_device_extension(s_vk.phys, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (s_vram.budget_ok) dev_exts[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
@@ -10157,7 +10200,25 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         dci.ppEnabledExtensionNames = ndext ? dev_exts : NULL;
         dr_ = pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device);
     }
+    if (dr_ != VK_SUCCESS && (nanp || denorm)) {   /* (amdnan) nor over float controls */
+        nanp = denorm = 0;
+        dci.enabledExtensionCount = --ndext;
+        dci.ppEnabledExtensionNames = ndext ? dev_exts : NULL;
+        dr_ = pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device);
+    }
     VK_CHECK(dr_, "vkCreateDevice");
+    rsx_spirv_set_nan_preserve(nanp);
+    rsx_spirv_set_denorm(denorm);
+    {   /* GitHub #27: one startup line for every NaN rule and how it was decided */
+        static const char* const how_txt[4] = { "off", "on (AMD default)", "on (set)", "off (set)" };
+        char fp[192];
+        rsx_fp_nan_rules_describe(fp, sizeof fp);
+        VK_LOG("#27 NaN rules: PS3RECOMP_VK_NAN_PRESERVE %s, PS3RECOMP_VK_DENORM %s, %s"
+               " (=0 turns one off, =1 on; PS3RECOMP_AMD_NAN_FIX=0 = all AMD defaults off)\n",
+               nanp ? how_txt[nanp_how & 3]
+                    : (nanp_how == 1 || nanp_how == 2) ? "off (the driver does not offer it)" : how_txt[nanp_how & 3],
+               denorm == 1 ? "preserve" : denorm == 2 ? "ftz" : "driver default", fp);
+    }
     VK_LOG("GPU memory: %u MB (heap %d)%s\n", vk_vram_device_local_mb(), s_vram.dl_heap,
            s_vram.budget_ok ? ", budget numbers on (VK_EXT_memory_budget)" : ", no budget numbers");
     if (vk_load_device_functions()) return -1;
