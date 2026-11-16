@@ -66,6 +66,9 @@ static uint32_t loader_vscr_default(void)
 #include <unistd.h>
 #endif
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+#ifdef __SWITCH__
+extern "C" int ppu_prof_stamp_on(void);   /* PS3_PROF_STAMP: whether to stamp at all (off on the Switch) */
+#endif
 extern "C" uint32_t g_ps3_sdk_version;    /* sys_process_get_sdk_version */
 extern "C" int32_t  g_ppu_primary_prio;   /* main thread priority (sys_ppu_thread.c) */
 
@@ -3936,7 +3939,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
+#ifdef __SWITCH__
+    { /* PS3_PROF_STAMP (sys_ppu_thread.c): off on the Switch */
+      if (ppu_prof_stamp_on()) ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0))); }
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */

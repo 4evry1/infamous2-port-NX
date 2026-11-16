@@ -1072,6 +1072,25 @@ static void* spu_exec_thread_proc(void* arg)
 #endif
     ps3_host_qos_self(1);   /* PS3_QOS (host_qos.h): the SPUs set the frame rate */
     ps3_host_place_self(PS3_PLACE_SPU);   /* PS3_CPU_PLACE (host_place.h) */
+#ifdef __SWITCH__
+    /* The Horizon layer may give a named SPU thread group its own priority (hz_tls.c, HZ_PRIO_NAMES,
+     * hz-0.41): inFAMOUS 2's "RADG5" group is its sound mixer on its own SPU. */
+    /* hz-0.43: RADG5 turned out to be Bink. Both of the game's SPURS instances name their group
+     * "CellSpursKernelGroup", so the name also gets "/<the title's SPU count>" to tell them apart: the
+     * one-SPU instance runs the relocmod jobs (most likely the Wwise DSP), 78% busy at 59 in run 44.
+     * Either form matches an HZ_PRIO_NAMES entry. */
+    { extern void hz_ppu_thread_named(const char* name) __attribute__((weak));
+      spu_group_t* g = spu_find_group(t->group_id);
+      if (hz_ppu_thread_named && g) {
+          char nm[48];
+          const uint32_t n = g->spurs_base ? g->spurs_base : g->num_threads;
+          snprintf(nm, sizeof nm, "%s/%u", g->name, (unsigned)n);
+          { static _Atomic int shown = 0;
+            if (shown < 24) { shown++; fprintf(stderr, "[hz] SPU thread 0x%X of group \"%s\"\n", (unsigned)t->tid, nm); } }
+          hz_ppu_thread_named(nm);
+          hz_ppu_thread_named(g->name);
+      } }
+#endif
     /* PS3_HOT_QOS=1: on an SPU-bound title these threads are the frame-rate
      * ceiling, and at the default QoS macOS is free to run them on the
      * efficiency cores. Above-normal maps to QOS_CLASS_USER_INTERACTIVE on

@@ -601,12 +601,25 @@ static void draw_pad_input(uint8_t* px, uint32_t row, const IconBox* b, int in)
 {
     Scene sc; sc.n = sc.ns = 0;
     switch (in) {
+#ifdef __SWITCH__
+    /* Local change (Switch build): the console's own pad. Buttons are bound by position, so the
+     * prompt carries the letter printed on that position of a Switch pad: bottom B, right A,
+     * left Y, top X; L / R / ZL / ZR. With the Xbox letters the prompt said "A" for the button
+     * a Switch calls B (console run 5, 2026-11-12). */
+    case 0: g_face(&sc, b, "B", kColA); break;
+    case 1: g_face(&sc, b, "A", kColB); break;
+    case 2: g_face(&sc, b, "Y", kColX); break;
+    case 3: g_face(&sc, b, "X", kColY); break;
+    case 9: case 10: case PIM_PAD_TRIGGER_LEFT: case PIM_PAD_TRIGGER_RIGHT: {
+        const char* l = in == 9 ? "L" : in == 10 ? "R" : in == PIM_PAD_TRIGGER_LEFT ? "ZL" : "ZR";
+#else
     case 0: g_face(&sc, b, "A", kColA); break;
     case 1: g_face(&sc, b, "B", kColB); break;
     case 2: g_face(&sc, b, "X", kColX); break;
     case 3: g_face(&sc, b, "Y", kColY); break;
     case 9: case 10: case PIM_PAD_TRIGGER_LEFT: case PIM_PAD_TRIGGER_RIGHT: {
         const char* l = in == 9 ? "LB" : in == 10 ? "RB" : in == PIM_PAD_TRIGGER_LEFT ? "LT" : "RT";
+#endif
         const int trig = in >= PIM_PAD_TRIGGER_LEFT;
         if (b->kind == K_SHOULDER) g_shoulder(&sc, b, l, trig);
         else {
@@ -1050,9 +1063,15 @@ static void g_dpad_img(Scene* sc, float n, int hi)
 /* SDL controller input `in`'s name (Xbox labels). */
 static const char* pad_label(int in, char* buf, size_t n)
 {
+#ifdef __SWITCH__   /* local change (Switch build): the letters of a Switch pad, by position (see draw_pad_input) */
+    static const char* const names[] = { "B", "A", "Y", "X", "-", "HOME", "+", "LS", "RS", "L", "R",
+                                         "\x01", "\x02", "\x03", "\x04", "CAPT", "P1", "P2", "P3", "P4", "PAD",
+                                         "ZL", "ZR" };
+#else
     static const char* const names[] = { "A", "B", "X", "Y", "VIEW", "HOME", "MENU", "LS", "RS", "LB", "RB",
                                          "\x01", "\x02", "\x03", "\x04", "SHARE", "P1", "P2", "P3", "P4", "PAD",
                                          "LT", "RT" };
+#endif
     if (in >= 0 && in < (int)(sizeof names / sizeof names[0])) snprintf(buf, n, "%s", names[in]);
     else if (in >= PIM_PAD_AXIS_FIRST && in < PIM_PAD_AXIS_FIRST + 4) snprintf(buf, n, "LS");
     else if (in >= PIM_PAD_AXIS_FIRST + 4 && in < PIM_PAD_N_INPUTS) snprintf(buf, n, "RS");

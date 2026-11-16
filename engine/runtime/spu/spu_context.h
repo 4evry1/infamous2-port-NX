@@ -16,6 +16,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>   /* spu_ls_read128 / spu_ls_write128 */
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -340,6 +343,13 @@ typedef struct spu_context {
      * Code lifted with spu_lifter.py --relocatable adds it to every LS
      * address it derives from its own position. */
     uint32_t code_base;
+    /* PS3_SPU_OVL_BOX: the span [res_lo, res_hi) in local store that covers every occupied
+     * resident_code slot (res_hi 0 = none is occupied). A GET that lies wholly outside it cannot
+     * overlap a resident span, which is all spu_overlay_note_get's per-GET slot scan looks for. Kept
+     * by spu_resident_box_update after each change of resident_code (the two places that change it
+     * in spu_channels.c, and the job replay's restore); a box that is too wide is only slower, one
+     * that is too narrow would skip an eviction, so a writer must never leave it narrower. */
+    uint32_t res_lo, res_hi;
 
     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
      * for co-resident tasks. A taskset may hold several tasks that all lift at the
@@ -469,11 +479,17 @@ typedef struct spu_context {
     /* Index + 1 of the MFC slot this context last held (spu_channels.c
      * mfc_for); 0 = none. Checked against the slot's owner on every use. */
     uint32_t mfc_hint;
+    /* hz-0.47: 32-byte entries (naturally: 3 x 4 + 4 x 2 bytes, then an 8-byte pointer), two ways per set
+     * (SPU_IB_CACHE_SIZE / 2 sets). The 40-byte entries straddled cache lines, and one way per pc lost an
+     * entry whenever two hot targets shared an index (console run 52: a third of spu_indirect_branch's
+     * samples on the entry's first load). img/ovl/task/slot fit 16 bits; a resolution with one that does
+     * not is simply not cached. No alignment attribute: contexts come from malloc (16-byte aligned), and
+     * raising the struct's alignment would let the compiler assume more than it gets. */
     struct {
         uint32_t pc, gen, reg_gen;
-        int32_t  img, ovl, task, slot;
+        int16_t  img, ovl, task, slot;
         void (*fn)(struct spu_context*);
-    } ib_cache[SPU_IB_CACHE_SIZE];
+    } ib_cache[SPU_IB_CACHE_SIZE / 2][2];
     /* PS3_SPU_WAKE_DEFER (spu_coherency.c): host wakes a lock-line notifier
      * has queued for this context and not yet issued. The notifier counts one
      * up while it holds a stripe (so the context is still registered), issues
@@ -511,6 +527,19 @@ typedef struct spu_context {
  * ponytail: still a per-title magic id -- the durable fix is residency-aware
  * dispatch (issue #59), which subsumes this. */
 #define SPU_RESOLVER_ONLY_IMAGE_ID   23
+
+/* Recompute res_lo / res_hi (see spu_context) from resident_code. */
+static inline void spu_resident_box_update(spu_context* c)
+{
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (unsigned k = 0; k < SPU_RESIDENT_CODE_SLOTS; ++k) {
+        if (!c->resident_code[k].image_id) continue;
+        const uint32_t b = c->resident_code[k].lsa, e = b + c->resident_code[k].size;
+        if (b < lo) lo = b;
+        if (e > hi) hi = e;
+    }
+    c->res_lo = lo; c->res_hi = hi;
+}
 
 /* ---------------------------------------------------------------------------
  * Initialization
@@ -682,6 +711,10 @@ static inline __attribute__((always_inline)) u128 spu_ls_read128(const spu_conte
     const uint8_t* p = &SPU_LS_BASE(ctx)[lsa];
 #if SPU_LS_VEC
     _mm_storeu_si128((__m128i*)v._u8, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)p)));
+#elif defined(__ARM_NEON)
+    /* One load and one REV32. clang turned the four byte-swapped words below into LD2 + UXTL +
+     * SHLL + ORR + REV64 (Switch build, 739 such loads in the hottest job function alone). */
+    vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));
 #elif SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -766,6 +799,8 @@ static inline __attribute__((always_inline)) void spu_ls_write128(spu_context* c
         spu_ls_write_probe_pre(ctx, lsa, val);
 #if SPU_LS_VEC
     _mm_storeu_si128((__m128i*)p, spu_ls_bswap_words(_mm_loadu_si128((const __m128i*)val._u8)));
+#elif defined(__ARM_NEON)
+    vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));
 #elif SPU_LS_FAST
     uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
     uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);

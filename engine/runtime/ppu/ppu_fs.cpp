@@ -64,6 +64,31 @@ extern "C" const char* ppu_vfs_root = ".";
  * loose files the game falls back to (see the header). */
 #include "ppu_fs_mods.h"
 
+#ifdef __SWITCH__
+/* Everything marked (fs-cheap) below is the Switch build's only: the PC builds keep upstream's code, with
+ * a getenv per call, no disc-path cache and no stat cache. The standard headers come before the getenv
+ * macro, so that nothing they declare is rewritten by it. */
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+/* (fs-cheap, 2026-11-13) The file calls run several getenv() each -- cellFsRead
+ * alone tests five diagnostic variables per read -- and getenv walks the whole
+ * environment with a string compare per entry. On the Switch the game's own
+ * streaming calls cellFsRead/Stat/Fstat hundreds of times a second, and the
+ * Horizon profile put the path code at 1-2% of all busy CPU. Every variable read
+ * here is set before the game starts (environment, env.txt, settings.ini), so
+ * each call site reads it once and keeps the answer. The race on first use is
+ * harmless: both readers store the same pointer. PS3_FS_ENV_LIVE=1 at build time
+ * (-D) restores a getenv per call. */
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(PS3_FS_ENV_LIVE)
+#define getenv(n) (__extension__({ static const char* fs_env_v_; static std::atomic<int> fs_env_d_{0}; \
+    if (!fs_env_d_.load(std::memory_order_acquire)) { fs_env_v_ = ::getenv(n); fs_env_d_.store(1, std::memory_order_release); } \
+    fs_env_v_; }))
+#endif
+#endif   /* __SWITCH__ */
+
 /* CELL_FS return / mode / flag constants. */
 #define CELL_OK              0
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
@@ -170,7 +195,11 @@ static void host_path_mount(char* out, size_t cap, const char* guest)
 /* The host file the guest gets: its translated path, then a language archive
  * swapped for the chosen language's (ppu_fs_lang.h; open and stat agree), or
  * a game mod's file (ppu_fs_mods.h). */
+#ifdef __SWITCH__
+static void host_path_uncached(char* out, size_t cap, const char* guest, bool mods_ok)
+#else
 static void host_path(char* out, size_t cap, const char* guest, bool mods_ok = false)
+#endif
 {
     host_path_mount(out, cap, guest);
     lang_redirect_host(out, cap);
@@ -179,6 +208,48 @@ static void host_path(char* out, size_t cap, const char* guest, bool mods_ok = f
      * user's mod file or the build cache */
     if (mods_ok) gmods::redirect(guest, out, cap);
 }
+
+#ifdef __SWITCH__
+/* (fs-cheap) Disc paths never change while the game runs: the disc is read-only,
+ * and the mount table, language and dev_flash roots are fixed at start. Their
+ * translation, which costs a host stat() for the PS3_GAME fallback (on the Switch
+ * an IPC to the file system each time) plus the language and mods lookups, is
+ * kept per guest path. Not cached: anything off the disc (hdd0 game data and
+ * saves are written by the game), a translation a mod changes (mods can be
+ * installed while the game runs), and paths that do not fit the cache's key.
+ * PS3_FS_PATH_CACHE=0 = translate every time. */
+static int fs_path_cache_on(void)
+{
+    static std::atomic<int> on{-1};
+    int v = on.load(std::memory_order_acquire);
+    if (v < 0) { const char* e = getenv("PS3_FS_PATH_CACHE"); v = !(e && e[0] == '0'); on.store(v, std::memory_order_release); }
+    return v;
+}
+static bool fs_path_is_disc(const char* guest)
+{
+    return strncmp(guest, "/dev_bdvd/", 10) == 0 || strncmp(guest, "/app_home/", 10) == 0;
+}
+static std::mutex s_path_cache_mx;
+static std::unordered_map<std::string, std::string> s_path_cache;   /* key: mods_ok flag + guest path */
+static void host_path(char* out, size_t cap, const char* guest, bool mods_ok = false)
+{
+    if (!fs_path_cache_on() || !fs_path_is_disc(guest)) { host_path_uncached(out, cap, guest, mods_ok); return; }
+    std::string key;
+    key.reserve(strlen(guest) + 1);
+    key.push_back(mods_ok ? '1' : '0');
+    key += guest;
+    {
+        std::lock_guard<std::mutex> lk(s_path_cache_mx);
+        auto it = s_path_cache.find(key);
+        if (it != s_path_cache.end() && it->second.size() < cap) { memcpy(out, it->second.c_str(), it->second.size() + 1); return; }
+    }
+    host_path_uncached(out, cap, guest, mods_ok);
+    /* a translation a mod serves is left uncached: the mod set can change */
+    if (mods_ok) { gmods::init(); if (gmods::g.nserve.load(std::memory_order_acquire)) return; }
+    std::lock_guard<std::mutex> lk(s_path_cache_mx);
+    if (s_path_cache.size() < 16384) s_path_cache.emplace(std::move(key), std::string(out));
+}
+#endif   /* __SWITCH__: (fs-cheap) disc-path cache */
 
 /* ---- fd / dir handle tables ---- */
 #include "ps3emu/ps3_limits.h"   /* PS3RECOMP_LIMITS: runtime gauges */
@@ -634,7 +705,34 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath, true);   /* the size of what a read-only open gets */
     struct stat st;
+#ifdef __SWITCH__
+    /* (fs-cheap) A disc file's stat never changes: answer repeats from memory
+     * (the game stats the same archives again and again while it streams).
+     * Only for disc paths whose translation is cached above, so a mod-served
+     * file is always stat'ed for real. PS3_FS_PATH_CACHE=0 = stat every time. */
+    static std::mutex s_stat_mx;
+    static std::unordered_map<std::string, std::pair<int, struct stat>> s_stat_cache;
+    const bool disc = fs_path_cache_on() && fs_path_is_disc(gpath);
+    int st_rc = -1;
+    bool from_cache = false;
+    if (disc) {
+        std::lock_guard<std::mutex> lk(s_stat_mx);
+        auto it = s_stat_cache.find(hpath);
+        if (it != s_stat_cache.end()) { st_rc = it->second.first; st = it->second.second; from_cache = true; }
+    }
+    if (!from_cache) {
+        st_rc = stat(hpath, &st);
+        if (disc) {
+            bool mods_serve = false;
+            { gmods::init(); mods_serve = gmods::g.nserve.load(std::memory_order_acquire) != 0; }
+            std::lock_guard<std::mutex> lk(s_stat_mx);
+            if (!mods_serve && s_stat_cache.size() < 16384) s_stat_cache.emplace(std::string(hpath), std::make_pair(st_rc, st));
+        }
+    }
+    if (st_rc != 0) {
+#else
     if (stat(hpath, &st) != 0) {
+#endif
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }

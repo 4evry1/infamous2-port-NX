@@ -159,6 +159,10 @@ static int find_free_slot(void)
     return -1;
 }
 
+#ifdef __SWITCH__
+extern void hz_ppu_thread_named(const char* name) __attribute__((weak));
+#endif
+
 /* Find thread by ID. The ID is the index + 1 (0 is invalid). */
 static ppu_thread_info* find_thread(uint64_t thread_id)
 {
@@ -193,6 +197,11 @@ static void* ppu_host_thread_proc(void* param)
      * USER_INITIATED. */
     ps3_host_qos_self(info->priority < PS3_HOST_QOS_PPU_INTERACTIVE_BELOW);
     ps3_host_place_self(PS3_PLACE_PPU);   /* PS3_CPU_PLACE (host_place.h) */
+#ifdef __SWITCH__
+    /* The Horizon layer may give a named guest thread its own priority (hz_tls.c,
+     * HZ_PRIO_NAMES; the Wwise audio thread "AK::EventManager" by default). */
+    if (hz_ppu_thread_named) hz_ppu_thread_named(info->name);
+#endif
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -425,6 +434,22 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
       *cia = pp ? pp : (unsigned)t->ctx.cia; }
     *name = t->name;
     return 1;
+}
+
+/* Whether the lv2/HLE dispatchers stamp the callsite at all. On the Switch the stamp's host-RA ->
+ * guest resolve (a binary search over every lifted function) on every syscall and HLE call was
+ * about 0.5% of busy CPU (console run 31, ppu_prof_resolve_host), for a breadcrumb only the
+ * engine's own sampling profiler and two stall reports read. PS3_PROF_STAMP=1 turns it back on
+ * there; everywhere else it stays always on, as before. */
+int ppu_prof_stamp_on(void)
+{
+#ifdef __SWITCH__
+    static int on = -1;
+    if (__builtin_expect(on < 0, 0)) { const char* e = getenv("PS3_PROF_STAMP"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on;
+#else
+    return 1;
+#endif
 }
 
 /* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */

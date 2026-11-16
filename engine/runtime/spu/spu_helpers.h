@@ -139,6 +139,33 @@ SPU__ONCE volatile long long g_spu_rz_ops = 0, g_spu_rz_bad = 0;   /* -DSPU_FLOA
 #else
 #define SPU_X64_MXCSR 0
 #endif
+/* SPU_FLOAT_RZ on arm64 (the x86 mode's twin, added for the Switch build where a gameplay
+ * profile had over half of all busy time in lifted SPU code built on the ~35-operation lean
+ * forms): while SPU code runs, FPCR is at round toward zero with flush-to-zero. On AArch64 FZ
+ * covers both sides -- a denormal operand reads as zero and a result below 2^-126 becomes zero --
+ * and Advanced SIMD honours FPCR, so that mode is the SPU's single precision exactly as
+ * MXCSR's RZ + FTZ + DAZ is. g_spu_float_rz says the mode is in use; a lifted TU built with
+ * SPU_FLOAT_RZ_ONLY has the native forms only, any other TU asks FPCR itself per operation
+ * (the interpreter and a synchronous run on a PPU thread stay right either way). */
+#if defined(__aarch64__)
+#define SPU_A64_FPCR 1
+#define SPU_FPCR_RZFZ 0x01C00000ull     /* FZ (bit 24) | RMode = toward zero (bits 23:22) */
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((weak)) int g_spu_float_rz = 0;
+#ifdef __cplusplus
+}
+#endif
+static inline __attribute__((always_inline)) uint64_t spu__fpcr_get(void) {
+    uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v;
+}
+static inline __attribute__((always_inline)) void spu__fpcr_set(uint64_t v) {
+    __asm__ volatile("msr fpcr, %0" : : "r"(v));
+}
+#else
+#define SPU_A64_FPCR 0
+#endif
 
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 #include <arm_neon.h>
@@ -1027,9 +1054,7 @@ SPU__NV_INLINE u128 spu__ln_fa(u128 a, u128 b, uint32_t negb) {
                                       vtstq_u32(eu, vdupq_n_u32(0x7FFFFFFFu)));
     return spu__nv_u128(spu__ln_flush(vaddq_u32(su, away)));
 }
-SPU__NV_INLINE u128 spu_fa_lean(u128 a, u128 b) { return spu__ln_fa(a, b, 0); }
-SPU__NV_INLINE u128 spu_fs_lean(u128 a, u128 b) { return spu__ln_fa(a, b, 0x80000000u); }
-SPU__NV_INLINE u128 spu_fm_lean(u128 a, u128 b) {
+SPU__NV_INLINE u128 spu__ln_fm(u128 a, u128 b) {
     const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
     const uint32x4_t x = spu__ln_flush(xa), y = spu__ln_flush(yb);
     const float64x2_t lo = vmulq_f64(spu__nv_lo(x), spu__nv_lo(y)), hi = vmulq_f64(spu__nv_hi(x), spu__nv_hi(y));
@@ -1054,9 +1079,66 @@ SPU__NV_INLINE u128 spu__ln_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t 
     const float64x2_t ehi = vaddq_f64(vsubq_f64(phi, vsubq_f64(shi, bhi)), vsubq_f64(zhi, bhi));
     return spu__nv_u128(spu__ln_narrow(spu__ln_toward0(slo, elo), spu__ln_toward0(shi, ehi)));
 }
-SPU__NV_INLINE u128 spu_fma_lean(u128 a, u128 b, u128 c)  { return spu__ln_fma(a, b, c, 0, 0); }
-SPU__NV_INLINE u128 spu_fms_lean(u128 a, u128 b, u128 c)  { return spu__ln_fma(a, b, c, 0, 0x80000000u); }
-SPU__NV_INLINE u128 spu_fnms_lean(u128 a, u128 b, u128 c) { return spu__ln_fma(a, b, c, 0x80000000u, 0); }
+#if SPU_A64_FPCR
+/* ---- SPU_FLOAT_RZ (arm64): the same ops native, under FPCR round toward zero + FZ ----
+ * The x86 forms' twins (spu__xrz_*, whose comment is the argument): the host op truncates, FZ
+ * reads an exponent-0 operand as zero and turns a result below 2^-126 into zero, FMLA is one
+ * truncation of the exact a*b + c. What remains is the +0 rule (spu__ln_flush on the result) and
+ * the extended range: a lane whose result is not below FLT_MAX in magnitude (FLT_MAX itself,
+ * Inf, NaN -- any exponent-255 operand ends there) is redone on the exact integer lanes, which
+ * do not read FPCR. The empty asm on one operand keeps the compiler from doing a constant
+ * operation at compile time, where it would round to nearest. */
+#if defined(SPU_FLOAT_RZ_ONLY) && SPU_FLOAT_RZ_ONLY
+#define SPU__ARZ_ON 1
+static __attribute__((constructor, used)) void spu__lifted_flag_rz(void) { g_spu_lifted_flags |= 2; }
+#else
+#define SPU__ARZ_ON ((spu__fpcr_get() & SPU_FPCR_RZFZ) == SPU_FPCR_RZFZ)
+#endif
+SPU__NV_INLINE int spu__arz_ok(uint32x4_t s) {
+    return vmaxvq_u32(vandq_u32(s, vdupq_n_u32(0x7FFFFFFFu))) < 0x7F7FFFFFu;
+}
+SPU__NV_INLINE u128 spu__arz_fa(u128 a, u128 b, uint32_t negb) {
+    const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
+    float32x4_t x = vreinterpretq_f32_u32(xa);
+    const float32x4_t y = vreinterpretq_f32_u32(veorq_u32(yb, vdupq_n_u32(negb)));
+    __asm__("" : "+w"(x));
+    const uint32x4_t s = vreinterpretq_u32_f32(vaddq_f32(x, y));
+    if (__builtin_expect(!spu__arz_ok(s), 0)) return spu__nv_u128(spu__ln_fa_slow(xa, yb, negb));
+    return spu__nv_u128(spu__ln_flush(s));
+}
+SPU__NV_INLINE u128 spu__arz_fm(u128 a, u128 b) {
+    const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32);
+    float32x4_t x = vreinterpretq_f32_u32(xa);
+    __asm__("" : "+w"(x));
+    const uint32x4_t s = vreinterpretq_u32_f32(vmulq_f32(x, vreinterpretq_f32_u32(yb)));
+    if (__builtin_expect(!spu__arz_ok(s), 0)) return spu__nv_u128(spu__ln_fm_slow(xa, yb));
+    return spu__nv_u128(spu__ln_flush(s));
+}
+SPU__NV_INLINE u128 spu__arz_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    const uint32x4_t xa = vld1q_u32(a._u32), yb = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
+    float32x4_t x = vreinterpretq_f32_u32(veorq_u32(xa, vdupq_n_u32(negp)));
+    const float32x4_t z = vreinterpretq_f32_u32(veorq_u32(zc, vdupq_n_u32(negc)));
+    __asm__("" : "+w"(x));
+    const uint32x4_t s = vreinterpretq_u32_f32(vfmaq_f32(z, x, vreinterpretq_f32_u32(yb)));
+    if (__builtin_expect(!spu__arz_ok(s), 0)) return spu__nv_u128(spu__ln_fma_slow(xa, yb, zc, negp, negc));
+    return spu__nv_u128(spu__ln_flush(s));
+}
+#else
+#define SPU__ARZ_ON 0
+#define spu__arz_fa(a, b, negb) spu__ln_fa(a, b, negb)
+#define spu__arz_fm(a, b) spu__ln_fm(a, b)
+#define spu__arz_fma(a, b, c, np, nc) spu__ln_fma(a, b, c, np, nc)
+#endif
+SPU__NV_INLINE u128 spu_fa_lean(u128 a, u128 b) { return SPU__ARZ_ON ? spu__arz_fa(a, b, 0) : spu__ln_fa(a, b, 0); }
+SPU__NV_INLINE u128 spu_fs_lean(u128 a, u128 b) {
+    return SPU__ARZ_ON ? spu__arz_fa(a, b, 0x80000000u) : spu__ln_fa(a, b, 0x80000000u); }
+SPU__NV_INLINE u128 spu_fm_lean(u128 a, u128 b) { return SPU__ARZ_ON ? spu__arz_fm(a, b) : spu__ln_fm(a, b); }
+SPU__NV_INLINE u128 spu_fma_lean(u128 a, u128 b, u128 c)  {
+    return SPU__ARZ_ON ? spu__arz_fma(a, b, c, 0, 0) : spu__ln_fma(a, b, c, 0, 0); }
+SPU__NV_INLINE u128 spu_fms_lean(u128 a, u128 b, u128 c)  {
+    return SPU__ARZ_ON ? spu__arz_fma(a, b, c, 0, 0x80000000u) : spu__ln_fma(a, b, c, 0, 0x80000000u); }
+SPU__NV_INLINE u128 spu_fnms_lean(u128 a, u128 b, u128 c) {
+    return SPU__ARZ_ON ? spu__arz_fma(a, b, c, 0x80000000u, 0) : spu__ln_fma(a, b, c, 0x80000000u, 0); }
 SPU__NV_INLINE int32x4_t spu__ln_key(uint32x4_t x) {
     const uint32x4_t f = spu__ln_flush(x);
     return vreinterpretq_s32_u32(veorq_u32(f, vshrq_n_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(f), 31)), 1)));
@@ -1298,6 +1380,18 @@ SPU__X_INLINE u128 spu_fcmeq_lean(u128 a, u128 b) { return spu__xs(_mm_cmpeq_epi
 #define spu_fcmeq_lean spu_fcmeq
 #define spu_fcmgt_lean spu_fcmgt
 #endif
+/* arm64: the older vector forms (spu_fa .. spu_fnms, what the interpreter and a lift without
+ * lean floats call) assume the default FPCR and have no native twin, so under SPU_FLOAT_RZ they
+ * would round wrongly. From here on those names are the lean forms -- the same bits in the
+ * default mode, and they follow FPCR. -DSPU_NO_RZ_ALIAS keeps the old forms (their tests). */
+#if SPU_A64_FPCR && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_NO_RZ_ALIAS)
+#define spu_fa   spu_fa_lean
+#define spu_fs   spu_fs_lean
+#define spu_fm   spu_fm_lean
+#define spu_fma  spu_fma_lean
+#define spu_fms  spu_fms_lean
+#define spu_fnms spu_fnms_lean
+#endif
 
 /* cflts / cfltu: value * 2^(173 - i8), truncated toward zero, saturating to the integer range.
  * csflt / cuflt: integer / 2^(155 - i8) as an extended-range single (truncated). The ISA leaves
@@ -1460,6 +1554,41 @@ SPU__X_INLINE u128 spu__xcg_cuflt(u128 a, int i8) {
 #endif
 #endif
 
+/* SPU_A64_CVT (hz-0.32; default 1, -DSPU_A64_CVT=0 = the scalar lanes): csflt / cuflt in four lanes on
+ * arm64 (the Switch), the twin of SPU_CG_CVT above for FPCR round toward zero (SPU__ARZ_ON). The
+ * scalar lanes were 0.5% of all busy CPU on the console (run 34, spu_csflt, not inlined). Same
+ * argument as the x86 form: SCVTF / UCVTF under round toward zero keep the top 24 bits of |v| (UCVTF
+ * takes the whole unsigned range, so cuflt needs no 2^31 split), the 2^-scale is exact in the
+ * exponent field, and a lane whose exponent is not above the scale is the SPU's 0. */
+#if SPU_A64_FPCR && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+#ifndef SPU_A64_CVT
+#define SPU_A64_CVT 1
+#endif
+#if SPU_A64_CVT
+SPU__NV_INLINE u128 spu__acv_scale(uint32x4_t fb, int scale) {
+    const uint32x4_t s23 = vdupq_n_u32((uint32_t)scale << 23);
+    const uint32x4_t keep = vcgtq_u32(vandq_u32(fb, vdupq_n_u32(0x7F800000u)), s23);
+    u128 r; vst1q_u32(r._u32, vandq_u32(vsubq_u32(fb, s23), keep)); return r;
+}
+SPU__NV_INLINE u128 spu__acv_csflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (!SPU__ARZ_ON || scale < 0) return (spu_csflt)(a, i8);
+    int32x4_t v = vld1q_s32(a._s32);
+    __asm__("" : "+w"(v));
+    return spu__acv_scale(vreinterpretq_u32_f32(vcvtq_f32_s32(v)), scale);
+}
+SPU__NV_INLINE u128 spu__acv_cuflt(u128 a, int i8) {
+    const int scale = 155 - (i8 & 0xFF);
+    if (!SPU__ARZ_ON || scale < 0) return (spu_cuflt)(a, i8);
+    uint32x4_t v = vld1q_u32(a._u32);
+    __asm__("" : "+w"(v));
+    return spu__acv_scale(vreinterpretq_u32_f32(vcvtq_f32_u32(v)), scale);
+}
+#define spu_csflt(...) spu__acv_csflt(__VA_ARGS__)
+#define spu_cuflt(...) spu__acv_cuflt(__VA_ARGS__)
+#endif
+#endif
+
 /* ---- speculative float regions (spu_lifter.py SPU_LIFT_SPEC_FLOAT, spu-cg 2026-11-10) ----
  * The lifter runs a straight run of register statements holding two or more of the checked
  * float ops below (fa fs fm fma fms fnms cflts cfltu) once with the checks deferred: each op is
@@ -1559,6 +1688,80 @@ SPU__X_INLINE u128 spu_cfltu_spec(u128 a, int i8, spu_spec_acc* acc) {
     const __m128i x = spu__xl(a), e = _mm_and_si128(x, _mm_set1_epi32(0x7F800000));
     *acc = _mm_max_epu32(*acc, e);
     return spu__xs(spu__xcfltu_core(x, scale, _mm_cmpeq_epi32(e, _mm_setzero_si128())));
+}
+#elif SPU_A64_FPCR && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* arm64 twin of the x86 block above, for SPU_FLOAT_RZ on arm64: the same accumulator (unsigned
+ * max of |raw result|, or of a cflts/cfltu operand's exponent bits), the same verdict
+ * (anything above 0x7F7FFFFE in a lane = that op's per-op form would have left its fast path),
+ * the same full exponent-0 flush on every result. Without it every checked float op in a run
+ * paid UMAXV + FMOV + CMP + branch (Switch profile, run 10). */
+typedef uint32x4_t spu_spec_acc;
+#define SPU_SPEC_INIT() vdupq_n_u32(0)
+#define SPU_SPEC_OK(acc) (vmaxvq_u32(acc) <= 0x7F7FFFFEu)
+__attribute__((weak)) int g_spu_spec_cap = 64;
+static __attribute__((constructor, used)) void spu__spec_cap_init(void) {
+    const char* e = getenv("PS3_SPU_SPEC");
+    if (e && *e) { const int v = atoi(e); g_spu_spec_cap = v < 0 ? 0 : v > 255 ? 255 : v; }
+}
+SPU__NV_INLINE u128 spu_gpr_vld(const spu_context* ctx, int n) {
+    u128 r; vst1q_u8(r._u8, vld1q_u8((const uint8_t*)(const volatile void*)&ctx->gpr[n])); return r;
+}
+#define SPU_GPR_VLD(ctx, n) spu_gpr_vld((ctx), (n))
+typedef u128 spu_spec_sv;
+#define SPU_SPEC_SAVE(ctx, n) ((ctx)->gpr[n])
+#define spu_spec_restore(p) (*(const u128*)(const void*)(p))
+SPU__NV_INLINE uint32x4_t spu__asp_out(uint32x4_t s, spu_spec_acc* acc) {
+    *acc = vmaxq_u32(*acc, vandq_u32(s, vdupq_n_u32(0x7FFFFFFFu)));
+    return spu__ln_flush(s);
+}
+SPU__NV_INLINE u128 spu__asp_fa(u128 a, u128 b, uint32_t negb, spu_spec_acc* acc) {
+    float32x4_t x = vreinterpretq_f32_u32(vld1q_u32(a._u32));
+    const float32x4_t y = vreinterpretq_f32_u32(veorq_u32(vld1q_u32(b._u32), vdupq_n_u32(negb)));
+    __asm__("" : "+w"(x));
+    return spu__nv_u128(spu__asp_out(vreinterpretq_u32_f32(vaddq_f32(x, y)), acc));
+}
+SPU__NV_INLINE u128 spu__asp_fm(u128 a, u128 b, spu_spec_acc* acc) {
+    float32x4_t x = vreinterpretq_f32_u32(vld1q_u32(a._u32));
+    __asm__("" : "+w"(x));
+    return spu__nv_u128(spu__asp_out(vreinterpretq_u32_f32(vmulq_f32(x, vreinterpretq_f32_u32(vld1q_u32(b._u32)))), acc));
+}
+SPU__NV_INLINE u128 spu__asp_fma(u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc, spu_spec_acc* acc) {
+    float32x4_t x = vreinterpretq_f32_u32(veorq_u32(vld1q_u32(a._u32), vdupq_n_u32(negp)));
+    const float32x4_t z = vreinterpretq_f32_u32(veorq_u32(vld1q_u32(c._u32), vdupq_n_u32(negc)));
+    __asm__("" : "+w"(x));
+    return spu__nv_u128(spu__asp_out(vreinterpretq_u32_f32(vfmaq_f32(z, x, vreinterpretq_f32_u32(vld1q_u32(b._u32)))), acc));
+}
+/* not under FPCR round toward zero (a TU without SPU_FLOAT_RZ_ONLY, run in the default mode):
+ * the per-op form, exact, the accumulator untouched */
+SPU__NV_INLINE u128 spu_fa_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fa(a, b, 0, acc) : spu_fa_lean(a, b); }
+SPU__NV_INLINE u128 spu_fs_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fa(a, b, 0x80000000u, acc) : spu_fs_lean(a, b); }
+SPU__NV_INLINE u128 spu_fm_spec(u128 a, u128 b, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fm(a, b, acc) : spu_fm_lean(a, b); }
+SPU__NV_INLINE u128 spu_fma_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fma(a, b, c, 0, 0, acc) : spu_fma_lean(a, b, c); }
+SPU__NV_INLINE u128 spu_fms_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fma(a, b, c, 0, 0x80000000u, acc) : spu_fms_lean(a, b, c); }
+SPU__NV_INLINE u128 spu_fnms_spec(u128 a, u128 b, u128 c, spu_spec_acc* acc) {
+    return SPU__ARZ_ON ? spu__asp_fma(a, b, c, 0x80000000u, 0, acc) : spu_fnms_lean(a, b, c); }
+/* cflts/cfltu: spu__cfl_fast_ok's verdict (a lane with exponent 255) as exponent bits; the fast
+ * form's result elsewhere (it does not depend on the rounding mode: the scale is exact) */
+SPU__NV_INLINE u128 spu_cflts_spec(u128 a, int i8, spu_spec_acc* acc) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cflts(a, i8);
+    const uint32x4_t x = vld1q_u32(a._u32), e = vandq_u32(x, vdupq_n_u32(0x7F800000u));
+    *acc = vmaxq_u32(*acc, e);
+    const float32x4_t f = vmulq_f32(vreinterpretq_f32_u32(x), vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(127 + scale) << 23)));
+    return spu__nv_u128(vbicq_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(f)), vceqzq_u32(e)));
+}
+SPU__NV_INLINE u128 spu_cfltu_spec(u128 a, int i8, spu_spec_acc* acc) {
+    const int scale = 173 - (i8 & 0xFF);
+    if (scale < 0 || scale > 127) return spu_cfltu(a, i8);
+    const uint32x4_t x = vld1q_u32(a._u32), e = vandq_u32(x, vdupq_n_u32(0x7F800000u));
+    *acc = vmaxq_u32(*acc, e);
+    const float32x4_t f = vmulq_f32(vreinterpretq_f32_u32(x), vreinterpretq_f32_u32(vdupq_n_u32((uint32_t)(127 + scale) << 23)));
+    return spu__nv_u128(vbicq_u32(vcvtq_u32_f32(f), vceqzq_u32(e)));
 }
 #else
 /* no speculation (non-x86, scalar helpers, the RZ check build): the per-op forms, exact */
@@ -1693,6 +1896,15 @@ static inline uint64_t spu__d_out(double d) {
         if (!(m_ & SPU_MXCSR_RZFZ)) return f##_h_ args; \
         _mm_setcsr(m_ & ~SPU_MXCSR_RZFZ); fences; ret r_ = f##_h_ args; \
         __asm__ volatile("" : "+m"(r_)); _mm_setcsr(m_); return r_; }
+#elif SPU_A64_FPCR
+/* arm64 twin: FPCR back to round to nearest without FZ around the op (msr fpcr is a barrier the
+ * compiler cannot move arithmetic across only with the operands and the result pinned too). */
+#define SPU__DP_RN(ret, f, params, args, fences) \
+    static inline ret f params { \
+        const uint64_t m_ = spu__fpcr_get(); \
+        if (__builtin_expect(!(m_ & SPU_FPCR_RZFZ), 1)) return f##_h_ args; \
+        spu__fpcr_set(m_ & ~SPU_FPCR_RZFZ); fences; ret r_ = f##_h_ args; \
+        __asm__ volatile("" : "+m"(r_)); spu__fpcr_set(m_); return r_; }
 #else
 #define SPU__DP_RN(ret, f, params, args, fences) static inline ret f params { return f##_h_ args; }
 #endif
@@ -2473,11 +2685,45 @@ static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 extern int g_spu_wrch_inline;
 extern volatile int g_spu_jobrec_mode;
+/* Upstream v0.5.2's PS3_SPU_FASTCH entries (spu_channels.c): plain GET/PUT and the tag update, a
+ * path that drops mfc_submit's two fences (x86-64's ordering stands in for them; in the Switch build it
+ * is OFF by default and, when switched on, keeps the fences: see spu_channels.c). Declared for the
+ * second inline test in spu_wrch_inl below. */
 extern int g_spu_fastch;
 void spu_wrch_cmd_fast(spu_context* ctx, uint32_t cmd);
 void spu_wrch_tagupd_fast(spu_context* ctx, uint32_t v);
+/* PS3_SPU_CMD_FAST (default 1 in the Switch build; our local change, kept alongside upstream's FASTCH, and
+ * tested FIRST in spu_wrch_inl): the other two channel writes of every DMA, the command and the tag
+ * update, go straight to spu_mfc_cmd / spu_mfc_tag_update (spu_channels.c) -- spu_wrch's own path for
+ * them minus the checks that cannot fire when g_spu_cmd_fast is set (it is, by spu_wrch's first call,
+ * only when PS3_SPU_WRCH_INLINE's conditions hold and the fence-lean path is on) -- with the value in
+ * a register rather than a u128. The job recorder is tested here as for the inline stores.
+ * The PC builds do not compile this test into the lifted code (PS3_SPU_CMD_FAST_INLINE 0, so the
+ * generated spu_wrch_inl is upstream's, with no extra load and no skipped wake); a PC build that wants
+ * it builds the lifted code with -DPS3_SPU_CMD_FAST_INLINE=1 and runs with PS3_SPU_CMD_FAST=1
+ * (spu_channels.c: off by default outside the Switch). */
+#ifndef PS3_SPU_CMD_FAST_INLINE
+#  ifdef __SWITCH__
+#    define PS3_SPU_CMD_FAST_INLINE 1
+#  else
+#    define PS3_SPU_CMD_FAST_INLINE 0
+#  endif
+#endif
+#if PS3_SPU_CMD_FAST_INLINE
+extern int g_spu_cmd_fast;
+void spu_mfc_cmd(spu_context* ctx, uint32_t cmd);
+void spu_mfc_tag_update(spu_context* ctx, uint32_t v);
+#endif
 static inline __attribute__((always_inline)) void spu_wrch_inl(spu_context* ctx, uint32_t ch, u128 v)
 {
+#if PS3_SPU_CMD_FAST_INLINE
+    if (__builtin_constant_p(ch) && (ch == MFC_Cmd || ch == MFC_WrTagUpdate) &&
+        __builtin_expect(g_spu_cmd_fast > 0 && !g_spu_jobrec_mode, 1)) {
+        if (ch == MFC_Cmd) spu_mfc_cmd(ctx, v._u32[0]);
+        else spu_mfc_tag_update(ctx, v._u32[0]);
+        return;
+    }
+#endif
     if (__builtin_constant_p(ch) &&
         (ch == MFC_LSA || ch == MFC_EAH || ch == MFC_EAL || ch == MFC_Size || ch == MFC_TagID ||
          ch == MFC_WrTagMask) &&

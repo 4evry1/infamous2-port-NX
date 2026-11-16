@@ -214,6 +214,9 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+#ifdef __SWITCH__
+extern "C" int ppu_prof_stamp_on(void);   /* PS3_PROF_STAMP: whether to stamp at all (off on the Switch) */
+#endif
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
@@ -275,7 +278,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
+#ifdef __SWITCH__
+    { /* PS3_PROF_STAMP (sys_ppu_thread.c): off on the Switch */
+      if (ppu_prof_stamp_on()) ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0))); }
+#else
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *

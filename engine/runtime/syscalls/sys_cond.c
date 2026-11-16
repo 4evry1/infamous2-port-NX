@@ -126,7 +126,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
-    const char* peek = getenv("PS3_COND_PEEK");
+    static const char* peek = (const char*)1; if (peek == (const char*)1) peek = getenv("PS3_COND_PEEK");   /* hz-0.46: read once */
     if (peek) {
         uint32_t ea = (uint32_t)strtoul(peek, NULL, 16);
         if (ea) {

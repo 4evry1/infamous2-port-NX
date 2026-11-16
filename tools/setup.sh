@@ -13,6 +13,7 @@
 #   --eboot      an already decrypted 1.04 EBOOT.elf instead (then RPCS3 is needed only for the firmware
 #                modules, unless work/fw holds liblv2.prx, libsysmodule.prx and libsre.prx)
 #   --jobs       compile jobs (default: half the CPU threads, at most 8: each lifted file is large)
+#   --prepare-only  steps 1-6 only (game, EBOOT, tools, glslang), no PC build: for the Switch target (switch/)
 # Steps:
 #   1. check this PC and the game                 6. Vulkan headers, SDL2 headers, glslang -> deps/
 #   2. the build tools -> tools-cache/            7. translate and compile the game (15-60 min)
@@ -27,7 +28,7 @@
 # Play with tools/play.sh (or the desktop launcher).
 set -eu   # (no pipefail: 'ldconfig -p | grep -q' would fail on grep's early exit)
 root="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-disc=""; rpcs3=""; rpcs3bin=""; eboot=""; desktop=1
+disc=""; rpcs3=""; rpcs3bin=""; eboot=""; desktop=1; prepare_only=0
 jobs=$(( $(nproc) / 2 )); [ $jobs -gt 8 ] && jobs=8; [ $jobs -lt 1 ] && jobs=1
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -37,7 +38,8 @@ while [ $# -gt 0 ]; do
         --eboot) eboot="$2"; shift ;;
         --jobs) jobs="$2"; shift ;;
         --no-desktop) desktop=0 ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        --prepare-only) prepare_only=1 ;;
+        -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
         *) echo "unknown option $1 (--help)"; exit 2 ;;
     esac
     shift
@@ -385,6 +387,10 @@ if [ ! -f "$deps/glslang-install-linux/lib/cmake/glslang/glslang-config.cmake" ]
         || fail "building glslang failed (see $deps/glslang-build.log)"
 fi
 echo "  deps ready"
+if [ $prepare_only = 1 ]; then
+    echo "== prepared in $(( ($(date +%s) - t0) / 60 )) min (--prepare-only): the Switch build continues with switch/build.sh"
+    exit 0
+fi
 
 # ------------------------------------------------------------------------------------------------
 step 7 "translating and compiling the game (the long part: 15-60 minutes)"

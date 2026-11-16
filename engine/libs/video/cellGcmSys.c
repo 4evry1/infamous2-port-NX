@@ -1055,7 +1055,15 @@ int gcm_stall_snapshot(char* buf, int size)
 static unsigned long long gcm_park_grace_ms(void)
 {
     static unsigned long long ms = 0;
+    /* The Switch (hz-0.40): 2000. With every core busy and frames near 100 ms, 50 ms was not
+     * enough: console run 40 resynced a park the title patched just after the grace (the word at
+     * the park was already the patched command when the dump printed it) and the picture never
+     * came back; the same "bad word" freeze is in runs 3-26 ("ref stuck ... word@get=0x00041808"). */
+#ifdef __SWITCH__
+    if (!ms) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = (e && atoi(e) > 0) ? (unsigned long long)atoi(e) : 2000ull; }
+#else
     if (!ms) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = (e && atoi(e) > 0) ? (unsigned long long)atoi(e) : 50ull; }
+#endif
     return ms;
 }
 #define GCM_PARK_GRACE_MS gcm_park_grace_ms()
@@ -2693,7 +2701,14 @@ walk_more:
                       if (s_park_off != s_fifo_getoff || park_put != put) {
                           if (s_park_off != s_fifo_getoff) { s_park_since = now; s_ps_parks++; }
                           s_park_off = s_fifo_getoff; park_put = put; gcm_run_clock_start(&grace, now);
+#ifdef __SWITCH__
+                      } else if (gcm_run_clock_ms(&grace, now) >= GCM_PARK_GRACE_MS &&
+                                 /* re-read the park: a patch that landed since this pass read it
+                                  * is followed by the next pass, never dropped by a resync */
+                                 (!gcm_io2ea(s_fifo_getoff) || vm_read32(gcm_io2ea(s_fifo_getoff)) == w)) {
+#else
                       } else if (gcm_run_clock_ms(&grace, now) >= GCM_PARK_GRACE_MS) {
+#endif
                           s_park_off = 0; s_park_since = 0; s_ps_resync++;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);

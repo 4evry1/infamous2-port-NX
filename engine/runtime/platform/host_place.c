@@ -271,7 +271,19 @@ static int bud_logical(void)
     return n > 0 ? (int)n : 1;
 }
 int ps3_host_cpus(void)  { return bud_logical(); }
+#ifdef __SWITCH__
+/* Nintendo Switch (Horizon): 4 Cortex-A57 cores, no SMT. The process gets the cores its core mask
+ * allows (3 for an ordinary application; 4 when core 3 is unlocked). bud_logical() ends in
+ * sysconf(_SC_NPROCESSORS_ONLN), which the Horizon layer (horizon/src/hz_misc.c) answers with the
+ * popcount of that mask (svcGetInfo CoreMask, the value the layer keeps as hz_core_mask), so the
+ * logical count already IS the physical one. The generic line below assumes SMT and halves it: 3 -> 1
+ * core, which makes PS3_JOB_WORKERS=auto, PS3_CORE_SCARCE and PS3_USLEEP_WAIT=auto judge a 3-4 core
+ * console as a 1-2 core PC. (Fixed here, in the one place that decides, rather than by environment
+ * variables, so every caller of ps3_host_cores() sees the real count.) */
+int ps3_host_cores(void) { return bud_logical(); }
+#else
 int ps3_host_cores(void) { const int n = bud_logical(); return n > 1 ? n / 2 : 1; }   /* SMT assumed */
+#endif
 int ps3_host_core_scarce(void)
 {
     const char* e = getenv("PS3_CORE_SCARCE");
@@ -280,6 +292,21 @@ int ps3_host_core_scarce(void)
     e = getenv("PS3_CORE_SCARCE_BELOW"); if (e && atoi(e) > 0) below = atoi(e);
     return ps3_host_cores() < below;
 }
+#ifdef __SWITCH__
+/* Thread roles on the Switch go to the Horizon layer (horizon/src/hz_tls.c hz_place_self), which
+ * sets the thread's priority by role: there all threads share priority 59, and Horizon hands a core
+ * to a thread that wakes from a short sleep only when the running one blocks or at the 10 ms
+ * time-slice, so the main thread's usleep(3) job polls each cost up to 10 ms (run 24 profiles:
+ * the main thread 44-58% asleep in nanosleep while the cores were busy with SPU work). */
+extern void hz_place_self(int role) __attribute__((weak));
+void ps3_host_place_self(int role) { if (hz_place_self) hz_place_self(role); }
+void ps3_host_place_self_once(int role)
+{
+    static __thread int t_placed_sw;
+    if (!t_placed_sw) { t_placed_sw = 1; ps3_host_place_self(role); }
+}
+#else
 void ps3_host_place_self(int role) { (void)role; }
 void ps3_host_place_self_once(int role) { (void)role; }
+#endif
 #endif

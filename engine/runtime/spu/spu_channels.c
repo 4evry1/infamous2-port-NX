@@ -548,6 +548,26 @@ static unsigned spu_float_mode_enter(void)
     if ((v & SPU_MXCSR_RZFZ) == SPU_MXCSR_RZFZ) return ~0u;   /* nested run: the outer one restores */
     _mm_setcsr(v | SPU_MXCSR_RZFZ);
     return v;
+#elif SPU_A64_FPCR
+    /* arm64 twin (spu_helpers.h, SPU_FLOAT_RZ on arm64): FPCR round toward zero + FZ for the run.
+     * On when the lifted code was built with SPU_FLOAT_RZ_ONLY (it has no other form) or
+     * SPU_FLOAT_RZ=1 asks for it; SPU_FLOAT_RZ=0 without such code keeps the default FPCR. The
+     * return value is the outer FPCR's low word (its high word is reserved, zero). */
+    static int s_on = -1;
+    int on = __atomic_load_n(&s_on, __ATOMIC_ACQUIRE);
+    if (on < 0) {
+        const char* e = getenv("SPU_FLOAT_RZ");
+        on = (g_spu_lifted_flags & 2) || (e && e[0] == '1');
+        if (on) __atomic_store_n(&g_spu_float_rz, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
+        fprintf(stderr, "[spu] single precision: %s (SPU_FLOAT_RZ)\n",
+                on ? "native, FPCR round-toward-zero + FZ" : "exact emulation, default FPCR");
+    }
+    if (!on) return ~0u;
+    const uint64_t v = spu__fpcr_get();
+    if ((v & SPU_FPCR_RZFZ) == SPU_FPCR_RZFZ) return ~0u;   /* nested run: the outer one restores */
+    spu__fpcr_set(v | SPU_FPCR_RZFZ);
+    return (unsigned)v;
 #else
     return ~0u;
 #endif
@@ -556,6 +576,8 @@ static void spu_float_mode_leave(unsigned outer)
 {
 #if SPU_X64_MXCSR
     if (outer != ~0u) _mm_setcsr(outer);
+#elif SPU_A64_FPCR
+    if (outer != ~0u) spu__fpcr_set(outer);
 #else
     (void)outer;
 #endif
@@ -762,7 +784,12 @@ static void spu_dma_lean_init(void)
     ps3_toggle_watch(PS3T_SPU_DMA_LEAN, spu_dma_lean_set);
 }
 
-static mfc_engine* mfc_for(spu_context* ctx)
+#ifdef __SWITCH__
+/* Switch build: the hint test is split off and forced inline (the one case every command and tag operation of
+ * a running job takes), the scan stays out of line. The PC builds keep upstream's single function below. */
+static mfc_engine* mfc_for_slow(spu_context* ctx);
+
+static inline __attribute__((always_inline)) mfc_engine* mfc_for(spu_context* ctx)
 {
     /* PS3_SPU_DMA_LEAN: the slot this context held last time, if it still
      * does -- the scan below walked up to 128 slots per channel write. */
@@ -770,6 +797,22 @@ static mfc_engine* mfc_for(spu_context* ctx)
         spu_mfc_slot* hs = mfc_slot((int)ctx->mfc_hint - 1);
         if (__atomic_load_n(&hs->ctx, __ATOMIC_ACQUIRE) == ctx) return &hs->mfc;
     }
+    return mfc_for_slow(ctx);
+}
+
+static __attribute__((noinline)) mfc_engine* mfc_for_slow(spu_context* ctx)
+#else
+static mfc_engine* mfc_for(spu_context* ctx)
+#endif
+{
+#ifndef __SWITCH__
+    /* PS3_SPU_DMA_LEAN: the slot this context held last time, if it still
+     * does -- the scan below walked up to 128 slots per channel write. */
+    if (__builtin_expect(g_spu_dma_lean, 1) && ctx->mfc_hint) {
+        spu_mfc_slot* hs = mfc_slot((int)ctx->mfc_hint - 1);
+        if (__atomic_load_n(&hs->ctx, __ATOMIC_ACQUIRE) == ctx) return &hs->mfc;
+    }
+#endif
     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
         if (__atomic_load_n(&mfc_slot(i)->ctx, __ATOMIC_ACQUIRE) == ctx) {
             ctx->mfc_hint = (uint32_t)i + 1;
@@ -904,6 +947,25 @@ static uint64_t ll_mask_for(spu_context* ctx, uint32_t ea)
     return spu_lockline_mask_ea(ea);
 }
 
+/* PS3_SPU_PUTLLC_COUNT (see the PUTLLC case below): -1 until first read. */
+static int s_putllc_count = -1;
+static __attribute__((noinline, cold)) int spu_putllc_count_init(void)
+{
+    const char* e = getenv("PS3_SPU_PUTLLC_COUNT");
+#ifdef __SWITCH__
+    const int on = e && e[0] == '1';          /* the Switch build: off unless asked for */
+#else
+    const int on = !(e && e[0] == '0');       /* the PC builds: on, as upstream, unless =0 */
+#endif
+    __atomic_store_n(&s_putllc_count, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int spu_putllc_count_on(void)
+{
+    const int v = __atomic_load_n(&s_putllc_count, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : spu_putllc_count_init();
+}
+
 /* PS3_SPU_PUTLLC_PRECHECK (see the PUTLLC case below): -1 until first read. */
 static int s_putllc_precheck = -1;
 static __attribute__((noinline, cold)) int spu_putllc_precheck_init(void)
@@ -920,6 +982,25 @@ static inline int spu_putllc_precheck_on(void)
 }
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+/* hz-0.32: the trace switches below (SPU_POLLTRACE, SPU_ATOMTRACE and its YDKJ_* companions,
+ * SPU_ATOM_EA) are read once into one flag. Each block kept its own static switch, so every MFC
+ * atomic paid four atomic loads and branches before doing anything (the Switch: spu_mfc_atomic_body
+ * 1.6% of busy CPU, run 32). With none of them set the blocks are skipped as a whole; with any set
+ * each block decides on its own switch as before. */
+#ifdef __SWITCH__
+static int spu_atom_trace_on(void)
+{
+    static int v = -1;
+    if (__builtin_expect(v < 0, 0))
+        v = (getenv("SPU_POLLTRACE") || getenv("SPU_ATOMTRACE") || getenv("SPU_ATOM_EA")) ? 1 : 0;
+    return v;
+}
+#define SPU_ATOM_TRACE() __builtin_expect(spu_atom_trace_on(), 0)
+#else
+/* The PC builds run the trace blocks as upstream does: each decides on its own switch. */
+#define SPU_ATOM_TRACE() 1
+#endif
+
 static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
 {
     uint64_t llm = 0;
@@ -937,6 +1018,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
     uint8_t* ls  = &ctx->ls[lsa];
     uint8_t* mem = vm_base + ea;
 
+    if (SPU_ATOM_TRACE()) {
     { static _Atomic int s_t = -1; if (s_t < 0) s_t = getenv("SPU_POLLTRACE") ? 1 : 0;
       if (s_t) { static uint64_t s_n = 0; static uint32_t s_lastea = 0;
         if ((++s_n % 2000000) == 0 || ea != s_lastea) {
@@ -979,6 +1061,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         }
       } }
 
+    }
     /* Guard atomic line ops against an uncommitted/garbage EA (e.g. a SPURS
      * policy computing a lock-line address from an incomplete instance context).
      * Same rationale as the DMA EA guard: a bad guest atomic must not segfault
@@ -997,6 +1080,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         return 1;
     }
 
+    if (SPU_ATOM_TRACE()) {
     /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
      * SPU_ATOM_FULL=1 additionally dumps 32 bytes of the line before and after.
      *
@@ -1038,6 +1122,7 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
               fprintf(stderr, "%s\n", buf); fflush(stderr);
           }
       } }
+    }
     /* Bink sync-line atomic trace (armed by the PPU-side producer probe). */
     { extern uint32_t g_barrier_sync_watch;
       uint32_t b = g_barrier_sync_watch;
@@ -1236,7 +1321,12 @@ static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
         return 1;
 
     case MFC_PUTLLC_CMD:
-        __atomic_fetch_add(&g_spu_putllc_count, 1u, __ATOMIC_RELAXED);   /* read by the PM flow trace */
+        /* PS3_SPU_PUTLLC_COUNT (default 0): g_spu_putllc_count, a total over all SPUs that nothing in
+         * the engine or the generated sources reads any more (the PM flow trace that did is gone), was
+         * bumped with a locked add on every PUTLLC -- one cache line every SPU thread writes, which
+         * moves between cores on every attempt. 1 = keep counting. */
+        if (__builtin_expect(spu_putllc_count_on(), 0))
+            __atomic_fetch_add(&g_spu_putllc_count, 1u, __ATOMIC_RELAXED);
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++;
@@ -1454,10 +1544,28 @@ static int channel_is_mfc(uint32_t ch)
 /* PS3_SPU_WRCH_INLINE (spu_helpers.h, lifted TUs): -1 until the first spu_wrch,
  * then 1 = the lifted code stores the MFC parameter channels inline. */
 int g_spu_wrch_inline = -1;
+/* PS3_SPU_CMD_FAST (spu_helpers.h, lifted TUs): -1 until the first spu_wrch, then 1 = a lifted
+ * `wrch` of MFC_Cmd / MFC_WrTagUpdate calls spu_mfc_cmd / spu_mfc_tag_update directly. */
+int g_spu_cmd_fast = -1;
 static __attribute__((noinline, cold)) void spu_wrch_inline_init(void)
 {
     const char* e = getenv("PS3_SPU_WRCH_INLINE");
     const int on = !(e && e[0] == '0') && spu_ch_lean() && !getenv("SPU_CHHIST");
+    /* The direct entries are spu_wrch's own path for these two channels without the checks that
+     * cannot fire once the conditions below hold: the channel-write histogram (SPU_CHHIST: off,
+     * as for the inline stores), the tag-status probe (SPU_TAGPROBE), and the lock-line fences that
+     * spu_mfc_atomic puts around every command when PS3_SPU_FENCE_LEAN is off. */
+    /* Default 1 in the Switch build, 0 elsewhere (the PC builds run upstream's path: spu_helpers.h compiles the
+     * direct entries into the lifted code only for the Switch, or with -DPS3_SPU_CMD_FAST_INLINE=1). */
+    const char* c = getenv("PS3_SPU_CMD_FAST");
+#ifdef __SWITCH__
+    const int cmd = on && !(c && c[0] == '0') && spu_fence_lean() && !getenv("SPU_TAGPROBE");
+    spu_dma_lean_init();
+#else
+    const int cmd = on && (c && c[0] == '1') && spu_fence_lean() && !getenv("SPU_TAGPROBE");
+    if (cmd) spu_dma_lean_init();
+#endif
+    __atomic_store_n(&g_spu_cmd_fast, cmd, __ATOMIC_RELAXED);
     __atomic_store_n(&g_spu_wrch_inline, on, __ATOMIC_RELAXED);
 }
 
@@ -1479,13 +1587,29 @@ static __attribute__((noinline, cold)) void spu_wrch_inline_init(void)
  * fences (spu_mfc_atomic), the PPU side keeps its own. =1 puts them back (A/B switch). */
 int g_spu_fastch = -1;
 static int s_fastch_fence = 0;
+/* The Switch build (aarch64, Cortex-A57): the argument above does not hold. Its memory model is weak,
+ * so without the two fences a GET's loads and a PUT's stores can be reordered against the SPU
+ * thread's own earlier/later stores and against another thread's view of the tag state
+ * (tag_completed, the ring words a PUT publishes). So there FASTCH defaults to OFF (the generic
+ * chain with mfc_submit's fences, which is what the Switch build ran before v0.5.2), and if it is
+ * switched on with PS3_SPU_FASTCH=1 its fences default to ON (PS3_SPU_FASTCH_FENCE=0 removes them
+ * again, for an A/B). Every other build (the PC builds, x86-64 and macOS) keeps upstream's defaults (on, no
+ * fences). Our own PS3_SPU_CMD_FAST path (spu_helpers.h, tested first) keeps its fences on every host and
+ * is unaffected. */
+#if defined(__SWITCH__)
+#define PS3_FASTCH_DEFAULT_ON    0
+#define PS3_FASTCH_DEFAULT_FENCE 1
+#else
+#define PS3_FASTCH_DEFAULT_ON    1
+#define PS3_FASTCH_DEFAULT_FENCE 0
+#endif
 static __attribute__((noinline, cold)) int spu_fastch_init(void)
 {
     const char* e = getenv("PS3_SPU_FASTCH");
-    int on = !(e && e[0] == '0') && spu_ch_lean() && !getenv("SPU_CHHIST") && !getenv("SPU_TAGPROBE") &&
+    int on = (e ? e[0] != '0' : PS3_FASTCH_DEFAULT_ON) && spu_ch_lean() && !getenv("SPU_CHHIST") && !getenv("SPU_TAGPROBE") &&
              !getenv("SPU_MFC_TRACE") && !getenv("SPU_DMATRACE");
     const char* f = getenv("PS3_SPU_FASTCH_FENCE");
-    s_fastch_fence = f && f[0] == '1';
+    s_fastch_fence = f ? f[0] == '1' : PS3_FASTCH_DEFAULT_FENCE;
     if (on) { spu_dma_lean_init(); on = spu_dma_fast_init() ? 1 : 0; }   /* the diagnostics gates */
     __atomic_store_n(&g_spu_fastch, on, __ATOMIC_RELEASE);
     return on;
@@ -1658,6 +1782,42 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
         break;
     }
+}
+
+/* PS3_SPU_CMD_FAST (default 1; lifted TUs, spu_helpers.h): the MFC command write and the tag-update
+ * write of a lifted job, the two channel writes of every DMA that were still a call into spu_wrch.
+ * That function first looked at the job recorder, the one-time initialisations, the channel-write
+ * histogram, classified the channel (a 14-way switch) and for MFC_Cmd ran spu_mfc_atomic's own
+ * classification and fence-lean test, before getting to the same mfc_submit these call. With the
+ * conditions of spu_wrch_inline_init met (no recorder in the lifted TU's test, histogram and tag probe
+ * off, fence-lean on) none of that can change the outcome, and these do what is left, in spu_wrch's
+ * order: for MFC_Cmd a lock-line command goes to spu_mfc_atomic_body between its two fences (what
+ * spu_mfc_atomic does), anything else to mfc_submit (whose own two fences order it); for
+ * MFC_WrTagUpdate the tag status is latched and the tag-status event raised as mfc_channel_write and
+ * spu_wrch's tail do, minus the wake of a thread that is not asleep (see spu_mfc_tag_update). A
+ * recorder switched on after the lifted TU's test sends the write through spu_wrch as before. */
+void spu_mfc_cmd(spu_context* ctx, uint32_t cmd)
+{
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) { spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(cmd)); return; }
+    if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        spu_mfc_atomic_body(ctx, cmd);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        return;
+    }
+    mfc_submit(mfc_for(ctx), ctx, cmd);
+}
+
+void spu_mfc_tag_update(spu_context* ctx, uint32_t v)
+{
+    if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) { spu_wrch(ctx, MFC_WrTagUpdate, spu_make_preferred_u32(v)); return; }
+    ctx->mfc_tag_status = mfc_tag_wait(mfc_for(ctx), ctx->mfc_tag_mask, v);
+    /* spu_wrch's tail raises the event and then calls spu_ch_wake. The only thread that ever sleeps on
+     * the context's wait variable is the SPU's own, inside spu_ch_wait, and this is that thread, running
+     * lifted code: nobody is waiting, and the wake -- on the POSIX layer a mutex lock, a generation bump,
+     * a broadcast and an unlock -- does nothing but cost that. (A producer on another thread still wakes:
+     * spu_coherency.c, the mailbox and signal writers.) */
+    if (v != 0 && (ctx->event_mask & 0x1u)) spu_ev_raise(ctx, 0x1u);
 }
 
 /* ===========================================================================
@@ -3008,6 +3168,55 @@ static void ovl_summary_build(int n)
     __atomic_store_n(&s_ovl_summary_n, n, __ATOMIC_RELEASE);
 }
 static void ovl_summary_invalidate(void) { __atomic_store_n(&s_ovl_summary_n, -1, __ATOMIC_RELEASE); }
+static inline int ovl_head_on(void);
+
+/* PS3_SPU_OVL_LIFT_HEAD (default 1 in the Switch build, 0 elsewhere; 0 = the page test alone, as before): the two fixed-address lifts
+ * (the raw-SPU images, LS 0x80..0x18570 and 0x3000..0xC350) cover nearly all of local store, so the page
+ * test in ovl_cannot_match below let nearly every GET through to spu_overlay_note_get_full -- a
+ * 0x2C8-byte frame, the whole candidate walk, and for each lift a 16-byte gm_equal (bounce buffer and
+ * memcmp) -- only to find, in the first word, that the bytes are job data and not the image: about
+ * 40 ns of a 65 ns GET (bench, with the game's overlay table registered). ovl_try_source's test for a
+ * fixed-address lift is   lo < hi && (hi - lo >= 128 || hi - lo == size) && head-equal && full-equal;
+ * this evaluates its first three terms, the same expressions, and only when all of them hold does the
+ * GET go on to the full function, which then runs the whole of ovl_try_source unchanged. So a GET is
+ * ruled out here only when ovl_try_source would have reported "no hit" for every lift, which is what
+ * the full function does with it: nothing. With PS3_SPU_OVL_HEAD off ovl_try_source makes no head
+ * test, so nothing can be ruled out and every GET over a lift page goes on. */
+static int s_ovl_lift_head = -1;
+static __attribute__((noinline, cold)) int ovl_lift_head_init(void)
+{
+    const char* e = getenv("PS3_SPU_OVL_LIFT_HEAD");
+#ifdef __SWITCH__
+    const int on = !(e && e[0] == '0');       /* the Switch build: on unless =0 */
+#else
+    const int on = e && e[0] == '1';          /* the PC builds: off (upstream's page test alone) unless =1 */
+#endif
+    __atomic_store_n(&s_ovl_lift_head, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int ovl_lift_head_on(void)
+{
+    const int v = __atomic_load_n(&s_ovl_lift_head, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : ovl_lift_head_init();
+}
+/* 1 if some fixed-address lift might hit this GET (see above); `n` is the source count the summary
+ * was checked against. */
+static inline int ovl_lifts_may_hit(uint32_t lsa, const uint8_t* ls, uint32_t size, int n)
+{
+    if (!ovl_head_on()) return 1;
+    const int nl = s_ovl_ix_nlift;
+    for (int k = 0; k < nl; k++) {
+        const spu_ovl_src* o = &s_ovl_src[s_ovl_ix_lift[k]];
+        const uint32_t lo = lsa > o->lift_lsa ? lsa : o->lift_lsa;
+        const uint32_t hi = (lsa + size) < (o->lift_lsa + o->span) ? (lsa + size) : (o->lift_lsa + o->span);
+        if (lo < hi && (hi - lo >= 128 || hi - lo == size) &&
+            gm_equal(vm_base + o->src_ea + (lo - o->lift_lsa), ls + (lo - lsa), hi - lo < 16 ? hi - lo : 16))
+            return 1;
+    }
+    /* the index was rebuilt under us (a source registered late): rule nothing out */
+    return __atomic_load_n(&s_ovl_summary_n, __ATOMIC_ACQUIRE) != n;
+}
+
 static inline int ovl_cannot_match(uint32_t ea, const uint8_t* ls, uint32_t lsa, uint32_t size)
 {
     const int n = s_ovl_src_count;
@@ -3024,7 +3233,11 @@ static inline int ovl_cannot_match(uint32_t ea, const uint8_t* ls, uint32_t lsa,
     if (lsa < s_ovl_lift_hi && lsa + size > s_ovl_lift_lo) { /* a fixed lift could */
         if (!lean || !size) return 0;
         for (uint32_t pg = lsa >> 10; pg <= ((lsa + size - 1) >> 10) && pg < 256; pg++)
-            if (s_ovl_lift_pages[pg >> 6] & (1ull << (pg & 63))) return 0;
+            if (s_ovl_lift_pages[pg >> 6] & (1ull << (pg & 63))) {
+                /* a page of a lift: ruled out only if no lift's own test can pass (ovl_lift_head_on) */
+                if (!ovl_lift_head_on() || ovl_lifts_may_hit(lsa, ls, size, n)) return 0;
+                break;
+            }
     }
     return 1;
 }
@@ -3050,6 +3263,27 @@ static __attribute__((noinline, cold)) int spu_ovl_fast_init(void)
     return on;
 }
 
+/* PS3_SPU_OVL_BOX (default 1 in the Switch build, 0 elsewhere; 0 = scan the 16 slots on every GET, as before): the scan below looks for
+ * an occupied slot that the GET overlaps; the context keeps a span that covers every occupied slot
+ * (spu_context.res_lo / res_hi, spu_resident_box_update), and a GET outside it overlaps none. */
+static int s_ovl_box = -1;
+static __attribute__((noinline, cold)) int ovl_box_init(void)
+{
+    const char* e = getenv("PS3_SPU_OVL_BOX");
+#ifdef __SWITCH__
+    const int on = !(e && e[0] == '0');       /* the Switch build: on unless =0 */
+#else
+    const int on = e && e[0] == '1';          /* the PC builds: off (the slot scan on every GET, as upstream) unless =1 */
+#endif
+    __atomic_store_n(&s_ovl_box, on, __ATOMIC_RELAXED);
+    return on;
+}
+static inline int ovl_box_on(void)
+{
+    const int v = __atomic_load_n(&s_ovl_box, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : ovl_box_init();
+}
+
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
     int fast = __atomic_load_n(&s_ovl_fast, __ATOMIC_RELAXED);
@@ -3057,12 +3291,13 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     if (fast) {
         const uint32_t lsa = (uint32_t)(ls - ctx->ls);
         int overlap = 0;
-        for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-            if (!ctx->resident_code[slot].image_id) continue;
-            const uint32_t base = ctx->resident_code[slot].lsa;
-            const uint32_t end = base + ctx->resident_code[slot].size;
-            if (lsa < end && lsa + size > base) { overlap = 1; break; }
-        }
+        if (!ovl_box_on() || (lsa < ctx->res_hi && lsa + size > ctx->res_lo))
+            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                if (!ctx->resident_code[slot].image_id) continue;
+                const uint32_t base = ctx->resident_code[slot].lsa;
+                const uint32_t end = base + ctx->resident_code[slot].size;
+                if (lsa < end && lsa + size > base) { overlap = 1; break; }
+            }
         if (!overlap && ovl_cannot_match(ea, ls, lsa, size)) return;
     }
     spu_overlay_note_get_full(ctx, ea, ls, size);
@@ -3186,6 +3421,7 @@ static int ovl_try_source(spu_context* ctx, const spu_ovl_src* o, uint32_t ea, u
                 ctx->resident_code[slot].source_ea = ea;
                 ctx->resident_code[slot].image_id = o->image_id;
                 ctx->resident_code[slot].reloc = (uint32_t)o->reloc;
+                spu_resident_box_update(ctx);   /* PS3_SPU_OVL_BOX: the span over the slots */
                 ctx->ib_gen++;
                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
                     fprintf(stderr, "[spu-ovl] img=%d code span src=0x%08X -> LS 0x%05X+0x%X resident as image %d (slot %u)\n",
@@ -3251,6 +3487,7 @@ static void spu_overlay_note_get_full(spu_context* ctx, uint32_t ea, const uint8
                 fprintf(stderr, "[spu-ovl] img=%d code span image %d evicted by GET ea=0x%08X -> LS 0x%05X size=%u\n",
                         ctx->image_id, ctx->resident_code[slot].image_id, ea, lsa, size); }
             ctx->resident_code[slot].image_id = 0;
+            spu_resident_box_update(ctx);
             ctx->ib_gen++;
         }
     }
@@ -4556,6 +4793,57 @@ static __attribute__((noinline, cold)) int spu_ibcache_init(void)
     return v < 0 ? 0 : v;
 }
 
+/* hz-0.47: PS3_SPU_IBCACHE_STAT=1 logs the cache's hits and misses every 10 s; PS3_SPU_IBCACHE_VERIFY=1
+ * resolves every branch the cache would have answered as well and compares the two functions, logging any
+ * difference (a check run: slower, the resolver's answer is used). Both off by default. */
+static int s_ibc_stat = -1, s_ibc_verify = -1;
+static unsigned long long s_ibc_hit, s_ibc_miss, s_ibc_vok, s_ibc_vbad, s_ibc_t0;
+static __attribute__((noinline, cold)) void spu_ibcache_flags_init(void)
+{
+    const char* e = getenv("PS3_SPU_IBCACHE_STAT");
+    const char* v = getenv("PS3_SPU_IBCACHE_VERIFY");
+    __atomic_store_n(&s_ibc_stat, e && e[0] == '1', __ATOMIC_RELAXED);
+    __atomic_store_n(&s_ibc_verify, v && v[0] == '1', __ATOMIC_RELAXED);
+    if (v && v[0] == '1') fprintf(stderr, "[spu-ibcache] VERIFY: every cache hit is resolved again and compared\n");
+}
+static inline int spu_ibcache_verify_on(void)
+{
+    int v = __atomic_load_n(&s_ibc_verify, __ATOMIC_RELAXED);
+    if (__builtin_expect(v < 0, 0)) { spu_ibcache_flags_init(); v = __atomic_load_n(&s_ibc_verify, __ATOMIC_RELAXED); }
+    return v;
+}
+static __attribute__((noinline, cold)) void spu_ibcache_report(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long now = (unsigned long long)ts.tv_sec;
+    unsigned long long t0 = __atomic_load_n(&s_ibc_t0, __ATOMIC_RELAXED);
+    if (!t0) { __atomic_store_n(&s_ibc_t0, now, __ATOMIC_RELAXED); return; }
+    if (now - t0 < 10 || !__atomic_compare_exchange_n(&s_ibc_t0, &t0, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    const unsigned long long h = __atomic_exchange_n(&s_ibc_hit, 0, __ATOMIC_RELAXED), m = __atomic_exchange_n(&s_ibc_miss, 0, __ATOMIC_RELAXED);
+    fprintf(stderr, "[spu-ibcache] last 10 s: %llu hits, %llu misses (%.1f%% hit)%s", h, m, h + m ? 100.0 * h / (h + m) : 0.0,
+            __atomic_load_n(&s_ibc_verify, __ATOMIC_RELAXED) > 0 ? "" : "\n");
+    if (__atomic_load_n(&s_ibc_verify, __ATOMIC_RELAXED) > 0)
+        fprintf(stderr, "; verify %llu same, %llu differ\n", s_ibc_vok, s_ibc_vbad);
+}
+static inline void spu_ibcache_count(int hit)
+{
+    int s = __atomic_load_n(&s_ibc_stat, __ATOMIC_RELAXED);
+    if (__builtin_expect(s < 0, 0)) { spu_ibcache_flags_init(); s = __atomic_load_n(&s_ibc_stat, __ATOMIC_RELAXED); }
+    if (__builtin_expect(!s && __atomic_load_n(&s_ibc_verify, __ATOMIC_RELAXED) <= 0, 1)) return;
+    __atomic_fetch_add(hit ? &s_ibc_hit : &s_ibc_miss, 1, __ATOMIC_RELAXED);
+    if (((hit ? s_ibc_hit : s_ibc_miss) & 0xFFFF) == 0) spu_ibcache_report();
+}
+static __attribute__((noinline, cold)) void spu_ibcache_verify(spu_context* ctx, uint32_t pc,
+                                                              void (*cached)(struct spu_context*), void (*fn)(struct spu_context*))
+{
+    if ((void*)cached == (void*)fn) { __atomic_fetch_add(&s_ibc_vok, 1, __ATOMIC_RELAXED); spu_ibcache_count(1); return; }
+    const unsigned long long n = __atomic_fetch_add(&s_ibc_vbad, 1, __ATOMIC_RELAXED) + 1;
+    spu_ibcache_count(1);
+    if (n <= 16)
+        fprintf(stderr, "[spu-ibcache] VERIFY DIFFER #%llu: img=%d ovl=%d task=%d pc=0x%05X cached %p resolved %p\n",
+                n, ctx->image_id, ctx->resident_ovl, ctx->resident_task, pc, (void*)cached, (void*)fn);
+}
+
 static int s_irq_fastib = -1;     /* PS3_SPU_IRQ_FASTIB (spu_indirect_branch) */
 static __attribute__((noinline, cold)) int spu_irq_fastib_init(void)
 {
@@ -4623,10 +4911,13 @@ void spu_indirect_branch(spu_context* ctx)
          * changed (the task lookups are left out: they read tables, not ctx). */
         int ib_on = __atomic_load_n(&s_ib_cache, __ATOMIC_RELAXED);
         if (__builtin_expect(ib_on < 0, 0)) ib_on = spu_ibcache_init();
-        typeof(&ctx->ib_cache[0]) ce = NULL;
+        typeof(&ctx->ib_cache[0][0]) ce = NULL, cset = NULL;
         const uint32_t reg_gen = __atomic_load_n(&g_spu_reg_gen, __ATOMIC_ACQUIRE);
+        void (*ib_verify_fn)(struct spu_context*) = NULL;   /* PS3_SPU_IBCACHE_VERIFY: the hit being checked */
         if (ib_on && !(pc >= SPU_TASKSET_TASK_LO && (s_task_elf_count || s_task_entry_count))) {
-            ce = &ctx->ib_cache[(pc >> 2) & (SPU_IB_CACHE_SIZE - 1)];
+            cset = &ctx->ib_cache[(pc >> 2) & (SPU_IB_CACHE_SIZE / 2 - 1)][0];
+            /* hz-0.47: two ways; the way whose pc matches is checked exactly as the one entry was */
+            ce = cset[1].pc == pc && cset[1].fn ? &cset[1] : &cset[0];
             /* PS3_SPU_IBCACHE_SLOT (default 1): an entry a resident code slot
              * resolved (slot >= 0) came from that slot's image and the registry
              * alone -- the resolver below never reads image_id, resident_ovl
@@ -4639,9 +4930,14 @@ void spu_indirect_branch(spu_context* ctx)
                  (ce->img == ctx->image_id && ce->ovl == ctx->resident_ovl && ce->task == ctx->resident_task))) {
                 const int cs = ce->slot;
                 if (cs < 0 || !spu_slot_word_stale(ctx, (unsigned)cs, pc)) {
-                    if (cs >= 0 && ctx->resident_code[cs].reloc) ctx->code_base = ctx->resident_code[cs].lsa;
-                    fn = ce->fn;
-                    goto have_fn;
+                    if (__builtin_expect(spu_ibcache_verify_on(), 0)) {
+                        ib_verify_fn = ce->fn;      /* resolve anyway below and compare */
+                    } else {
+                        if (cs >= 0 && ctx->resident_code[cs].reloc) ctx->code_base = ctx->resident_code[cs].lsa;
+                        fn = ce->fn;
+                        spu_ibcache_count(1);
+                        goto have_fn;
+                    }
                 }
             }
         }
@@ -4665,13 +4961,20 @@ void spu_indirect_branch(spu_context* ctx)
         for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS && !fn && code_owner >= 0; ++slot)
             if (ctx->resident_code[slot].image_id && !ctx->resident_code[slot].reloc)
                 fn = spu_lookup(pc, ctx->resident_code[slot].image_id);
+        if (ib_verify_fn) spu_ibcache_verify(ctx, pc, ib_verify_fn, fn);
         if (!fn) goto slow;
+        if (ce && !ib_verify_fn) spu_ibcache_count(0);
         /* A stale slot that covered pc makes the answer depend on LS words
-         * this entry would not re-check: not cached. */
-        if (ce && !stale_seen) {
+         * this entry would not re-check: not cached. Neither is one whose ids do not fit 16 bits. */
+        if (ce && !stale_seen && !ib_verify_fn &&
+            ctx->image_id == (int16_t)ctx->image_id && ctx->resident_ovl == (int16_t)ctx->resident_ovl &&
+            ctx->resident_task == (int16_t)ctx->resident_task) {
+            /* hz-0.47: the new entry goes to way 0, way 0's to way 1 (unless way 0 held this pc) */
+            if (cset[0].fn && cset[0].pc != pc) cset[1] = cset[0];
+            ce = &cset[0];
             ce->pc = pc; ce->gen = ctx->ib_gen; ce->reg_gen = reg_gen;
-            ce->img = ctx->image_id; ce->ovl = ctx->resident_ovl; ce->task = ctx->resident_task;
-            ce->slot = owner_slot; ce->fn = fn;
+            ce->img = (int16_t)ctx->image_id; ce->ovl = (int16_t)ctx->resident_ovl; ce->task = (int16_t)ctx->resident_task;
+            ce->slot = (int16_t)owner_slot; ce->fn = fn;
         }
     have_fn:
         ctx->pc = pc;

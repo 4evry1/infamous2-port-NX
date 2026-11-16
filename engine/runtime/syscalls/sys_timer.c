@@ -453,6 +453,29 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
     }
 #else
+#ifdef __SWITCH__
+    /* hz-0.45, PS3_USLEEP_RUN_US=<n> (default 100, 0 = off) and PS3_USLEEP_LONG_US=<m> (default 200): once a
+     * thread has polled with short sleeps from one guest call site for n us, each further sleep of less than m
+     * us lasts m us. Console run 51 (timeline trace): inFAMOUS 2's main thread waits for its SPU jobs in
+     * func_0038AA14 / func_0038B43C with usleep(1) -- 38,000 calls a second, 50 ms of every 131 ms frame.
+     * nanosleep(1 us) on Horizon wakes the thread almost at once, and at priority 58 it then takes a core
+     * from an SPU worker (59) doing the very work it waits for. The wait ends up to m us late instead. */
+    { static long run_us = -1, long_us = 200;
+      if (run_us < 0) { const char* e = getenv("PS3_USLEEP_RUN_US"); run_us = e ? atol(e) : 100; if (run_us < 0) run_us = 0;
+                        const char* l = getenv("PS3_USLEEP_LONG_US"); long_us = l ? atol(l) : 200; if (long_us < 0) long_us = 0;
+                        fprintf(stderr, "[sys_timer] short-sleep polls: after %ld us at one call site, sleep %ld us each (PS3_USLEEP_RUN_US / PS3_USLEEP_LONG_US)\n",
+                                run_us, long_us); }
+      if (run_us > 0 && usec < (uint64_t)long_us) {
+          static __thread uint32_t t_lr;
+          static __thread uint64_t t_run0, t_last;
+          struct timespec ts0; clock_gettime(CLOCK_MONOTONIC, &ts0);
+          const uint64_t now = (uint64_t)ts0.tv_sec * 1000000ull + (uint64_t)ts0.tv_nsec / 1000ull;
+          const uint32_t lr = (uint32_t)ctx->lr;
+          if (lr != t_lr || (int64_t)(now - t_last) > (int64_t)long_us + 50) { t_lr = lr; t_run0 = now; }   /* a new poll run */
+          if (now - t_run0 >= (uint64_t)run_us) usec = (uint64_t)long_us;
+          t_last = now + usec;
+      } }
+#endif
     /* PS3_USLEEP_SPIN_US=<n>: a sleep of n microseconds or less spins to a
      * CLOCK_MONOTONIC deadline, yielding each turn, instead of nanosleep.
      * nanosleep(3 us) on macOS returns after ~50 us at best and after a

@@ -144,6 +144,10 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
     return (uint32_t)(slot + 1);
 }
 
+/* hz-0.46: debug switches read once (getenv walks the environment: 1.7% of the main thread in console run 52). */
+static int s_env_noportroute = -1, s_env_q23stack = -1;
+static int ev_env_once(int* slot, const char* name) { if (*slot < 0) *slot = getenv(name) ? 1 : 0; return *slot; }
+
 int64_t sys_event_queue_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -407,7 +411,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                 /* Match the observed real port_send(port=4) shape: data1=0, data2=1,
                  * data3=0. source is the port name; use a SPURS-ish tag. Env
                  * YDKJ_RDY_D2 overrides data2 for quick format experiments. */
-                const char* d2s = getenv("YDKJ_RDY_D2");
+                static const char* d2s = (const char*)1; if (d2s == (const char*)1) d2s = getenv("YDKJ_RDY_D2");   /* hz-0.46: read once */
                 uint64_t d2 = d2s ? (uint64_t)strtoull(d2s, 0, 0) : 1ULL;
                 out[0] = bswap64(0x0000000000000000ULL); /* source/name */
                 out[1] = 0; out[2] = bswap64(d2); out[3] = 0;
@@ -446,7 +450,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* Diagnostic: main-thread per-frame poll on q=2/q=3 (timeout ~30us) never
      * advances to content. Dump its guest call chain to identify the frame-loop
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
-    if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
+    if ((queue_id == 2 || queue_id == 3) && ev_env_once(&s_env_q23stack, "YDKJ_Q23STACK")) {   /* hz-0.46: read once */
 #ifdef _WIN32
         static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
@@ -1006,7 +1010,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
          * sends; we only fix the port->queue routing our HLE lost. Env YDKJ_PORTROUTE
          * (default ON) can be disabled for A/B. */
         if (port_id <= SYS_EVENT_QUEUE_MAX && g_sys_event_queues[port_id - 1].active
-                && (!getenv("YDKJ_NO_PORTROUTE"))) {
+                && !ev_env_once(&s_env_noportroute, "YDKJ_NO_PORTROUTE")) {   /* hz-0.46: read once */
             sys_event_queue_info* rq = &g_sys_event_queues[port_id - 1];
             sys_event_t revt; revt.source = 0; revt.data1 = data1; revt.data2 = data2; revt.data3 = data3;
             int rc = event_queue_push(rq, &revt);

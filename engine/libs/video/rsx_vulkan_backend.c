@@ -2674,6 +2674,15 @@ static void vk_sc_tick(void)
 {
     vk_pa_frame();                             /* (stutter) vk_pipe_async.inc */
     if (!s_sc.pc_new || ps3_ft_now() - s_sc.pc_last_new < VK_SC_IDLE_NS) return;
+#ifdef __SWITCH__
+    /* On the Switch a save is expensive in a way the PC never sees: the whole file (8 MB after
+     * one session) goes to the SD card, which took 0.35 s on average and up to 2.2 s, and the
+     * card serves the game's own reads meanwhile. Console run 13 made 46 such saves in under
+     * eight minutes, and its two 2-second FIFO stalls sat beside the slowest ones. So after a
+     * burst the save waits until the last one is a minute old; what is lost by closing the game
+     * inside that minute is a few pipelines, rebuilt next time. */
+    if (ps3_ft_now() - s_sc.pc_last_save < 60000000000ull) return;
+#endif
     vk_sc_save_async(1);
     vk_sc_maybe_stats("idle");
 }
@@ -5085,7 +5094,11 @@ static void vk_res_init(void)
     if (s_res.on) return;
     s_res.gw = s_vk.width; s_res.gh = s_vk.height;
     u32 q = (u32)(vk_postfx_render_scale_wanted() * 4.0f + 0.5f);   /* quarter steps, 1x..4x */
+#ifdef __SWITCH__   /* local change (Switch build): 0.5x and 0.75x too (vk_postfx.c PFX_SCALE_MIN_Q) */
+    if (q < 2u) q = 2u;
+#else
     if (q < 4u) q = 4u;
+#endif
     /* [wide] a wide picture scales x even at 720p */
     if ((q == 4u && !s_wide.on) || q > 16u || !s_vk.device) {
         vk_postfx_render_scale_active(1.0f);

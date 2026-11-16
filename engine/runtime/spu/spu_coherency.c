@@ -200,11 +200,45 @@ static void ll_drop(ll_stripe* s)
     atomic_store_explicit(&s->seq, q + 1u, memory_order_release);
     atomic_store_explicit(&s->v, 0, memory_order_release);
 }
+/* PS3_SPU_LL_SEQ_YIELD=<n> (default 512 in the Switch build, 0 elsewhere; 0 = never yield, the old loop): a seqlock reader waits for a
+ * writer to leave its stripe. The writer's critical section is a few hundred nanoseconds, so a reader
+ * that has spun this many pauses is waiting for a writer that is not running -- preempted while it held
+ * the stripe, which with five SPU threads, the PPU threads and the RSX thread on four cores is not rare.
+ * The old loop kept the reader on its core for the rest of its time slice (on AArch64 `yield` is a hint
+ * that most cores execute as a NOP, so the loop is also an uninterrupted stream of loads of the line the
+ * writer needs back); it was 1.2-2.4% of all busy CPU time in the gameplay profiles (spu_lockline_read_begin).
+ * Now the reader offers its core to a runnable thread every n pauses, as ll_take already does for
+ * writers every 4096. It changes when a waiting reader runs, not what it reads or in what order: the
+ * acquire load of the sequence word and the retry loop are as before. (The Windows build of this file
+ * yields on a clock, ll_wait_step.) */
+static int s_ll_seq_yield = -1;
+static __attribute__((noinline, cold)) int ll_seq_yield_init(void)
+{
+    const char* e = getenv("PS3_SPU_LL_SEQ_YIELD");
+#ifdef __SWITCH__
+    int n = e ? atoi(e) : 512;      /* the Switch build */
+#else
+    int n = e ? atoi(e) : 0;        /* the PC builds: upstream's loop, no yield, unless asked for */
+#endif
+    if (n < 0) n = 0;
+    __atomic_store_n(&s_ll_seq_yield, n, __ATOMIC_RELAXED);
+    return n;
+}
+static __attribute__((noinline)) unsigned ll_seq_wait(ll_stripe* s)
+{
+    int n = __atomic_load_n(&s_ll_seq_yield, __ATOMIC_RELAXED);
+    if (__builtin_expect(n < 0, 0)) n = ll_seq_yield_init();
+    unsigned q, spins = 0;
+    while ((q = atomic_load_explicit(&s->seq, memory_order_acquire)) & 1u) {
+        ll_pause();
+        if (n && ++spins >= (unsigned)n) { spins = 0; sched_yield(); }
+    }
+    return q;
+}
 static uint32_t ll_seq_begin(ll_stripe* s)
 {
-    unsigned q;
-    while ((q = atomic_load_explicit(&s->seq, memory_order_acquire)) & 1u) ll_pause();
-    return q;
+    const unsigned q = atomic_load_explicit(&s->seq, memory_order_acquire);
+    return __builtin_expect(!(q & 1u), 1) ? q : ll_seq_wait(s);
 }
 static int ll_seq_valid(ll_stripe* s, uint32_t q)
 {

@@ -33,12 +33,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <immintrin.h>
+/* aarch64 (the Nintendo Switch), or -DEDGE_FORCE_SIMDE=1 -DSIMDE_NO_NATIVE on x86: the x86 intrinsics below come
+ * from SIMDe through edge_simde.h and MXCSR (control and sticky flags) becomes FPCR / FPSR (see there).
+ * Everywhere else (the PC build) nothing changes: the real <immintrin.h>. */
+#if defined(__aarch64__) || defined(EDGE_FORCE_SIMDE)
+#  define EDGE_SIMDE 1
+#else
+#  define EDGE_SIMDE 0
+#  include <immintrin.h>
+#endif
 
 #include "spu_context.h"
 #include "spu_helpers.h"
-
-#if !defined(__SSE4_1__) || !defined(__FMA__)
+#if EDGE_SIMDE
+#  include "edge_simde.h"   /* after spu_helpers.h: it redefines __m128i & co. as SIMDe's */
+#elif !defined(__SSE4_1__) || !defined(__FMA__)
 #error "job216_bsp_native.c needs SSE4.1 and FMA (the SPU sources' /arch:AVX2)"
 #endif
 #if defined(__clang__)
@@ -50,7 +59,7 @@
 #define J220_IMAGE 216   /* our image id of jobmod_9cb47b0cc0eb_e60c0 (Thiago: 220) */
 #define J220_BSP   0x68D8u
 #define LSQ        0x3FFF0u
-#define CSR_FAST   0xFFC0u               /* RZ | FZ | DAZ, all exceptions masked */
+#define CSR_FAST   0xFFC0u               /* RZ | FZ | DAZ, all exceptions masked (aarch64: edge_simde.h's FPCR value) */
 #define NOINL      __attribute__((noinline))
 
 typedef __m128i V;                       /* a quad: lane i = SPU word i */
@@ -465,11 +474,19 @@ int j220_bsp_run(u128* gpr, uint8_t* ls)
 {
     if (!t_j) { t_j = (Journal*)calloc(1, sizeof *t_j); if (!t_j) return 0; }
     B b = { ls, t_j, 0 };
+#if EDGE_SIMDE
+    edge_fp_saved fp;
+    edge_fp_enter(&fp);                          /* FPCR = the SPU's mode, FPSR flags cleared */
+    bsp(&b, gpr);
+    if (edge_fp_bad()) b.bad = 1;                /* overflow or invalid */
+    edge_fp_leave(&fp);
+#else
     const unsigned csr = _mm_getcsr();
     _mm_setcsr(CSR_FAST);
     bsp(&b, gpr);
     if (_mm_getcsr() & 0x9) b.bad = 1;          /* overflow or invalid */
     _mm_setcsr(csr);
+#endif
     t_why = b.bad;
     if (b.bad) { j_undo(t_j, ls); return 0; }
     j_clear(t_j);
@@ -489,6 +506,10 @@ static int j220_entry(spu_context* ctx)
         __atomic_store_n(&s_mode, m, __ATOMIC_RELEASE);
     }
     if (!s_mode) return 0;
+#if defined(__aarch64__)
+    /* the helpers of this TU (SPU_FLOAT_RZ_ONLY) assume the SPU run's FPCR (RZ + FZ): any other, the lifted code decides */
+    if ((edge_getcsr() & EDGE_CSR_FAST) != EDGE_CSR_FAST) return 0;
+#endif
     return j220_bsp_run(ctx->gpr, ctx->ls);
 }
 __attribute__((constructor)) static void j220_register(void)

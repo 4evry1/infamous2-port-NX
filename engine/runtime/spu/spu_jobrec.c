@@ -351,6 +351,7 @@ static void jr_restore(spu_context* c, const jr_state* s)
         c->resident_code[i].image_id = s->resident_code[i].image_id;
         c->resident_code[i].reloc = s->resident_code[i].reloc;
     }
+    spu_resident_box_update(c);   /* the span box over resident_code (spu_context.h) follows the slots */
     c->list_stall_mask = s->list_stall_mask; c->list_stall_stat = s->list_stall_stat;
     memcpy(c->list_stall_elem_lsa, s->list_stall_elem_lsa, sizeof s->list_stall_elem_lsa);
     memcpy(c->list_stall_remaining, s->list_stall_remaining, sizeof s->list_stall_remaining);

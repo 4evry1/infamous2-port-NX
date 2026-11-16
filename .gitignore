@@ -38,3 +38,16 @@ __pycache__/
 /settings.ini
 /mods.ini
 /spots.ini
+# Switch target (switch/): builds, console run output, and the game folders when they are symlinks
+# (a trailing-slash rule does not match a symlink)
+*.nro
+*.nso
+*.nacp
+*.nsp
+/game
+/eboot
+/deps
+/tools-cache
+ftrace.txt
+profile-*.bin
+playlog.tsv

@@ -1,0 +1,26 @@
+# Switch (aarch64) build: the SPU natives that may take over lifted functions (switch/scripts/lift.sh passes
+# this file as PORT_SPU_NATIVES_FILE). Same format as natives/spu/natives.txt:  <image name> <addr>[:<continuation>] ...
+# A native that declines a call (an input it does not model) lets the lifted function run instead.
+#
+# image 204 (jobmod_3af9ed8fe0d4_e14ff0): the render-list builder, main 0x12C60 (natives/spu/job204_native.c).
+jobmod_3af9ed8fe0d4_e14ff0 0x12C60
+#
+# image 223 (jobmod_d0d15ec83992_ea2a0): Edge Geometry (natives/spu/edge223_native.c; on aarch64 its x86 intrinsics
+# come from SIMDe through natives/spu/edge_simde.h, and vertex compression has its own NEON path):
+#   skinning 0xD0A8, cull transform 0xA3C8, cull 0xA798, vertex decompression 0x4448,
+#   vertex compression 0x99E8 (continues at 0x98B0), index decompression 0xC7B8.
+# On the Switch the compression chunk was 1.6% of all busy CPU lifted. The index kernel stays off unless
+# PS3_NATIVE_EDGE_IDX=1 (2 = a check run that compares it with the lifted code on every call).
+jobmod_d0d15ec83992_ea2a0 0xD0A8 0xA3C8 0xA798 0x4448 0x99E8:0x98B0 0xC7B8
+#
+# image 210 (jobmod_867e5d2348b3_e2898): the culling-tree walk, worker 0x4358 (switch/natives/job210_native.c,
+# from ThiagoFraga761/infamous2-pc jobbc11_native.c, MIT; NEON float layer).
+jobmod_867e5d2348b3_e2898 0x4358
+#
+# image 208 (jobmod_7393701cbd39_e1390): the flat instance culler, worker 0x4030 (switch/natives/job208_native.c,
+# from ThiagoFraga761/infamous2-pc job207_native.c, MIT; NEON float layer).
+jobmod_7393701cbd39_e1390 0x4030
+#
+# image 216 (jobmod_9cb47b0cc0eb_e60c0): the BSP polygon clipper 0x68D8 (natives/spu/job216_bsp_native.c; it undoes
+# itself and lets the lifted code run on any input it cannot take). PS3_NATIVE_J220=0 in env.txt turns it off.
+jobmod_9cb47b0cc0eb_e60c0 0x68D8

@@ -286,16 +286,58 @@ VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
 VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
 VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
 
-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vmaddfp_scalar(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, y))), vscr)); } VMX_OUT; }
-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+VMX_INL void vmx_vnmsubfp_scalar(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+
+/* vmaddfp / vnmsubfp on aarch64 (the Switch): the same four lanes in one NEON register.
+ * The scalar loops above were 1.7% of all busy CPU on the console (run 34: vmx_vmaddfp 1.5%,
+ * vmx_vnmsubfp 0.2%, never inlined). Every step is the scalar code's, lane-wise and bit for bit:
+ * big-endian load (rev32), the VSCR[NJ] input flush (exponent 0 -> the sign alone), one fused
+ * multiply-add under the current FPCR (FMLA, as fmaf), any NaN -> 0x7FC00000 (vmx_fix), the output
+ * flush, big-endian store. No input needs a fallback. The Switch layer's boot self-test compares
+ * both forms on a million vectors of mixed specials (horizon/src/hz_spu_selftest.c).
+ * -DPPU_VMX_SCALAR = the scalar forms everywhere. */
+#if defined(__aarch64__) && !defined(PPU_VMX_SCALAR)
+#include <arm_neon.h>
+#define PPU_VMX_NEON 1
+VMX_INL uint32x4_t vmx_ld4(const void* p) { return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8((const uint8_t*)p))); }
+VMX_INL void vmx_st4(void* p, uint32x4_t v) { vst1q_u8((uint8_t*)p, vrev32q_u8(vreinterpretq_u8_u32(v))); }
+VMX_INL uint32x4_t vmx_flush4(uint32x4_t x, uint32_t vscr) {
+    if (!(vscr & VMX_NJ)) return x;
+    const uint32x4_t den = vceqq_u32(vandq_u32(x, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0));
+    return vbslq_u32(den, vandq_u32(x, vdupq_n_u32(0x80000000u)), x);
+}
+VMX_INL uint32x4_t vmx_fix4(uint32x4_t r) {
+    const uint32x4_t nan = vcgtq_u32(vandq_u32(r, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x7F800000u));
+    return vbslq_u32(nan, vdupq_n_u32(0x7FC00000u), r);
+}
+VMX_INL void vmx_vmaddfp_neon(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const float32x4_t x = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(a_), vscr));
+    const float32x4_t y = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(b_), vscr));
+    const float32x4_t z = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(c_), vscr));
+    vmx_st4(d_, vmx_flush4(vmx_fix4(vreinterpretq_u32_f32(vfmaq_f32(y, x, z))), vscr));   /* x*z + y */
+}
+VMX_INL void vmx_vnmsubfp_neon(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const float32x4_t x = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(a_), vscr));
+    const float32x4_t y = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(b_), vscr));
+    const float32x4_t z = vreinterpretq_f32_u32(vmx_flush4(vmx_ld4(c_), vscr));
+    const float32x4_t m = vnegq_f32(vfmaq_f32(vnegq_f32(y), x, z));                          /* -(x*z - y) */
+    vmx_st4(d_, vmx_flush4(vmx_fix4(vreinterpretq_u32_f32(m)), vscr));
+}
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_neon(d_, a_, b_, c_, vscr); }
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_neon(d_, a_, b_, c_, vscr); }
+#else
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_scalar(d_, a_, b_, c_, vscr); }
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_scalar(d_, a_, b_, c_, vscr); }
+#endif
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
@@ -311,20 +353,34 @@ VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
 VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
 VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
 
-/* int <-> float with a 2^uimm scale */
+/* int <-> float with a 2^uimm scale.
+ * hz-0.32: the scale is a multiply by the exact power of two (vmx_p2: the float 2^e built from its
+ * exponent field, e within -31..31 here) instead of ldexpf, a libm call per lane (about 6,900 call
+ * sites in the Switch build). The same result bit for bit: the scale of a converted integer (0 or at
+ * least 1 in magnitude) by 2^-31..2^0 stays normal, so ldexpf does no rounding, and the product with
+ * an exact power of two is exact too; 2^uimm for vctsxs / vctuxs is that constant. */
+#ifdef __SWITCH__
+VMX_INL float vmx_p2(int e) { return vmx_f((uint32_t)(127 + e) << 23); }
+#define VMX_SCALE_DOWN(x, uimm) ((x) * vmx_p2(-(int)(uimm)))   /* x * 2^-uimm */
+#define VMX_POW2(uimm)          vmx_p2((int)(uimm))            /* 2^uimm */
+#else
+/* the PC builds keep upstream's ldexpf */
+#define VMX_SCALE_DOWN(x, uimm) ldexpf((x), -(int)(uimm))
+#define VMX_POW2(uimm)          ldexpf(1.0f, (int)(uimm))
+#endif
 VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(VMX_SCALE_DOWN((float)vmx_w(b, i), uimm))); VMX_OUT; }
 VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)(int32_t)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+    for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(VMX_SCALE_DOWN((float)(int32_t)vmx_w(b, i), uimm))); VMX_OUT; }
 VMX_INL void vmx_vctsxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); int32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * VMX_POW2(uimm); int32_t v;
         if (f != f) v = 0;
         else if (f < -2147483648.0f) { v = INT32_MIN; *vscr |= VMX_SAT; }
         else if (f >= 2147483648.0f) { v = INT32_MAX; *vscr |= VMX_SAT; }
         else v = (int32_t)f;
         vmx_sw(r, i, (uint32_t)v); } VMX_OUT; }
 VMX_INL void vmx_vctuxs(VMX_D, VMX_B, unsigned uimm, uint32_t* vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
-    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * ldexpf(1.0f, (int)uimm); uint32_t v;
+    for (int i = 0; i < 4; i++) { float f = vmx_f(vmx_w(b, i)) * VMX_POW2(uimm); uint32_t v;
         if (f != f) v = 0;
         else if (f < 0.0f) { v = 0; *vscr |= VMX_SAT; }
         else if (f >= 4294967296.0f) { v = 0xFFFFFFFFu; *vscr |= VMX_SAT; }

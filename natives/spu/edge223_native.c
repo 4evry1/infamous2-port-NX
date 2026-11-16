@@ -75,7 +75,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
-#include <immintrin.h>
+/* aarch64 (the Nintendo Switch), or -DEDGE_FORCE_SIMDE=1 -DSIMDE_NO_NATIVE on x86 (the test that the SIMDe
+ * path is bit-exact): the x86 intrinsics below come from SIMDe through edge_simde.h, MXCSR becomes FPCR.
+ * Everywhere else (the PC build) nothing changes: the real <immintrin.h>. */
+#if defined(__aarch64__) || defined(EDGE_FORCE_SIMDE)
+#  define EDGE_SIMDE 1
+#else
+#  define EDGE_SIMDE 0
+#  include <immintrin.h>
+#endif
 
 #include "spu_context.h"
 #include "spu_helpers.h"
@@ -91,6 +99,9 @@
 #  endif
 #endif
 
+#if EDGE_SIMDE
+#  include "edge_simde.h"   /* after spu_helpers.h: it redefines __m128i & co. as SIMDe's */
+#endif
 /* Only the SIMDe headers this file uses: the umbrella avx512.h pulls in fixupimm_round.h, which
  * clang-cl rejects ("imm8 must be constant"). */
 #define SIMDE_AVX512_DIR "simde-0.8.2/simde/x86/avx512/"
@@ -137,8 +148,21 @@
 #include "simde-0.8.2/simde/x86/avx512/xor.h"
 #undef SIMDE_AVX512_DIR
 
-#if !defined(SIMDE_X86_AVX2_NATIVE) || !defined(SIMDE_X86_FMA_NATIVE)
+#if EDGE_SIMDE
+/* SIMDe's 512-bit fmadd / fmsub / fnmadd are an unfused multiply and add off x86 (and with SIMDE_NO_NATIVE):
+ * the fused ones of edge_simde.h instead (the 256-bit family is mapped there). */
+#  include "edge_simde_512.h"
+#  if defined(__aarch64__)
+#    define EDGE_BACKEND "SIMDe/NEON"
+#  else
+#    define EDGE_BACKEND "SIMDe/portable (x86 test build)"
+#  endif
+#  define EDGE_BACKEND_NOAVX2 EDGE_BACKEND ", 512-bit forms"
+#elif !defined(SIMDE_X86_AVX2_NATIVE) || !defined(SIMDE_X86_FMA_NATIVE)
 #error "edge223_native.c needs AVX2 and FMA (the SPU sources' /arch:AVX2): SIMDe would fall back to unfused multiply-add"
+#else
+#  define EDGE_BACKEND "AVX2"
+#  define EDGE_BACKEND_NOAVX2 "SIMDe on AVX2"   /* upstream's text */
 #endif
 
 /* ---- what SIMDe 0.8.2 lacks: lane for lane the AVX-512 instruction ---- */
@@ -273,7 +297,11 @@ static inline Q quad_at(const uint8_t* ls, uint32_t addr)
  * The fast functions are noinline: the compiler does not order floating-point
  * arithmetic against MXCSR writes, but it cannot move it out of a call. */
 typedef simde__m512i Z;
+#ifdef EDGE_CSR_FAST
+#define CSR_FAST EDGE_CSR_FAST                 /* aarch64: FPCR RZ | FZ (edge_simde.h) */
+#else
 #define CSR_FAST 0xFFC0u                       /* RZ | FZ | DAZ, all exceptions masked */
+#endif
 #define B_IN 0x48800000                        /* 2^18 */
 #define B_RSQ 0x71800000                       /* 2^100: a factor from fi */
 #define NOINL __attribute__((noinline))
@@ -1318,8 +1346,31 @@ typedef struct {
  * the per-triangle tests (outside, back face, zero area) and the compaction are skipped.
  * PS3RECOMP_EDGE_TSC=1: cycles per kernel (and the cull's transform / triangle loop apart) in the exit report. */
 static int g_gpu, g_tsc;
+/* The exit report's counters are shared atomics bumped on every kernel call (and four times by every cull
+ * call): on the Switch's four Cortex-A57 cores each of them moves a cache line between cores. aarch64 counts
+ * only with PS3RECOMP_EDGE_STATS=1 (or PS3RECOMP_EDGE_TSC=1); every other build counts as before
+ * (PS3RECOMP_EDGE_STATS=0 turns it off there too). */
+#if defined(EDGE_A64) && EDGE_A64
+static int g_stats;
+#else
+static int g_stats = 1;
+#endif
+#if EDGE_SIMDE
+/* aarch64: thread-local storage is laid out for EVERY thread the process starts (libnx gives each one a copy of
+ * the whole .tbss, on the Switch's heap), and two static thread-local buffers made it 155 KB (the cull's copy of
+ * its index buffer, 131 KB; the decompression's per-vertex-group flags, 16 + 8 KB). Only the few SPU threads that
+ * run Edge need them: they are malloc'd once per thread, through a thread-local pointer, before the kernel
+ * writes anything (a failure declines the call / takes the exact path). */
+static _Thread_local uint8_t* t_idx;
+static _Thread_local uint8_t* t_decbad;
+static inline uint8_t* edge_tls_buf(uint8_t** slot, size_t n)
+{
+    if (unlikely(!*slot)) *slot = (uint8_t*)malloc(n);
+    return *slot;
+}
+#endif
 static unsigned long long g_cs_calls, g_cs_nt, g_cs_kept, g_cs_zero, g_cs_xf_cyc, g_cs_run_cyc, g_cs_gpu_cull;
-#define CSADD(v, n) __atomic_fetch_add(&(v), (unsigned long long)(n), __ATOMIC_RELAXED)
+#define CSADD(v, n) do { if (g_stats) __atomic_fetch_add(&(v), (unsigned long long)(n), __ATOMIC_RELAXED); } while (0)
 static inline uint32_t be16(const uint8_t* p) { return (uint32_t)p[0] << 8 | p[1]; }
 
 /* the largest of n big-endian u16 at ls + (B & LSM) (the wrap of the LS address kept for the odd case), AVX2:
@@ -1498,13 +1549,53 @@ static NOINL void cull_run(uint8_t* ls, Cull* k, uint32_t csr)
     }
 }
 
+#if EDGE_SIMDE
+typedef uint32_t edge_u32x4 __attribute__((vector_size(16)));
+typedef uint32_t edge_u32x8 __attribute__((vector_size(32)));
+typedef uint8_t edge_u8x16 __attribute__((vector_size(16)));
+/* the 16-byte record at p, its four words as values (the LS holds them big-endian) */
+static inline __attribute__((always_inline)) edge_u32x4 edge_ldrec(const uint8_t* p)
+{
+    edge_u8x16 v; memcpy(&v, p, 16);
+    v = __builtin_shufflevector(v, v, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    edge_u32x4 r; memcpy(&r, &v, 16); return r;
+}
+/* words 0, 1, 2 of four records, one word per register in record order (a 4 x 4 transpose without its last row) */
+static inline __attribute__((always_inline)) void edge_rec4(edge_u32x4 r0, edge_u32x4 r1, edge_u32x4 r2, edge_u32x4 r3,
+                                                            edge_u32x4* x, edge_u32x4* y, edge_u32x4* z)
+{
+    const edge_u32x4 t0 = __builtin_shufflevector(r0, r1, 0, 4, 1, 5), t1 = __builtin_shufflevector(r2, r3, 0, 4, 1, 5);
+    const edge_u32x4 t2 = __builtin_shufflevector(r0, r1, 2, 6, 3, 7), t3 = __builtin_shufflevector(r2, r3, 2, 6, 3, 7);
+    *x = __builtin_shufflevector(t0, t1, 0, 1, 4, 5);
+    *y = __builtin_shufflevector(t0, t1, 2, 3, 6, 7);
+    *z = __builtin_shufflevector(t2, t3, 0, 1, 4, 5);
+}
+#endif
 /* cull_batch16 for AVX2: eight triangles (groups g0, g0 + 1), lane t = triangle t, the records
  * gathered word by word. MXCSR is CSR_FAST. 0: the groups need the exact way. */
 static inline __attribute__((always_inline)) int cull_batch8(const uint8_t* ls, const Cull* k, uint32_t g0, uint16_t* masks)
 {
     const uint8_t* ip = k->idx + 24 * g0;
-    const Y t6 = _mm256_setr_epi32(0, 6, 12, 18, 24, 30, 36, 42);
     Y sx[3], sy[3], cd[3];
+#if EDGE_SIMDE
+    /* No AVX2 gathers here (SIMDe turns each into a scalar loop: twelve of them, 96 loads, per eight triangles):
+     * each record is one 16-byte load, byte-swapped, and the eight of a vertex go through two 4 x 4 transposes
+     * (clang vector extensions: zip / trn on NEON). The same words in the same lanes as the gathers below. */
+    for (int v = 0; v < 3; v++) {
+        edge_u32x4 R[8];
+        for (int t = 0; t < 8; t++) {
+            const uint32_t ix = (uint32_t)ip[6 * t + 2 * v] << 8 | ip[6 * t + 2 * v + 1];   /* the index, big-endian u16 */
+            R[t] = edge_ldrec(ls + ((k->rec + (ix << 4)) & LSQ));
+        }
+        edge_u32x4 x0, y0, z0, x1, y1, z1;
+        edge_rec4(R[0], R[1], R[2], R[3], &x0, &y0, &z0);
+        edge_rec4(R[4], R[5], R[6], R[7], &x1, &y1, &z1);
+        const edge_u32x8 X = __builtin_shufflevector(x0, x1, 0, 1, 2, 3, 4, 5, 6, 7), Yy = __builtin_shufflevector(y0, y1, 0, 1, 2, 3, 4, 5, 6, 7),
+                         Zz = __builtin_shufflevector(z0, z1, 0, 1, 2, 3, 4, 5, 6, 7);
+        memcpy(&sx[v], &X, 32); memcpy(&sy[v], &Yy, 32); memcpy(&cd[v], &Zz, 32);
+    }
+#else
+    const Y t6 = _mm256_setr_epi32(0, 6, 12, 18, 24, 30, 36, 42);
     for (int v = 0; v < 3; v++) {
         const Y w = _mm256_i32gather_epi32((const int*)(ip + 2 * v), t6, 1);   /* the index, LS byte order, in the low half */
         const Y ix = _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(w, Y1(0xFF)), 8), _mm256_and_si256(_mm256_srli_epi32(w, 8), Y1(0xFF)));
@@ -1513,6 +1604,7 @@ static inline __attribute__((always_inline)) int cull_batch8(const uint8_t* ls, 
         sy[v] = ybswap(_mm256_i32gather_epi32((const int*)(ls + 4), a, 1));
         cd[v] = ybswap(_mm256_i32gather_epi32((const int*)(ls + 8), a, 1));
     }
+#endif
     const Y orc = _mm256_or_si256(_mm256_or_si256(cd[0], cd[1]), cd[2]), andc = _mm256_and_si256(_mm256_and_si256(cd[0], cd[1]), cd[2]);
     const Y valid = _mm256_and_si256(_mm256_cmpeq_epi32(_mm256_and_si256(orc, Y1(4)), Y0), _mm256_cmpgt_epi32(_mm256_and_si256(andc, Y1(2)), Y0));
     const Y inside = _mm256_cmpeq_epi32(_mm256_and_si256(andc, Y1(252)), Y0);
@@ -1607,6 +1699,9 @@ static int edge_cull_core(u128* gpr, uint8_t* ls)
             const Span w2[4] = { { sp2 - 0x30, sp + 0x20, 1 }, { S, S + 0x1B0, 1 }, { k.B, k.B + 24 * k.ng + 48, 1 },
                                  { k.rec, k.rec + 16 * (maxi + 1), 0 } };
             if (!spans_ok(w1, 5) || !spans_ok(w2, 4)) return 0;
+#if EDGE_SIMDE
+            if (!edge_tls_buf(&t_idx, 24 * 5462 + 128)) return 0;
+#endif
         }
     }
     /* prologue */
@@ -1637,7 +1732,11 @@ static int edge_cull_core(u128* gpr, uint8_t* ls)
                 k.kept = (k.nt && (andc & 252)) ? 0 : k.nt;
                 CSADD(g_cs_gpu_cull, 1);
             } else {
+#if EDGE_SIMDE
+                uint8_t* const idx = t_idx;                            /* allocated above, before the prologue */
+#else
                 static _Thread_local uint8_t idx[24 * 5462 + 128];   /* 65535 indexes at most */
+#endif
                 memcpy(idx, ls + k.B, 24 * k.ng + 64);
                 k.idx = idx;
                 cull_store(ls, &k, 0, 15);                          /* the pipeline's two empty steps */
@@ -1881,7 +1980,11 @@ static NOINL void dec_exact_uv_pair(uint8_t* ls, uint32_t ra, uint32_t rb, uint3
 /* MXCSR is CSR_FAST here; csr is the caller's */
 static void dec_fast_uv(uint8_t* ls, uint32_t rec, uint32_t stride, uint32_t o, uint32_t dst, uint32_t n2, uint32_t csr)
 {
+#if EDGE_SIMDE
+    uint16_t* const bad = (uint16_t*)t_decbad;
+#else
     static _Thread_local uint16_t bad[SPU_LS_SIZE / 64];
+#endif
     dst &= LSQ;
     if (likely(!dec_fast_uv_pass(ls, rec, stride, o ? DEC_USHUF(6) : DEC_USHUF(0), dst, n2, bad))) return;
     _mm_setcsr(csr);
@@ -1952,8 +2055,15 @@ static inline unsigned dec_uv8(uint8_t* ls, uint32_t rec, uint32_t stride, uint3
                                    _mm256_cmpgt_epi32(seli, Y1(7)));
     const Y hs = _mm256_or_si256(yabs(h), _mm256_slli_epi32(_mm256_and_si256(d, Y1(1u << 8)), 23));
     Y c[4];
+#if EDGE_SIMDE
+    const Y dsh[3] = { d, _mm256_srli_epi32(d, 2), _mm256_srli_epi32(d, 4) };   /* literal counts: SIMDe's NEON shift takes an immediate */
+#endif
     for (int i = 0; i < 3; i++) {
+#if EDGE_SIMDE
+        const Y src = _mm256_and_si256(dsh[i], Y1(3));
+#else
         const Y src = _mm256_and_si256(_mm256_srli_epi32(d, 2 * i), Y1(3));
+#endif
         c[i] = _mm256_blendv_epi8(_mm256_blendv_epi8(hs, ma, _mm256_cmpeq_epi32(src, Y1(1))), mb, _mm256_cmpeq_epi32(src, Y1(2)));
     }
     c[3] = _mm256_or_si256(Y1(F1), _mm256_slli_epi32(_mm256_and_si256(d, Y1(1u << 9)), 22));
@@ -1981,7 +2091,11 @@ static NOINL unsigned dec_fast_uv_pass_y(uint8_t* ls, uint32_t rec, uint32_t str
 /* dec_fast_uv for AVX2: the unit vector at byte o of each record; MXCSR is CSR_FAST, csr the caller's */
 static void dec_fast_uv_y(uint8_t* ls, uint32_t rec, uint32_t stride, uint32_t o, uint32_t dst, uint32_t n2, uint32_t csr)
 {
+#if EDGE_SIMDE
+    uint8_t* const bad = t_decbad;
+#else
     static _Thread_local uint8_t bad[SPU_LS_SIZE / 16];
+#endif
     dst &= LSQ;
     if (likely(!dec_fast_uv_pass_y(ls, rec, stride, o, dst, n2, bad))) return;
     _mm_setcsr(csr);
@@ -2048,7 +2162,7 @@ static unsigned long long g_dec_fb[DEC_FB_N];
 /* PS3RECOMP_EDGE_DEC_LAYOUT=0 restores the strict overlap guard (no spans of
  * different loops may overlap), the kill switch for the layout change. */
 static int g_dec_layout = 1;
-#define DEC_FALLBACK(r) do { __atomic_fetch_add(&g_dec_fb[r], 1, __ATOMIC_RELAXED); return 0; } while (0)
+#define DEC_FALLBACK(r) do { if (g_stats) __atomic_fetch_add(&g_dec_fb[r], 1, __ATOMIC_RELAXED); return 0; } while (0)
 static int edge_dec_core(u128* gpr, uint8_t* ls)
 {
     const uint32_t S = gpr[3]._u32[0], T = gpr[4]._u32[0], D = gpr[5]._u32[0], sp = gpr[1]._u32[0];
@@ -2129,7 +2243,11 @@ static int edge_dec_core(u128* gpr, uint8_t* ls)
         sq(ls, S + 0x170, slots);
     }
     const int fast = g_dec_ok && (!g_avx2 || g_dec_y_ok) && k.P + 9 * (k.n2 + 2) + 16 <= SPU_LS_SIZE && (!k.tan || k.P2 + 3 * (k.n2 + 2) + 16 <= SPU_LS_SIZE) &&
-                     !memcmp(ls + DEC_TAB, k_dec_tab_be, sizeof k_dec_tab_be);
+                     !memcmp(ls + DEC_TAB, k_dec_tab_be, sizeof k_dec_tab_be)
+#if EDGE_SIMDE
+                     && edge_tls_buf(&t_decbad, SPU_LS_SIZE / 16)
+#endif
+                     ;
     /* Everything of the first loop before anything of the second (see the
      * guard above); within a loop the spans are disjoint, so any order. */
     sq(ls, k.U2 + 16 * k.n2, splat4(0)); sq(ls, k.U2 + 16 * k.n2 + 16, splat4(0));
@@ -2258,6 +2376,115 @@ static NOINL int enc_fast4(uint8_t* ls, const Enc* k, uint32_t v, uint32_t nv)
     }
     return 1;
 }
+#if defined(__aarch64__) && !defined(EDGE_FORCE_SIMDE)
+#include <arm_neon.h>
+/* enc_fast4 in plain NEON (hz-0.39). Under SIMDe every 512-bit value of enc_fast4 is four
+ * q registers spilled to the stack, and its mask moves and compares run lane by lane: console
+ * run 38 spent 3.6% of all busy CPU in enc_pack4 + enc_fast4, most of it on those spills and the
+ * scalar mask loops. Here vld4q_u32 deinterleaves the four vertices, so x, y, z of all four sit
+ * in one register each and the packed word comes out four at a time.
+ * Same results as enc_fast4: same FPCR (the caller's CSR_FAST), the same fused multiply-add;
+ * vcvtq_s32_f32 saturates to 0x7FFFFFFF where cvttps gives 0x80000000 and enc_pack4 then
+ * puts 0x7FFFFFFF (f >= 1.0), and to 0x80000000 below -1.0 as cvttps does; NaN and infinity
+ * inputs (exponent 255) go to the exact path as before. A self-test on the first call compares
+ * the two on random groups and keeps enc_fast4 on any difference (PS3_EDGE_ENC_NEON=0: never use
+ * this one). */
+static inline uint32x4_t enc_be(uint32x4_t v) { return vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(v))); }
+static inline uint32x4_t enc_word_n(uint32x4_t x, uint32x4_t y, uint32x4_t z, const float sc[3], const float bi[3])
+{
+    const float32x4_t two31 = vdupq_n_f32(0x1p31f);
+    const uint32x4_t cx = vreinterpretq_u32_s32(vcvtq_s32_f32(vmulq_f32(vfmaq_f32(vdupq_n_f32(bi[0]), vdupq_n_f32(sc[0]), vreinterpretq_f32_u32(x)), two31)));
+    const uint32x4_t cy = vreinterpretq_u32_s32(vcvtq_s32_f32(vmulq_f32(vfmaq_f32(vdupq_n_f32(bi[1]), vdupq_n_f32(sc[1]), vreinterpretq_f32_u32(y)), two31)));
+    const uint32x4_t cz = vreinterpretq_u32_s32(vcvtq_s32_f32(vmulq_f32(vfmaq_f32(vdupq_n_f32(bi[2]), vdupq_n_f32(sc[2]), vreinterpretq_f32_u32(z)), two31)));
+    return vorrq_u32(vandq_u32(cz, vdupq_n_u32(0xFFC00000u)), vorrq_u32(vshlq_n_u32(vshrq_n_u32(cy, 21), 11), vshrq_n_u32(cx, 21)));
+}
+static inline uint32x4_t enc_exp255(uint32x4x4_t q)
+{
+    const uint32x4_t e = vdupq_n_u32(0x7F800000u);
+    return vorrq_u32(vorrq_u32(vceqq_u32(vandq_u32(q.val[0], e), e), vceqq_u32(vandq_u32(q.val[1], e), e)), vceqq_u32(vandq_u32(q.val[2], e), e));
+}
+static NOINL int enc_fast4_neon(uint8_t* ls, const Enc* k, uint32_t v, uint32_t nv)
+{
+    uint32x4x4_t N = vld4q_u32((const uint32_t*)(ls + ((k->U2 + 16 * v) & LSQ)));
+    uint32x4x4_t T = vld4q_u32((const uint32_t*)(ls + ((k->U3 + 16 * v) & LSQ)));
+    for (int i = 0; i < 3; i++) { N.val[i] = enc_be(N.val[i]); T.val[i] = enc_be(T.val[i]); }
+    if (unlikely(vmaxvq_u32(vorrq_u32(enc_exp255(N), enc_exp255(T))))) return 0;
+    float sc[3], bi[3];
+    memcpy(sc, k->scale._u32, sizeof sc); memcpy(bi, k->bias._u32, sizeof bi);
+    uint32_t n[4], t[4];
+    vst1q_u32(n, enc_be(enc_word_n(N.val[0], N.val[1], N.val[2], sc, bi)));
+    vst1q_u32(t, enc_be(enc_word_n(T.val[0], T.val[1], T.val[2], sc, bi)));
+    /* (x, y, z, n) per vertex in LS byte order, the position's bytes as they are, then t */
+    uint8_t p[64];
+    memcpy(p, ls + k->U1 + 16 * v, 64);
+    uint8_t* o = ls + k->O + 20 * v;
+    const uint32_t count = nv > 2 ? 4 : 2;
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(o + 20 * i, p + 16 * i, 12);
+        memcpy(o + 20 * i + 12, &n[i], 4);
+        memcpy(o + 20 * i + 16, &t[i], 4);
+    }
+    return 1;
+}
+/* -1 untested, 2 testing, 1 NEON path on, 0 off */
+static int g_enc_neon = -1;
+static uint32_t enc_rng(uint32_t* s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
+static uint32_t enc_rand_word(uint32_t* s)
+{
+    float f;
+    switch (enc_rng(s) & 7) {
+    case 0: return enc_rng(s);                                            /* any bits: huge, tiny, NaN, inf */
+    case 1: return enc_rng(s) & 0x807FFFFFu;                              /* zero / denormal */
+    case 2: return (enc_rng(s) & 0x80000000u) | 0x3F800000u | (enc_rng(s) & 0x7FF);   /* about +-1 */
+    default: f = ((int32_t)enc_rng(s) / 2147483648.0f) * 1.5f; { uint32_t w; memcpy(&w, &f, 4); return w; }
+    }
+}
+/* runs under the caller's CSR_FAST */
+static int enc_neon_selftest(void)
+{
+    enum { GROUPS = 20000, A_U1 = 0x1000, A_U2 = 0x2000, A_U3 = 0x3000, A_O = 0x4003 };
+    uint8_t* a = malloc(0x5000);
+    uint8_t* b = malloc(0x5000);
+    if (!a || !b) { free(a); free(b); return -1; }
+    Enc k;
+    memset(&k, 0, sizeof k);
+    k.U1 = A_U1; k.U2 = A_U2; k.U3 = A_U3; k.O = A_O; k.n2 = 4;
+    for (int i = 0; i < 4; i++) { k.scale._u32[i] = k_enc_scale[i]; k.bias._u32[i] = k_enc_bias[i]; }
+    uint32_t s = 0x9E3779B9u;
+    int differ = 0;
+    for (int g = 0; g < GROUPS; g++) {
+        for (uint32_t i = 0; i < 0x5000; i += 4) { const uint32_t w = enc_rand_word(&s); memcpy(a + i, &w, 4); }
+        memcpy(b, a, 0x5000);
+        const uint32_t nv = (g & 1) ? 4 : 2;
+        const int ra = enc_fast4(a, &k, 0, nv), rb = enc_fast4_neon(b, &k, 0, nv);
+        if (ra != rb || memcmp(a, b, 0x5000)) {
+            if (differ < 3) fprintf(stderr, "[edge] vertex compression NEON self-test: group %d differs (results %d %d)\n", g, ra, rb);
+            differ++;
+        }
+    }
+    free(a); free(b);
+    fprintf(stderr, "[edge] vertex compression NEON path: %d random groups checked, %d differ -> %s\n",
+            GROUPS, differ, differ ? "kept the SIMDe path" : "NEON path on");
+    return differ ? 0 : 1;
+}
+/* the fast path to use: the caller holds CSR_FAST */
+static inline int enc_fast4_any(uint8_t* ls, const Enc* k, uint32_t v, uint32_t nv)
+{
+    int on = __atomic_load_n(&g_enc_neon, __ATOMIC_ACQUIRE);
+    if (unlikely(on < 0)) {
+        int expect = -1;
+        if (__atomic_compare_exchange_n(&g_enc_neon, &expect, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            const char* e = getenv("PS3_EDGE_ENC_NEON");
+            const int r = (e && *e == '0') ? 0 : enc_neon_selftest();
+            on = r > 0 ? 1 : 0;
+            __atomic_store_n(&g_enc_neon, on, __ATOMIC_RELEASE);
+        } else on = 0;
+    }
+    return on == 1 ? enc_fast4_neon(ls, k, v, nv) : enc_fast4(ls, k, v, nv);
+}
+#else
+#define enc_fast4_any enc_fast4
+#endif
 /* the slot byte holding id, or -1 */
 static inline int enc_slot(Q q, uint32_t id)
 {
@@ -2302,7 +2529,7 @@ static int edge_enc_core(u128* gpr, uint8_t* ls)
         const uint32_t csr = _mm_getcsr();
         _mm_setcsr(CSR_FAST);
         for (uint32_t v = 0; v < n2; v += 4)
-            if (unlikely(!enc_fast4(ls, &k, v, n2 - v))) {
+            if (unlikely(!enc_fast4_any(ls, &k, v, n2 - v))) {
                 EDGE_EXACT(g_enc_exact);
                 _mm_setcsr(csr);
                 enc_exact(ls, &k, v, v + 4 < n2 ? v + 4 : n2);
@@ -2451,7 +2678,7 @@ static unsigned long long g_idx_fb[IDX_FB_N];
 #ifdef EDGE_HARNESS
 const unsigned long long* edge_idx_fallbacks(void) { return g_idx_fb; }
 #endif
-#define IDX_FALLBACK(r) do { __atomic_fetch_add(&g_idx_fb[r], 1, __ATOMIC_RELAXED); return 0; } while (0)
+#define IDX_FALLBACK(r) do { if (g_stats) __atomic_fetch_add(&g_idx_fb[r], 1, __ATOMIC_RELAXED); return 0; } while (0)
 static int edge_idx_core(u128* gpr, uint8_t* ls)
 {
     const uint32_t S = gpr[3]._u32[0], B = gpr[4]._u32[0], sp = gpr[1]._u32[0];
@@ -2645,6 +2872,51 @@ EdgeCore edge_core_for(uint32_t addr)
 static int s_init = -1;
 static const char* const k_env[] = { "PS3_NATIVE_EDGE_SKIN", "PS3_NATIVE_EDGE_XF", "PS3_NATIVE_EDGE_CULL",
                                      "PS3_NATIVE_EDGE_DEC", "PS3_NATIVE_EDGE_ENC", "PS3_NATIVE_EDGE_IDX" };
+/* edge2-arm (2026-11-13): what the kernels assume of the host, checked once at start-up (any build: it is
+ * a few dozen instructions). The kernels stay off if one of these fails. At CSR_FAST:
+ *  - the fused multiply-add family (256- and 512-bit) is one rounding: a = b = 1 + 2^-12, c = -(1 + 2^-11):
+ *    fma = 2^-24, fmsub with +c, fnmadd with +c: -2^-24; an unfused multiply and add gives 0 / 0 / 0;
+ *  - round toward zero: 1.0f + 1.5 * 2^-24 is 1.0f (to nearest it would be 1 + 2^-23); int -> float
+ *    16777219 is 16777218 (to nearest 16777220);
+ *  - flush-to-zero / denormals-are-zero: 0x00400000 * 1.0f is +0. */
+static NOINL int edge_selftest(void)
+{
+    uint32_t r[8][8];
+    static volatile uint32_t va = 0x3F800800u, vc = 0xBF801000u, vp = 0x3F801000u, vh = 0x33C00000u, vd = 0x00400000u, vi = 16777219u, v1 = 0x3F800000u;
+    const uint32_t csr = _mm_getcsr();
+    _mm_setcsr(CSR_FAST);
+    const __m256 a = _mm256_castsi256_ps(_mm256_set1_epi32((int)va)), c = _mm256_castsi256_ps(_mm256_set1_epi32((int)vc)),
+                 p = _mm256_castsi256_ps(_mm256_set1_epi32((int)vp));
+    _mm256_storeu_si256((__m256i*)r[0], _mm256_castps_si256(_mm256_fmadd_ps(a, a, c)));
+    _mm256_storeu_si256((__m256i*)r[1], _mm256_castps_si256(_mm256_fmsub_ps(a, a, p)));
+    _mm256_storeu_si256((__m256i*)r[2], _mm256_castps_si256(_mm256_fnmadd_ps(a, a, p)));
+    {
+        const simde__m512 A = simde_mm512_castsi512_ps(simde_mm512_set1_epi32((int)va)), C = simde_mm512_castsi512_ps(simde_mm512_set1_epi32((int)vc)),
+                          P = simde_mm512_castsi512_ps(simde_mm512_set1_epi32((int)vp));
+        uint32_t z[3][16];
+        simde_mm512_storeu_si512(z[0], simde_mm512_castps_si512(simde_mm512_fmadd_ps(A, A, C)));
+        simde_mm512_storeu_si512(z[1], simde_mm512_castps_si512(simde_mm512_fmsub_ps(A, A, P)));
+        simde_mm512_storeu_si512(z[2], simde_mm512_castps_si512(simde_mm512_fnmadd_ps(A, A, P)));
+        for (int i = 0; i < 3; i++) { r[3 + i][0] = z[i][0]; r[3 + i][1] = z[i][15]; }
+    }
+    const __m256 one = _mm256_set1_ps(1.0f);
+    _mm256_storeu_si256((__m256i*)r[6], _mm256_castps_si256(_mm256_add_ps(one, _mm256_castsi256_ps(_mm256_set1_epi32((int)vh)))));
+    {
+        uint32_t t[8], u[8];
+        _mm256_storeu_si256((__m256i*)t, _mm256_castps_si256(_mm256_cvtepi32_ps(_mm256_set1_epi32((int)vi))));
+        _mm256_storeu_si256((__m256i*)u, _mm256_castps_si256(_mm256_mul_ps(_mm256_castsi256_ps(_mm256_set1_epi32((int)v1)), _mm256_castsi256_ps(_mm256_set1_epi32((int)vd)))));
+        r[7][0] = t[0]; r[7][7] = t[7]; r[7][1] = u[0]; r[7][6] = u[7];
+    }
+    _mm_setcsr(csr);
+    int ok = 1;
+    for (int i = 0; i < 8; i++) ok &= r[0][i] == 0x33800000u && r[1][i] == 0x33800000u && r[2][i] == 0xB3800000u && r[6][i] == 0x3F800000u;
+    ok &= r[3][0] == 0x33800000u && r[3][1] == 0x33800000u && r[4][0] == 0x33800000u && r[4][1] == 0x33800000u &&
+          r[5][0] == 0xB3800000u && r[5][1] == 0xB3800000u;
+    ok &= r[7][0] == 0x4B800001u && r[7][7] == 0x4B800001u && r[7][1] == 0u && r[7][6] == 0u;
+    if (!ok) fprintf(stderr, "[edge] SELF-TEST FAILED (fma %08X %08X %08X, 512-bit %08X %08X %08X, RZ add %08X, cvt %08X, ftz %08X): kernels off\n",
+                     r[0][0], r[1][0], r[2][0], r[3][0], r[4][0], r[5][0], r[6][0], r[7][0], r[7][1]);
+    return ok;
+}
 static void edge_init(void)
 {
     static int busy;
@@ -2653,11 +2925,21 @@ static void edge_init(void)
         return;
     }
     const char* e = getenv("PS3_NATIVE_EDGE");
-    const int m = !(e && e[0] == '0');
+    /* The self-test of edge_selftest runs by default only on the SIMDe builds (aarch64, the Switch; or the forced-SIMDe
+     * x86 test build). The native AVX2 PC build starts as upstream does, without it, and a failed test there cannot
+     * turn the kernels off; PS3_NATIVE_EDGE_SELFTEST=1 runs it on a PC build too (=0 skips it everywhere). */
+    const char* est = getenv("PS3_NATIVE_EDGE_SELFTEST");
+#if EDGE_SIMDE
+    const int do_selftest = !(est && est[0] == '0');
+#else
+    const int do_selftest = est && est[0] == '1';
+#endif
+    const int m = !(e && e[0] == '0') && (getenv("PS3_NATIVE_EDGE_NOSELFTEST") || !do_selftest || edge_selftest());   /* NOSELFTEST: tests only */
     rsq_init(); wtab_init(); fnms_init(); dec_tables_init(); dec_desc_init(); idx_tables_init();
     { const char* ea = getenv("PS3_NATIVE_EDGE_AVX2"); g_avx2 = !(ea && ea[0] == '0'); }
     { const char* eg = getenv("PS3RECOMP_EDGE_GPU"); g_gpu = eg ? atoi(eg) : 0; if (g_gpu < 0 || g_gpu > 2) g_gpu = 0; }
     { const char* et = getenv("PS3RECOMP_EDGE_TSC"); g_tsc = et && et[0] == '1'; }
+    { const char* es = getenv("PS3RECOMP_EDGE_STATS"); if (es) g_stats = es[0] == '1'; if (g_tsc) g_stats = 1; }
     { const char* dl = getenv("PS3RECOMP_EDGE_DEC_LAYOUT"); g_dec_layout = dl ? atoi(dl) != 0 : 1; }
     _Static_assert(sizeof k_env / sizeof k_env[0] == NKERN, "one switch per kernel");
     for (int i = 0; i < NKERN; i++) {
@@ -2670,26 +2952,90 @@ static void edge_init(void)
          * one stalled before the title and one walked a different path (scene intact) */
         const int dflt = k->core == edge_idx_core ? 0 : g_avx2 ? 1 : (k->core == edge_skin_core || k->core == edge_enc_core);
         k->mode = m && (ke ? ke[0] != '0' : dflt);
+        /* hz-0.42: PS3_NATIVE_EDGE_IDX=2 is a check run (see idx_check_before) */
+        if (k->core == edge_idx_core && k->mode && ke && ke[0] == '2') k->mode = 2;
     }
-    fprintf(stderr, "[edge] native Edge Geometry kernels (image %d, %s, gpu-cull %d):", EDGE_IMAGE, g_avx2 ? "AVX2" : "SIMDe on AVX2", g_gpu);
-    for (int i = 0; i < NKERN; i++) fprintf(stderr, " %s=%s", g_kern[i].name, g_kern[i].mode ? "on" : "off");
+    fprintf(stderr, "[edge] native Edge Geometry kernels (image %d, %s, gpu-cull %d):", EDGE_IMAGE, g_avx2 ? EDGE_BACKEND : EDGE_BACKEND_NOAVX2, g_gpu);
+    for (int i = 0; i < NKERN; i++) fprintf(stderr, " %s=%s", g_kern[i].name, g_kern[i].mode == 2 ? "check" : g_kern[i].mode ? "on" : "off");
     fprintf(stderr, "\n");
     __atomic_store_n(&s_init, 1, __ATOMIC_RELEASE);
 }
 static void edge_report_now(void);
+/* hz-0.42: a check run of the index kernel on the console (PS3_NATIVE_EDGE_IDX=2). Upstream's kernel passed
+ * the job replay but not two fight runs (a stall before the title, a different walk), which may have been the
+ * kernel or chance. Here every call runs the kernel on a copy of the local store and registers, then declines,
+ * so the lifted code runs on the real state as without the native; the lifted function's two call sites
+ * (0xD030, 0xD09C) then call edge_idx_check_after, which compares the copy with what the lifted code left.
+ * The local store is compared whole except the stack window, which only the lifted code uses for spills;
+ * the kernel writes no register and the lifted code restores r80-r127, which are compared too. */
+#define IDX_CHK_STACK_LO 0x1000u
+#define IDX_CHK_STACK_HI 0x100u
+static _Thread_local struct { uint8_t* ls; u128 gpr[128]; int armed, ok; uint32_t S, B, sp; } t_idx_chk;
+static unsigned long long g_idxc_calls, g_idxc_same, g_idxc_diff, g_idxc_declined, g_idxc_regdiff;
+static int idx_check_before(spu_context* ctx)
+{
+    if (unlikely(!t_idx_chk.ls) && !(t_idx_chk.ls = (uint8_t*)_aligned_malloc(SPU_LS_SIZE, 64))) return 0;
+    memcpy(t_idx_chk.ls, ctx->ls, SPU_LS_SIZE);
+    memcpy(t_idx_chk.gpr, ctx->gpr, sizeof t_idx_chk.gpr);
+    t_idx_chk.S = ctx->gpr[3]._u32[0]; t_idx_chk.B = ctx->gpr[4]._u32[0]; t_idx_chk.sp = ctx->gpr[1]._u32[0];
+    t_idx_chk.ok = edge_idx_core(t_idx_chk.gpr, t_idx_chk.ls);
+    memcpy(t_idx_chk.gpr, ctx->gpr, sizeof t_idx_chk.gpr);   /* the registers as the call found them */
+    t_idx_chk.armed = 1;
+    return 0;
+}
+void edge_idx_check_after(spu_context* ctx)
+{
+    if (!t_idx_chk.armed) return;
+    t_idx_chk.armed = 0;
+    const unsigned long long n = __atomic_fetch_add(&g_idxc_calls, 1, __ATOMIC_RELAXED) + 1;
+    if (!t_idx_chk.ok) __atomic_fetch_add(&g_idxc_declined, 1, __ATOMIC_RELAXED);
+    else {
+        const uint32_t sp = t_idx_chk.sp & (SPU_LS_SIZE - 1);
+        const uint32_t lo = sp > IDX_CHK_STACK_LO ? sp - IDX_CHK_STACK_LO : 0;
+        const uint32_t hi = sp + IDX_CHK_STACK_HI < SPU_LS_SIZE ? sp + IDX_CHK_STACK_HI : SPU_LS_SIZE;
+        uint32_t first = SPU_LS_SIZE, bytes = 0, last = 0;
+        for (uint32_t a = 0; a < SPU_LS_SIZE; a += 16) {
+            if (a + 16 > lo && a < hi) continue;
+            if (!memcmp(ctx->ls + a, t_idx_chk.ls + a, 16)) continue;
+            for (uint32_t b = a; b < a + 16; b++)
+                if (ctx->ls[b] != t_idx_chk.ls[b]) { if (first == SPU_LS_SIZE) first = b; last = b; bytes++; }
+        }
+        int reg = -1;
+        for (int r = 80; r < 128 && reg < 0; r++) if (memcmp(&ctx->gpr[r], &t_idx_chk.gpr[r], 16)) reg = r;
+        if (reg >= 0) __atomic_fetch_add(&g_idxc_regdiff, 1, __ATOMIC_RELAXED);
+        if (bytes || reg >= 0) {
+            const unsigned long long d = __atomic_fetch_add(&g_idxc_diff, 1, __ATOMIC_RELAXED) + 1;
+            if (d <= 12)
+                fprintf(stderr, "[edge] index check DIFFER #%llu: S=0x%05X B=0x%05X sp=0x%05X, %u bytes differ in 0x%05X..0x%05X"
+                        " (lifted %02X native %02X at the first), register r%d\n", d, t_idx_chk.S, t_idx_chk.B, sp, bytes,
+                        bytes ? first : 0, bytes ? last : 0, bytes ? ctx->ls[first] : 0, bytes ? t_idx_chk.ls[first] : 0, reg);
+        } else __atomic_fetch_add(&g_idxc_same, 1, __ATOMIC_RELAXED);
+    }
+    if ((n & 0x3FFF) == 0)
+        fprintf(stderr, "[edge] index check: %llu calls, %llu same, %llu differ (%llu in r80-r127), %llu declined by the kernel\n",
+                n, g_idxc_same, g_idxc_diff, g_idxc_regdiff, g_idxc_declined);
+}
 static int edge_entry(spu_context* ctx, EdgeKernel* k)
 {
     if (unlikely(__atomic_load_n(&s_init, __ATOMIC_ACQUIRE) < 0)) edge_init();
     if (!k->mode) return 0;
+    if (k->mode == 2) return idx_check_before(ctx);
+#if defined(EDGE_A64) && EDGE_A64
+    /* The helpers of this TU (SPU_FLOAT_RZ_ONLY) and the exact paths below assume the SPU run's FPCR (RZ + FZ).
+     * Every lifted run has it; if one does not, the lifted function decides. */
+    if (unlikely((edge_getcsr() & EDGE_CSR_FAST) != EDGE_CSR_FAST)) return 0;
+#endif
     const unsigned long long t0 = g_tsc ? __rdtsc() : 0;
     const int ok = k->core(ctx->gpr, ctx->ls);
     if (g_tsc) __atomic_fetch_add(&k->ns_nat, __rdtsc() - t0, __ATOMIC_RELAXED);   /* cycles, in the field's slot */
     if (ok) {
-        const unsigned long long nn = __atomic_fetch_add(&k->native, 1, __ATOMIC_RELAXED) + 1;
-        if (g_tsc && k->core == edge_cull_core && (nn & 0x3F) == 0) edge_report_now();   /* a replay never runs the destructor */
+        if (g_stats) {
+            const unsigned long long nn = __atomic_fetch_add(&k->native, 1, __ATOMIC_RELAXED) + 1;
+            if (g_tsc && k->core == edge_cull_core && (nn & 0x3F) == 0) edge_report_now();   /* a replay never runs the destructor */
+        }
         return 1;
     }
-    __atomic_fetch_add(&k->fallback, 1, __ATOMIC_RELAXED);
+    if (g_stats) __atomic_fetch_add(&k->fallback, 1, __ATOMIC_RELAXED);
     return 0;
 }
 #define EDGE_HOOK(i) static int edge_hook_##i(spu_context* ctx) { return edge_entry(ctx, &g_kern[i]); }

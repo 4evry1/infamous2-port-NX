@@ -178,7 +178,13 @@ static int pfx_set_one(const char* name, const char* value, int from_env)
         else if (!strcmp(value, "1440p")) d = 2.0;
         else if (!strcmp(value, "4k") || !strcmp(value, "4K") || !strcmp(value, "2160p")) d = 3.0;
         else if (pfx_parse_num(value, &d)) goto bad;
+#ifdef __SWITCH__   /* local change (Switch build): below 720p is allowed, down to half (640x360) */
+        if (!strcmp(value, "540p")) d = 0.75;
+        else if (!strcmp(value, "360p")) d = 0.5;
+        if (!(d >= 0.5 && d <= 4.0)) goto bad;
+#else
         if (!(d >= 1.0 && d <= 4.0)) goto bad;
+#endif
         vk_postfx_set_render_scale((float)d);
     } else {
         return -1;
@@ -239,11 +245,18 @@ int vk_postfx_aniso(void)
     if (lim == 0) return 1;
     return (lim > 0 && want > lim) ? lim : want;
 }
+/* The smallest internal resolution, in quarter steps of the guest's 720p. Local change (Switch
+ * build): 2 = half (640x360), so the Tegra's GPU can be given fewer pixels; elsewhere 4 = 720p. */
+#ifdef __SWITCH__
+#  define PFX_SCALE_MIN_Q 2
+#else
+#  define PFX_SCALE_MIN_Q 4
+#endif
 void vk_postfx_set_render_scale(float s)
 {
     pfx_env();
     const int q = (int)floor(s * 4.0 + 0.5);
-    PFX_STORE(s_set_scale, q < 4 ? 4 : q > 16 ? 16 : q);
+    PFX_STORE(s_set_scale, q < PFX_SCALE_MIN_Q ? PFX_SCALE_MIN_Q : q > 16 ? 16 : q);
 }
 /* [res] the setting (the backend reads it once, at the engine's init) and the
  * scale it then runs at: 1 until it says otherwise. */
@@ -253,7 +266,7 @@ float vk_postfx_render_scale_wanted(void) { pfx_env(); return (float)PFX_LOAD(s_
 void vk_postfx_render_scale_active(float s)
 {
     const int q = (int)floor(s * 4.0 + 0.5);
-    PFX_STORE(s_scale_active, q < 4 ? 4 : q > 16 ? 16 : q);
+    PFX_STORE(s_scale_active, q < PFX_SCALE_MIN_Q ? PFX_SCALE_MIN_Q : q > 16 ? 16 : q);
 }
 
 /* ---- [wide] PS3RECOMP_ASPECT (docs/WIDESCREEN.md) -------------------------

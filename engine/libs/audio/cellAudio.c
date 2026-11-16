@@ -626,6 +626,29 @@ static void audio_submit_mix(void)
     audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 }
 
+#ifdef __SWITCH__   /* only the Switch's late-block hold (audio_mix_thread_func) calls it */
+/* 1 when at least one port is running and the block at every running port's read index is still
+ * cleared (all sampled values zero): the title has not written the next block yet. Consumed blocks are
+ * cleared below, so a zero block is one the producer has not refilled. Sampled every 16 floats. */
+static int audio_next_block_empty(void)
+{
+    int running = 0, empty = 1;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX && empty; p++) {
+        const AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer) continue;
+        const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        if (!nblock) continue;
+        const float* bp = port->buffer + (u32)(port->read_index % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+        running = 1;
+        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * nch; s += 16)
+            if (bp[s] != 0.0f) { empty = 0; break; }
+    }
+    mutex_unlock(&s_audio_mutex);
+    return running && empty;
+}
+#endif
+
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
@@ -832,6 +855,25 @@ static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+#ifdef __SWITCH__
+    /* hz-0.34: the Windows branch above runs this thread ahead of the guest threads; on the Switch every
+     * thread sat at priority 59, where Horizon switches only on block or the 10 ms slice, and with the
+     * cores saturated the mixer made about 44.6 blocks of 1024 frames a second against the 46.9 real time
+     * needs (console runs 13-35: 77-88% of 10 s windows short): choppy audio. The Horizon layer raises it
+     * (hz_tls.c hz_audio_thread_boost, HZ_PRIO_AUDIO, default 57). */
+    { extern void hz_audio_thread_boost(void) __attribute__((weak));
+      if (hz_audio_thread_boost) hz_audio_thread_boost(); }
+#endif
+    /* AUDIO_QUEUE_BLOCKS: how many 256-sample blocks the mixer keeps queued ahead of the device (default 4,
+     * ~21 ms; 12, ~64 ms, on the Switch, where a busy core can hold the mixer off for a 10 ms slice or two) */
+    static int qb = -1;
+    if (qb < 0) { const char* e = getenv("AUDIO_QUEUE_BLOCKS"); qb = e && atoi(e) > 0 ? atoi(e) :
+#ifdef __SWITCH__
+        12;
+#else
+        4;
+#endif
+        printf("[cellAudio] mixer keeps %d blocks queued\n", qb); }
 
     /* Pace by what the device has actually consumed. The old loop mixed a
      * block and then slept a fixed 2-5 ms -- with a block being 256 samples
@@ -849,11 +891,53 @@ static void* audio_mix_thread_func(void* arg)
         unsigned long long el_us = (unsigned long long)(now.tv_sec - t0.tv_sec) * 1000000ull
                                  + (unsigned long long)((now.tv_nsec - t0.tv_nsec) / 1000);
         unsigned long long ahead_us = mixed * CELL_AUDIO_BLOCK_SAMPLES * 1000000ull / 48000ull;
-        if (audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * 4 ||
-            ahead_us > el_us + 4ull * CELL_AUDIO_BLOCK_SAMPLES * 1000000ull / 48000ull) {
+        if (audio_backend_queued_samples() >= CELL_AUDIO_BLOCK_SAMPLES * (unsigned)qb ||
+            ahead_us > el_us + (unsigned long long)qb * CELL_AUDIO_BLOCK_SAMPLES * 1000000ull / 48000ull) {
             usleep(1000);
             continue;
         }
+#ifdef __SWITCH__
+        /* hz-0.38, AUDIO_HOLD_MS (default 20, 0 = off): when the title has not yet written the next block,
+         * wait for it instead of mixing silence, while the device still has more than 2 blocks (~11 ms)
+         * queued and for at most AUDIO_HOLD_MS. The read index the title paces itself by then waits too,
+         * as the late producer catches up. Console run 38 (hz-0.37): the game's ring was empty in 21% of
+         * samples and the sound chopped; a late block now costs latency instead of a gap. */
+        {
+            static int hold_ms = -1;
+            static unsigned long long hold_t0, holds, held_us, silent, last_report;
+            if (hold_ms < 0) {
+                const char* e = getenv("AUDIO_HOLD_MS");
+                hold_ms = e && *e ? atoi(e) : 20;
+                printf("[cellAudio] late-block hold: up to %d ms\n", hold_ms);
+            }
+            if (hold_ms > 0) {
+                if (audio_next_block_empty()) {
+                    /* hz-0.43: gate on what audout really holds. The queue the mixer is told about leaves
+                     * out the Horizon layer's 2048-frame reserve and reads 0 whenever it is at or under it,
+                     * so "more than 2 blocks" was almost never true: run 44 waited 0.3 ms per hold and 99.5%
+                     * of holds still mixed silence. */
+                    extern uint32_t hz_audio_outstanding_frames(void) __attribute__((weak));
+                    const unsigned queued_now = hz_audio_outstanding_frames ? hz_audio_outstanding_frames()
+                                                                             : audio_backend_queued_samples();
+                    if (!hold_t0) { hold_t0 = el_us; holds++; }
+                    if (queued_now > CELL_AUDIO_BLOCK_SAMPLES * 2u &&
+                        el_us - hold_t0 < (unsigned long long)hold_ms * 1000ull) {
+                        usleep(500);
+                        continue;
+                    }
+                    silent++;
+                }
+                if (hold_t0) { held_us += el_us - hold_t0; hold_t0 = 0; }
+                if (el_us - last_report >= 10000000ull) {
+                    if (getenv("AUDIO_RATE"))
+                        fprintf(stderr, "[audio-hold] last 10 s: %llu holds, %llu ms waited, %llu blocks mixed empty, %llu blocks mixed in all\n",
+                                holds, held_us / 1000, silent, mixed);
+                    holds = held_us = silent = 0;
+                    last_report = el_us;
+                }
+            }
+        }
+#endif
         mixed++;
         audio_mix_one_block();
         audio_submit_mix();

@@ -361,6 +361,18 @@ tools/play.sh
 Vulkan loader, SDL2) and puts everything else in the port's own folder. Please [report](../../issues) how it
 runs on your distribution and GPU.
 
+## 🎮 Nintendo Switch (homebrew, experimental)
+
+The port also builds for the Nintendo Switch as a homebrew program (`.nro`, Atmosphère, title takeover), from your
+own copy of the game, on a Linux PC. It is playable but slow: about 9-10 fps in light scenes and 7-8 in heavy ones,
+CPU bound; audio is mostly smooth. How to build it, what it needs and its known issues: **[switch/README.md](switch/README.md)**.
+
+```
+tools/setup.sh --prepare-only --disc <your game folder> --rpcs3 <RPCS3's data folder>
+SWITCH_DEV_IMAGE=<Switch build image> switch/build.sh
+switch/build.sh sdcard <your SD card's root>
+```
+
 ## 🔄 Updates
 
 - When the game starts it asks GitHub whether a new version is out: in the background, at most every 6 hours,

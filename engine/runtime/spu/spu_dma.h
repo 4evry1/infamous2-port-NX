@@ -98,6 +98,30 @@ static inline void spu_put_copy(uint32_t ea, uint8_t* g, const void* s, uint32_t
     else gm_copy_to(g, s, n);
 }
 
+/* PS3_SPU_PUT_COH_INLINE (default 1 under __SWITCH__ only; the PC builds keep upstream's call into
+ * spu_coherency.c, -DPS3_SPU_PUT_COH_INLINE=1 turns the inline form on there too).
+ * spu_coherency.c's spu_coh_is_reserved without the call: the reserved-line bitmap and its "armed" flag
+ * are exported as pointers (g_spu_coh_armed / g_spu_coh_bitmap, which the lifted PPU store fast path
+ * reads too). The same two loads in the same order, so the same answer. -DPS3_SPU_PUT_COH_INLINE=0
+ * keeps the calls in mfc_do_transfer_lean (the full path's diagnostic copy of the loop never changed). */
+#ifndef PS3_SPU_PUT_COH_INLINE
+#  ifdef __SWITCH__
+#    define PS3_SPU_PUT_COH_INLINE 1
+#  else
+#    define PS3_SPU_PUT_COH_INLINE 0
+#  endif
+#endif
+#if PS3_SPU_PUT_COH_INLINE
+extern int* const g_spu_coh_armed;
+extern unsigned char* const g_spu_coh_bitmap;
+static inline int spu_coh_is_reserved_inl(uint32_t addr)
+{
+    if (!__atomic_load_n(g_spu_coh_armed, __ATOMIC_ACQUIRE)) return 0;
+    const uint32_t line = addr >> 7;
+    return (__atomic_load_n(&g_spu_coh_bitmap[line >> 3], __ATOMIC_RELAXED) >> (line & 7)) & 1u;
+}
+#endif
+
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
  * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
@@ -967,6 +991,11 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
     } else if (mfc_is_put(cmd)) {
         /* mfc_do_transfer_raw's PUT: the same copy-and-notify protocol. */
         extern int  spu_coh_is_reserved(uint32_t);
+#if PS3_SPU_PUT_COH_INLINE
+#define SPU_PUT_RESV(a) spu_coh_is_reserved_inl(a)
+#else
+#define SPU_PUT_RESV(a) spu_coh_is_reserved(a)
+#endif
         extern void spu_coh_notify_write_except(uint32_t, const void*);
         extern uint64_t spu_lockline_mask_ea(uint32_t);
         extern uint64_t spu_lockline_mask_range(uint32_t, uint32_t);
@@ -976,7 +1005,7 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
         uint32_t a1 = ((uint32_t)ea + size - 1u) & ~127u;
         int span_reserved = 0;
         for (uint32_t a = a0; ; a += 128u) {
-            if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
+            if (SPU_PUT_RESV(a)) { span_reserved = 1; break; }
             if (a == a1) break;
         }
         if (span_reserved) {
@@ -984,14 +1013,14 @@ static inline int mfc_do_transfer_lean(spu_context* spu, uint32_t lsa, uint64_t 
             spu_lockline_lock_mask(llm);
             spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
+                if (SPU_PUT_RESV(a)) spu_coh_notify_write_except(a, spu);
                 if (a == a1) break;
             }
             spu_lockline_unlock_mask(llm);
         } else {
             spu_put_copy((uint32_t)ea, (uint8_t*)ea_ptr, ls_ptr, size);   /* (critic2) */
             for (uint32_t a = a0; ; a += 128u) {
-                if (spu_coh_is_reserved(a)) {
+                if (SPU_PUT_RESV(a)) {
                     const uint64_t llm = spu_lockline_mask_ea(a);
                     spu_lockline_lock_mask(llm);
                     spu_coh_notify_write_except(a, spu);
