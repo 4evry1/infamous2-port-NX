@@ -592,6 +592,103 @@ static int fp_shadow_d24(void)
     return v;
 }
 
+/* RSX_FP_NAN_MODE (read once, before the first program; GitHub #27): how
+ * the SAT modifier, MIN and MAX treat a NaN.
+ *   rsx (AMD default, see below): as the RSX does -- SAT flushes NaN to 0 (RPCS3's hardware
+ *       notes, FragmentProgramDecompiler.cpp: "SAT modifier flushes NaNs to
+ *       0"), MIN / MAX return the other operand (the NV4x min/max). Spelled
+ *       out with integer tests on the bits, because SPIR-V leaves FClamp,
+ *       FMin and FMax undefined for a NaN operand and a driver may assume
+ *       there are none: NVIDIA's own clamp and min/max already give these
+ *       results (its picture is unchanged), other drivers did not have to.
+ *       rsx also gives SEQ / SNE their IEEE answer when an operand is NaN
+ *       (SNE true, SEQ false; RPCS3 #19874's hardware test: the RSX compares
+ *       are IEEE), with the same bit test, so a driver that assumes no NaN
+ *       cannot fold a game's own `x != x` NaN filter to false.
+ *   old (or 0, or empty): saturate(), min(), max() as before, byte for byte.
+ *   amd: DIAGNOSTIC -- SAT, MIN and MAX pass a NaN on and the exports lose
+ *       their NaN guard: what a host that keeps NaNs through its clamps and
+ *       drops `x == x` tests as always true draws, on any GPU.
+ * Default (GitHub #27, flickering black spots on faces, AMD RDNA3 on
+ * Windows only): unset on an AMD device (vendorID 0x1002, from
+ * rsx_fp_set_host_vendor before the first program) = rsx; unset on any other
+ * GPU = old, so every other GPU keeps its shaders byte for byte. */
+static u32 s_opx_vendor;   /* the host GPU's vendor ID (RSX_FP_OWNPX below) */
+/* The AMD defaults below, all at once: an AMD GPU, unless
+ * PS3RECOMP_AMD_NAN_FIX=0 (the one settings.ini line that turns every #27
+ * NaN rule back to the old path; a rule's own switch still wins). */
+static int fp_host_amd(void)
+{
+    if (__atomic_load_n(&s_opx_vendor, __ATOMIC_ACQUIRE) != 0x1002u) return 0;
+    const char* e = getenv("PS3RECOMP_AMD_NAN_FIX");
+    return !(e && (!*e || !strcmp(e, "0") || !strcmp(e, "off")));
+}
+#define FP_HOST_AMD() fp_host_amd()
+static int s_fp_nan_mode = -1, s_fp_nan_how;   /* how: 0 default off, 1 AMD default, 2 set on, 3 set off */
+static int fp_nan_mode(void)
+{
+    int v = __atomic_load_n(&s_fp_nan_mode, __ATOMIC_ACQUIRE);
+    if (v < 0) {
+        const char* e = getenv("RSX_FP_NAN_MODE");
+        if (!e) { v = FP_HOST_AMD() ? 1 : 0; s_fp_nan_how = v; }
+        else { v = (!strcmp(e, "rsx") || !strcmp(e, "1")) ? 1 : !strcmp(e, "amd") ? 2 : 0; s_fp_nan_how = v ? 2 : 3; }
+        __atomic_store_n(&s_fp_nan_mode, v, __ATOMIC_RELEASE);
+    }
+    return v;
+}
+
+/* An on/off switch whose default is on for an AMD GPU only (GitHub #27):
+ * unset = on for vendor 0x1002, off for the rest; "0", "off" or empty = off;
+ * anything else = on. Read once (before the first program); *how as above. */
+static int fp_amd_switch(const char* name, int* how)
+{
+    const char* e = getenv(name);
+    if (!e) { *how = FP_HOST_AMD() ? 1 : 0; return *how; }
+    const int on = *e && strcmp(e, "0") && strcmp(e, "off");
+    *how = on ? 2 : 3;
+    return on;
+}
+
+/* RSX_FP_NRM_SAFE (GitHub #27; default on for AMD only): NRM of a zero-length
+ * vector returns the vector (0, 0, 0) instead of normalize()'s 0 * inf = NaN.
+ * The same guard RPCS3's decompiler has carried for years for games that
+ * make NaNs there (its _builtin_normalize); a NaN normal in a skin program
+ * then runs through the lighting maths, which each driver folds its own way. */
+static int s_fp_nrm = -1, s_fp_nrm_how;
+static int fp_nrm_safe(void)
+{
+    int v = __atomic_load_n(&s_fp_nrm, __ATOMIC_ACQUIRE);
+    if (v < 0) { v = fp_amd_switch("RSX_FP_NRM_SAFE", &s_fp_nrm_how); __atomic_store_n(&s_fp_nrm, v, __ATOMIC_RELEASE); }
+    return v;
+}
+
+/* RSX_FP_POW_EXP2 (GitHub #27; default on for AMD only): POW as
+ * exp2(y * log2(x)), the NV4x way (RPCS3's _builtin_approx_pow, NV_fragment_
+ * program's ApproxPower). HLSL pow() becomes SPIR-V's Pow, whose result is
+ * UNDEFINED for x < 0 and for x = 0 with y <= 0: a driver may answer
+ * anything there (and AMD's expands constant exponents into multiplies),
+ * where the spelled-out form gives the IEEE answer (0, inf or NaN) on every
+ * GPU. */
+static int s_fp_pow = -1, s_fp_pow_how;
+static int fp_pow_exp2(void)
+{
+    int v = __atomic_load_n(&s_fp_pow, __ATOMIC_ACQUIRE);
+    if (v < 0) { v = fp_amd_switch("RSX_FP_POW_EXP2", &s_fp_pow_how); __atomic_store_n(&s_fp_pow, v, __ATOMIC_RELEASE); }
+    return v;
+}
+
+int rsx_fp_nan_rules_describe(char* buf, size_t n)
+{
+    static const char* const how_txt[4] = { "off", "on (AMD default)", "on (set)", "off (set)" };
+    const int m = fp_nan_mode(), r = fp_nrm_safe(), p = fp_pow_exp2();
+    if (!buf || !n) return m || r || p;
+    snprintf(buf, n, "RSX_FP_NAN_MODE=%s %s, RSX_FP_NRM_SAFE %s, RSX_FP_POW_EXP2 %s",
+             m == 1 ? "rsx" : m == 2 ? "amd" : "old",
+             s_fp_nan_how == 1 ? "(AMD default)" : s_fp_nan_how >= 2 ? "(set)" : "(default)",
+             how_txt[s_fp_nrm_how & 3], how_txt[s_fp_pow_how & 3]);
+    return m || r || p;
+}
+
 /* PS3RECOMP_SOFT_SHADOWS (live, default 0; ps3_lightfx.h): a wider filter
  * for the filtered shadow lookups (see fp_shadow_helper). The engine's
  * applier sets it and re-keys its pipelines. */
@@ -661,6 +758,116 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
     return units;
 }
 
+/* GitHub #27 (AMD RDNA3, Windows: spots and hatching on characters in the
+ * cutscenes) DIAGNOSTICS, read once before the first program; unset = the
+ * helpers exactly as before (same text, same shader keys).
+ *   RSX_FP_SHADOW_FORCE=lit|dark  every shadow-map compare returns 1.0 (lit)
+ *       or 0.0 (shadowed): gone with lit = the spots come from the shadow
+ *       lookups (their inputs or their sampling), else from elsewhere.
+ *   RSX_FP_SHADOW_FORCE_FP=<hash>[,<hash>...]  only in those programs (the
+ *       structural hashes the engine logs as fp=...; up to 8); also limits
+ *       RSX_FP_SHADOW_BIAS.
+ *   RSX_FP_SHADOW_BIAS=<depth>  every compare's reference moved that far
+ *       (shadow-map depth, 0..1) towards passing (lit): gone with a small
+ *       value = the receiver and the map disagree by a little on that GPU
+ *       (precision), not by a broken fetch or program.
+ *   RSX_FP_SHADOW_FETCH=load  the map's texels read with Load at their
+ *       integer coordinates (clamped to the edge) instead of SampleLevel /
+ *       Gather through the guest's sampler: same taps, same weights, no
+ *       sampler -- gone = the driver's filtered or gathered fetch of the R32F
+ *       map differs from the hardware we test on. */
+static int s_shf_init, s_shf_mode, s_shf_load, s_shf_nfp;
+static float s_shf_bias;
+static u64 s_shf_fp[8];
+static _Thread_local int s_shf_here;   /* this program's force (programs translate on several threads) */
+static _Thread_local int s_shb_here;   /* this program takes RSX_FP_SHADOW_BIAS */
+static void fp_shadow_diag_init(void)
+{
+    int st = __atomic_load_n(&s_shf_init, __ATOMIC_ACQUIRE);
+    if (st == 1) return;
+    int expect = 0;
+    if (st == 0 && __atomic_compare_exchange_n(&s_shf_init, &expect, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const char* e = getenv("RSX_FP_SHADOW_FORCE");
+        s_shf_mode = !e ? 0 : !strcmp(e, "lit") ? 1 : !strcmp(e, "dark") ? 2 : 0;
+        e = getenv("RSX_FP_SHADOW_FETCH");
+        s_shf_load = e && !strcmp(e, "load");
+        e = getenv("RSX_FP_SHADOW_BIAS");
+        s_shf_bias = e ? (float)atof(e) : 0.0f;
+        if (!(s_shf_bias > 0.0f && s_shf_bias < 1.0f)) s_shf_bias = 0.0f;
+        e = getenv("RSX_FP_SHADOW_FORCE_FP");
+        while (e && *e && s_shf_nfp < 8) {
+            char* d; const u64 h = strtoull(e, &d, 16);
+            if (d == e) break;
+            s_shf_fp[s_shf_nfp++] = h;
+            e = *d == ',' ? d + 1 : NULL;
+        }
+        __atomic_store_n(&s_shf_init, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&s_shf_init, __ATOMIC_ACQUIRE) != 1) { }   /* another thread is reading them */
+}
+
+/* RSX_FP_OWNPX=<hash>:<unit>[,<hash>:<unit>...] (GitHub #27): in that
+ * program, TEX / TXP on that unit read the texel at the fragment's own pixel
+ * (Load at SV_POSITION) instead of sampling at the coordinate the program
+ * computed. For the deferred passes that rebuild a position from the depth
+ * buffer's bytes at their own pixel -- inFAMOUS 2's character shadow masks
+ * c70407ba5c029d1c and 25f427a67ef667f7, unit 0, the point-sampled depth copy
+ * on the same pixel grid as their target: on RADV the picture is identical,
+ * and moving their fetch by a fifth of a texel changes it broadly, so those
+ * fetches sit near texel edges, where a GPU's coordinate rounding picks the
+ * neighbour -- a neighbour's depth bytes then misplace the receiver against
+ * the shadow map (the black spots on faces in the cutscenes on RDNA3).
+ * Up to 8 pairs.
+ *
+ * Default (v0.5.5): unset on an AMD device (Vulkan vendorID 0x1002, handed
+ * over by rsx_fp_set_host_vendor before the first program) = FP_OWNPX_AMD;
+ * unset on any other GPU = off (the shaders as before). RSX_FP_OWNPX=0 or
+ * empty = off everywhere. The changed programs' HLSL differs, so their
+ * shader-cache keys (the whole text is hashed) differ too. */
+#define FP_OWNPX_AMD "c70407ba5c029d1c:0,25f427a67ef667f7:0"
+static int s_opx_init, s_opx_n, s_opx_how;   /* how: 0 off, 1 AMD default, 2 the user's list, 3 the user's off */
+static u64 s_opx_fp[8]; static u32 s_opx_unit[8];
+static void fp_ownpx_init(void)
+{
+    int st = __atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE);
+    if (st == 1) return;
+    int expect = 0;
+    if (st == 0 && __atomic_compare_exchange_n(&s_opx_init, &expect, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        const char* e = getenv("RSX_FP_OWNPX");
+        if (!e && __atomic_load_n(&s_opx_vendor, __ATOMIC_ACQUIRE) == 0x1002u) { e = FP_OWNPX_AMD; s_opx_how = 1; }
+        while (e && *e && s_opx_n < 8) {
+            char* d; const u64 h = strtoull(e, &d, 16);
+            if (d == e || *d != ':') break;
+            const unsigned long u = strtoul(d + 1, &d, 10);
+            if (u < 16) { s_opx_fp[s_opx_n] = h; s_opx_unit[s_opx_n] = (u32)u; s_opx_n++; }
+            e = *d == ',' ? d + 1 : NULL;
+        }
+        if (s_opx_how != 1) s_opx_how = !getenv("RSX_FP_OWNPX") ? 0 : s_opx_n ? 2 : 3;
+        __atomic_store_n(&s_opx_init, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    while (__atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE) != 1) { }
+}
+
+int rsx_fp_set_host_vendor(u32 vendor_id)
+{
+    const int late = __atomic_load_n(&s_opx_init, __ATOMIC_ACQUIRE) != 0;
+    if (!late) __atomic_store_n(&s_opx_vendor, vendor_id, __ATOMIC_RELEASE);
+    fp_ownpx_init();
+    return late ? -1 : s_opx_how;
+}
+
+static u32 fp_ownpx_units(const u8* ucode, u32 max_bytes)
+{
+    fp_ownpx_init();
+    if (!s_opx_n) return 0;
+    const u64 h = rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull);
+    u32 m = 0;
+    for (int k = 0; k < s_opx_n; k++) if (s_opx_fp[k] == h) m |= 1u << s_opx_unit[k];
+    return m;
+}
+
 static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
                               const rsx_fp_shadow_desc* d)
 {
@@ -669,12 +876,20 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
         "reference <= depth", "reference > depth", "reference != depth",
         "reference >= depth", "1.0" };
+    const char* ctext = s_shf_here == 1 ? "1.0" : s_shf_here == 2 ? "0.0" : cmp[d->func];   /* RSX_FP_SHADOW_FORCE */
+    const int load = s_shf_load && !d->grid;   /* RSX_FP_SHADOW_FETCH=load (not with the D24 diagnostic) */
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
         "    float reference = saturate(coordinate.z);\n",
-        unit, cmp[d->func], unit);
+        unit, ctext, unit);
     out_puts(p, text);
+    /* RSX_FP_SHADOW_BIAS: towards passing -- down for < and <=, up for > and >= */
+    if (s_shb_here && s_shf_bias > 0.0f && !d->grid && (d->func == 1 || d->func == 3 || d->func == 4 || d->func == 6)) {
+        snprintf(text, sizeof text, "    reference %s %.9g;\n", (d->func == 1 || d->func == 3) ? "-=" : "+=",
+                 (double)s_shf_bias);
+        out_puts(p, text);
+    }
     /* PS3RECOMP_ENG_SHADOW_D24: the reference and the taps in the map's
      * fixed-point steps (exact integers in a float up to 2^24). */
     const char* grid = d->grid == 2 ? "65535.0" : "16777215.0";
@@ -685,7 +900,7 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     }
     char tq0[32] = "", tq1[48] = "";
     if (d->grid) { snprintf(tq0, sizeof tq0, "floor(saturate("); snprintf(tq1, sizeof tq1, ") * %s + 0.5)", grid); }
-    if (d->linear || d->unnormalized || d->soft) {
+    if (d->linear || d->unnormalized || d->soft || load) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"
             "    float2 size = float2(width, height);\n", tex);
         out_puts(p, text);
@@ -701,6 +916,13 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     } else
         out_puts(p, d->unnormalized ? "    float2 uv = coordinate.xy / size;\n" :
                                          "    float2 uv = coordinate.xy;\n");
+    if (load && !d->linear && !d->soft) {   /* RSX_FP_SHADOW_FETCH=load: the texel the point lookup takes */
+        snprintf(text, sizeof text,
+            "    int2 texel = clamp(int2(floor(uv * size)), int2(0, 0), int2(size) - 1);\n"
+            "    return (float4)_rsx_shadow_cmp%u(reference, %s.Load(int3(texel, 0)).r);\n}\n", unit, tex);
+        out_puts(p, text);
+        return;
+    }
     if (!d->linear && !(d->soft && !d->grid)) {
         snprintf(text, sizeof text,
             "    float depth = %s%s.SampleLevel(rsx_samp[%u], uv, 0.0).r%s;\n"
@@ -719,6 +941,19 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
      * addressing is the same as the RSX form's. */
     if (d->soft && !d->grid) {
         const int R = d->soft + 1;
+        /* the 2x2 texels one Gather returns: x (i0,j1), y (i1,j1), z (i1,j0), w (i0,j0) */
+        char gline[640];
+        if (load)   /* RSX_FP_SHADOW_FETCH=load: the same four texels read one by one */
+            snprintf(gline, sizeof gline,
+                "            int2 t0 = int2(base) + int2((int)k0, (int)l0); int2 hi = int2(size) - 1;\n"
+                "            float4 g = float4(%s.Load(int3(clamp(t0 + int2(0, 1), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0 + int2(1, 1), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0 + int2(1, 0), int2(0, 0), hi), 0)).r,\n"
+                "                              %s.Load(int3(clamp(t0, int2(0, 0), hi), 0)).r);\n",
+                tex, tex, tex, tex);
+        else
+            snprintf(gline, sizeof gline,
+                "            float4 g = %s.Gather(rsx_samp[%u], (base + float2(k0, l0) + 1.0) / size);\n", tex, unit);
         snprintf(text, sizeof text,
             "    float2 position = uv * size - 0.5;\n"
             "    float2 base = floor(position); float2 fraction = position - base;\n"
@@ -729,13 +964,13 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
             "        [unroll] for (int gx = 0; gx < %d; gx++) {\n"
             "            float k0 = (float)(2 * gx - %d);\n"
             "            float wx0 = %d.0 - abs(k0 - fraction.x), wx1 = %d.0 - abs(k0 + 1.0 - fraction.x);\n"
-            "            float4 g = %s.Gather(rsx_samp[%u], (base + float2(k0, l0) + 1.0) / size);\n"
+            "%s"
             "            sum += _rsx_shadow_cmp%u(reference, g.w) * (wx0 * wy0) + _rsx_shadow_cmp%u(reference, g.z) * (wx1 * wy0)\n"
             "                 + _rsx_shadow_cmp%u(reference, g.x) * (wx0 * wy1) + _rsx_shadow_cmp%u(reference, g.y) * (wx1 * wy1);\n"
             "        }\n"
             "    }\n"
             "    return (float4)(sum * %.9g);\n}\n",
-            R, R - 1, R, R, R, R - 1, R, R, tex, unit, unit, unit, unit, unit,
+            R, R - 1, R, R, R, R - 1, R, R, gline, unit, unit, unit, unit,
             1.0 / (double)(R * R * R * R));
         out_puts(p, text);
         return;
@@ -743,9 +978,14 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     out_puts(p, "    float2 position = uv * size - 0.5;\n"
         "    float2 base = floor(position); float2 fraction = position - base;\n");
     for (u32 tap = 0; tap < 4; tap++) {
-        snprintf(text, sizeof text,
-            "    float d%u = %s%s.SampleLevel(rsx_samp[%u], (base + float2(%s, %s)) / size, 0.0).r%s;\n",
-            tap, tq0, tex, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5", tq1);
+        if (load)   /* RSX_FP_SHADOW_FETCH=load: the texel at the tap's centre */
+            snprintf(text, sizeof text,
+                "    float d%u = %s.Load(int3(clamp(int2(base) + int2(%d, %d), int2(0, 0), int2(size) - 1), 0)).r;\n",
+                tap, tex, (int)(tap & 1), (int)((tap >> 1) & 1));
+        else
+            snprintf(text, sizeof text,
+                "    float d%u = %s%s.SampleLevel(rsx_samp[%u], (base + float2(%s, %s)) / size, 0.0).r%s;\n",
+                tap, tq0, tex, unit, (tap & 1) ? "1.5" : "0.5", (tap & 2) ? "1.5" : "0.5", tq1);
         out_puts(p, text);
         if (d->mode != 2) {
             snprintf(text, sizeof text, "    float c%u = _rsx_shadow_cmp%u(reference, d%u);\n", tap, unit, tap);
@@ -946,6 +1186,25 @@ static int rsx_fp_decompile_internal(
         rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull) == flip_hash;
     u32 dbg_count = 0; int dbg_done = 0;
     if (dbg_here) out_puts(&o, "    float4 _rsx_dbg = (float4)0;\n");
+    const u32 ownpx_mask = fp_ownpx_units(ucode, max_bytes);   /* RSX_FP_OWNPX */
+    /* RSX_FP_NAN_TRACE=1 | <structural hash hex>: DIAGNOSTIC (GitHub #27).
+     * Every instruction's result is tested for NaN on the lanes it writes,
+     * BEFORE its saturate, and the program's first colour export is painted
+     * float4(1, n / 255, 1, 1) where any instruction made one, n = the first
+     * such instruction (1-based, low 8 bits). RSX_FP_NAN_COLOR sees only
+     * the exports; a NaN that a saturate, min or max later hides (and a host
+     * whose clamps do not hide it would show) is seen here. Generated once per
+     * program: set it before the run starts. */
+    static int nan_trace = -1; static u64 nan_trace_hash;
+    if (nan_trace < 0) { const char* e = getenv("RSX_FP_NAN_TRACE");
+        nan_trace = e && *e && *e != '0';
+        if (nan_trace && strcmp(e, "1")) nan_trace_hash = strtoull(e, NULL, 16); }
+    const int trace_here = nan_trace && (!nan_trace_hash ||
+        rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull) == nan_trace_hash);
+    if (trace_here) out_puts(&o, "    uint _rsx_nant = 0u;\n");
+    const int nan_mode = fp_nan_mode();   /* RSX_FP_NAN_MODE: 0 old, 1 rsx, 2 amd */
+    const int nrm_safe = fp_nrm_safe();   /* RSX_FP_NRM_SAFE */
+    const int pow_exp2 = fp_pow_exp2();   /* RSX_FP_POW_EXP2 */
 
     /* Which colour export each register file received a write to, indexed
      * [half][target]. The whole file is tracked, not just target 0, because
@@ -1147,8 +1406,12 @@ static int rsx_fp_decompile_internal(
         case OP_MAD: snprintf(rhs, sizeof(rhs), "(%s) * (%s) + (%s)", a, b, c); break;
         case OP_DP3: snprintf(rhs, sizeof(rhs), "dot((%s).xyz, (%s).xyz)", a, b); break;
         case OP_DP4: snprintf(rhs, sizeof(rhs), "dot((%s), (%s))", a, b); break;
-        case OP_MIN: snprintf(rhs, sizeof(rhs), "min((%s), (%s))", a, b); break;
-        case OP_MAX: snprintf(rhs, sizeof(rhs), "max((%s), (%s))", a, b); break;
+        /* RSX_FP_NAN_MODE: rsx = the other operand when one is NaN (helpers
+         * in the preamble), amd = the NaN, old = HLSL min/max */
+        case OP_MIN: snprintf(rhs, sizeof(rhs), nan_mode == 1 ? "_rsx_min((%s), (%s))" : nan_mode == 2 ? "_rsx_pmin((%s), (%s))"
+                              : "min((%s), (%s))", a, b); break;
+        case OP_MAX: snprintf(rhs, sizeof(rhs), nan_mode == 1 ? "_rsx_max((%s), (%s))" : nan_mode == 2 ? "_rsx_pmax((%s), (%s))"
+                              : "max((%s), (%s))", a, b); break;
         case OP_FRC: snprintf(rhs, sizeof(rhs), "frac(%s)", a); break;
         case OP_FLR: snprintf(rhs, sizeof(rhs), "floor(%s)", a); break;
         case OP_RCP: snprintf(rhs, sizeof(rhs), "(1.0 / (%s).x)", a); break;
@@ -1176,7 +1439,11 @@ static int rsx_fp_decompile_internal(
         case OP_LG2: snprintf(rhs, sizeof(rhs), "log2((%s).x)", a); break;
         case OP_COS: snprintf(rhs, sizeof(rhs), "cos((%s).x)", a); break;
         case OP_SIN: snprintf(rhs, sizeof(rhs), "sin((%s).x)", a); break;
-        case OP_POW: snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b); break;
+        /* RSX_FP_POW_EXP2: exp2(y * log2(x)), defined everywhere (see fp_pow_exp2) */
+        case OP_POW:
+            if (pow_exp2) snprintf(rhs, sizeof(rhs), "exp2((%s).x * log2((%s).x))", b, a);
+            else          snprintf(rhs, sizeof(rhs), "pow((%s).x, (%s).x)", a, b);
+            break;
         case OP_DIV: snprintf(rhs, sizeof(rhs), "(%s) / (%s).x", a, b); break;
         /* Real RSX DIVSQ shares RSQ's sign-ignoring sqrt on the denominator
          * (oracle: RPCS3 FragmentProgramDecompiler.cpp's _builtin_sqrt macro,
@@ -1215,7 +1482,8 @@ static int rsx_fp_decompile_internal(
                      buffered ? "fp_alpha.y * " : "", (double)s_fp_wpos_sy);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
-        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+        case OP_NRM: snprintf(rhs, sizeof(rhs), nrm_safe ? "float4(_rsx_nrm((%s).xyz), 1.0)"   /* RSX_FP_NRM_SAFE */
+                                                         : "float4(normalize((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
         /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
          * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
@@ -1229,9 +1497,15 @@ static int rsx_fp_decompile_internal(
         case OP_SGE: snprintf(rhs, sizeof(rhs), "(float4)((%s) >= (%s))", a, b); break;
         case OP_SLE: snprintf(rhs, sizeof(rhs), "(float4)((%s) <= (%s))", a, b); break;
         case OP_SGT: snprintf(rhs, sizeof(rhs), "(float4)((%s) >  (%s))", a, b); break;
-        case OP_SNE: snprintf(rhs, sizeof(rhs), "(float4)((%s) != (%s))", a, b); break;
-        case OP_SEQ: snprintf(rhs, sizeof(rhs), "(float4)((%s) == (%s))", a, b); break;
+        /* RSX_FP_NAN_MODE=rsx: the IEEE answer for a NaN operand, from its bits */
+        case OP_SNE: snprintf(rhs, sizeof(rhs), nan_mode == 1 ? "_rsx_sne((%s), (%s))" : "(float4)((%s) != (%s))", a, b); break;
+        case OP_SEQ: snprintf(rhs, sizeof(rhs), nan_mode == 1 ? "_rsx_seq((%s), (%s))" : "(float4)((%s) == (%s))", a, b); break;
         case OP_TEX:
+            if ((ownpx_mask >> tex_unit) & 1u) {   /* RSX_FP_OWNPX: the texel at this pixel */
+                snprintf(rhs, sizeof(rhs), tex_sep_mask ? "rsx_tex%u.Load(int3(int2(input.position.xy), 0))"
+                                                        : "rsx_tex[%u].Load(int3(int2(input.position.xy), 0))", tex_unit);
+                break;
+            }
             if (shadow && shadow[tex_unit].enabled) {
                 snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz)", tex_unit, a);
                 break;
@@ -1251,6 +1525,11 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy)", tex_unit, tex_unit, a);
             break;
         case OP_TXP:
+            if ((ownpx_mask >> tex_unit) & 1u) {   /* RSX_FP_OWNPX: the texel at this pixel */
+                snprintf(rhs, sizeof(rhs), tex_sep_mask ? "rsx_tex%u.Load(int3(int2(input.position.xy), 0))"
+                                                        : "rsx_tex[%u].Load(int3(int2(input.position.xy), 0))", tex_unit);
+                break;
+            }
             if (shadow && shadow[tex_unit].enabled) {
                 snprintf(rhs, sizeof(rhs), "_rsx_shadow%u((%s).xyz / (%s).w)", tex_unit, a, a);
                 break;
@@ -1386,7 +1665,9 @@ static int rsx_fp_decompile_internal(
             char m[5];
             dest_mask(w0, m);
 
-            const char* sat = (w0 & FP_OUT_SAT) ? " _v = saturate(_v);" : "";
+            const char* sat = !(w0 & FP_OUT_SAT) ? ""
+                            : nan_mode == 1 ? " _v = _rsx_sat(_v);"
+                            : nan_mode == 2 ? " _v = _rsx_psat(_v);" : " _v = saturate(_v);";
             /* NV40 per-instruction result-scale modifier (SRC1 word bits
              * 28-30): 1/2/3 = *2/*4/*8, 5/6/7 = /2//4//8; applied to the
              * result BEFORE saturate (RPCS3 FragmentProgramDecompiler.cpp
@@ -1397,6 +1678,14 @@ static int rsx_fp_decompile_internal(
             u32 res_scale = (w2 >> 28) & 0x7u;
             static const char* scale_txt[8] = { "", " * 2.0", " * 4.0", " * 8.0",
                                                 "", " / 2.0", " / 4.0", " / 8.0" };
+            /* RSX_FP_NAN_TRACE: the lanes this instruction writes, before its saturate */
+            char trace[96]; trace[0] = '\0';
+            if (trace_here)
+                snprintf(trace, sizeof trace, " if (_rsx_nant == 0u && any(_v.%s != _v.%s)) _rsx_nant = %du;",
+                         m, m, count);
+            char sat_tr[160];
+            snprintf(sat_tr, sizeof sat_tr, "%s%s", trace, sat);
+            sat = sat_tr;
 
             /* Broadcast the result to float4 first so the write-mask picks the
              * CORRESPONDING components: `dst.w = rhs` would HLSL-truncate a
@@ -1495,6 +1784,14 @@ static int rsx_fp_decompile_internal(
     for (u32 t = FP_MAX_COLOR_TARGETS; t-- > 1; )
         if (wrote[half_exports][t]) { targets = t + 1; break; }
 
+    /* RSX_FP_NAN_TRACE: paint the first colour export where an instruction made a NaN. */
+    if (trace_here) {
+        char line[160];
+        snprintf(line, sizeof line,
+                 "    if (_rsx_nant != 0u) %s[%u] = float4(1.0, float(_rsx_nant & 255u) / 255.0, 1.0, 1.0);\n",
+                 export_file, fp_export_reg[half_exports][0]);
+        out_puts(&o, line);
+    }
     /* RSX_FP_NAN_COLOR=1: DIAGNOSTIC. Paint an output the NaN guard would zero
      * magenta, and one carrying an infinity cyan, so "black because NaN" and
      * "white because Inf" can be told from real colours on screen. Shaders are
@@ -1517,11 +1814,14 @@ static int rsx_fp_decompile_internal(
     }
 
     if (dbg_here && dbg_done) out_puts(&o, "    { float4 _d = _rsx_dbg; _d.w = 1.0; h[0] = _d; r[0] = _d; }\n");
+    /* The NaN guard's text is matched elsewhere (the signed-blend split in
+     * the Vulkan backend): it stays as it is. RSX_FP_NAN_MODE=amd drops it. */
     if (targets == 1) {
         char tail[96];
         snprintf(tail, sizeof(tail),
-                 "    float4 _o = %s[0];\n"
-                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
+                 nan_mode == 2 ? "    float4 _o = %s[0];\n    return _o;\n}\n"
+                               : "    float4 _o = %s[0];\n"
+                                 "    return (_o == _o) ? _o : (float4)0;\n}\n", export_file);
         out_puts(&o, tail);
     } else {
         /* Multiple render targets. The NaN guard is per target: a poisoned
@@ -1530,11 +1830,15 @@ static int rsx_fp_decompile_internal(
         out_puts(&o, "    PSOutput _out;\n");
         for (u32 t = 0; t < targets; t++) {
             char line[192];
-            snprintf(line, sizeof(line),
-                     "    float4 _o%u = %s[%u];\n"
-                     "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
-                     t, export_file, fp_export_reg[half_exports][t],
-                     t, t, t, t);
+            if (nan_mode == 2)
+                snprintf(line, sizeof(line), "    float4 _o%u = %s[%u];\n    _out.t%u = _o%u;\n",
+                         t, export_file, fp_export_reg[half_exports][t], t, t);
+            else
+                snprintf(line, sizeof(line),
+                         "    float4 _o%u = %s[%u];\n"
+                         "    _out.t%u = (_o%u == _o%u) ? _o%u : (float4)0;\n",
+                         t, export_file, fp_export_reg[half_exports][t],
+                         t, t, t, t);
             out_puts(&o, line);
         }
         out_puts(&o, "    return _out;\n}\n");
@@ -1627,9 +1931,47 @@ static int rsx_fp_decompile_internal(
         "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
         "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+    fp_shadow_diag_init();   /* RSX_FP_SHADOW_FORCE / _FP / RSX_FP_SHADOW_FETCH */
+    s_shf_here = 0; s_shb_here = 0;
+    if ((s_shf_mode || s_shf_bias > 0.0f) && shadow) {
+        int in_list = !s_shf_nfp;
+        if (!in_list) {
+            const u64 h = rsx_fp_structural_hash(ucode, max_bytes, 1469598103934665603ull);
+            for (int k = 0; k < s_shf_nfp; k++) if (s_shf_fp[k] == h) in_list = 1;
+        }
+        if (in_list) { s_shf_here = s_shf_mode; s_shb_here = s_shf_bias > 0.0f; }
+    }
+    /* RSX_FP_NAN_MODE helpers, only where the body uses them (every other
+     * program stays byte-identical). A NaN is found from its bits: an
+     * integer test no float assumption of a driver can fold away. */
+    {
+        const int s_rsx = strstr(o.p, "_rsx_sat(") != NULL, m_rsx = strstr(o.p, "_rsx_min(") || strstr(o.p, "_rsx_max(");
+        const int s_amd = strstr(o.p, "_rsx_psat(") != NULL, m_amd = strstr(o.p, "_rsx_pmin(") || strstr(o.p, "_rsx_pmax(");
+        const int c_rsx = strstr(o.p, "_rsx_sne(") || strstr(o.p, "_rsx_seq(");
+        if (s_rsx || m_rsx || s_amd || m_amd || c_rsx)
+            out_puts(&p, "bool4  _rsx_nan4(float4 v) { return (asuint(v) & 0x7FFFFFFFu) > 0x7F800000u; }\n");
+        /* SNE: 1 where a != b or either is NaN; SEQ: 1 where a == b and neither
+         * is NaN. Built from 0 / 1 floats (max, multiply: exact), so neither
+         * half can be folded away by an assumption about NaN. */
+        if (c_rsx) out_puts(&p,
+            "float4 _rsx_sne(float4 a, float4 b) { return max((float4)(a != b), max((float4)_rsx_nan4(a), (float4)_rsx_nan4(b))); }\n"
+            "float4 _rsx_seq(float4 a, float4 b) { return (float4)(a == b) * (1.0 - (float4)_rsx_nan4(a)) * (1.0 - (float4)_rsx_nan4(b)); }\n");
+        /* RSX_FP_NRM_SAFE: a zero-length vector stays (0, 0, 0) */
+        if (strstr(o.p, "_rsx_nrm(")) out_puts(&p,
+            "float3 _rsx_nrm(float3 v) { return dot(v, v) > 0.0 ? normalize(v) : v; }\n");
+        if (s_rsx) out_puts(&p, "float4 _rsx_sat(float4 v) { return _rsx_nan4(v) ? (float4)0 : saturate(v); }\n");
+        if (m_rsx) out_puts(&p,
+            "float4 _rsx_min(float4 a, float4 b) { return _rsx_nan4(a) ? b : _rsx_nan4(b) ? a : min(a, b); }\n"
+            "float4 _rsx_max(float4 a, float4 b) { return _rsx_nan4(a) ? b : _rsx_nan4(b) ? a : max(a, b); }\n");
+        if (s_amd) out_puts(&p, "float4 _rsx_psat(float4 v) { return _rsx_nan4(v) ? v : saturate(v); }\n");
+        if (m_amd) out_puts(&p,
+            "float4 _rsx_pmin(float4 a, float4 b) { return _rsx_nan4(a) ? a : _rsx_nan4(b) ? b : min(a, b); }\n"
+            "float4 _rsx_pmax(float4 a, float4 b) { return _rsx_nan4(a) ? a : _rsx_nan4(b) ? b : max(a, b); }\n");
+    }
     if (shadow) for (u32 u = 0; u < 16; u++)
         if ((sampled_units & (1u << u)) && shadow[u].enabled)
             fp_shadow_helper(&p, u, tex_sep_mask, &shadow[u]);
+    s_shf_here = 0; s_shb_here = 0;
     if (gamma_units) fp_gamma_helper(&p);
     if (expand_units || bx2_units) fp_expand_helper(&p);
     if (targets == 1) {

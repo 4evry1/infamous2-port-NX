@@ -686,14 +686,18 @@ static void cellFsLseek(ppu_context* ctx)
  * inFamous's menu catalog loader (func_002C5A30) skips a file whose mtime equals its cached
  * value -- which starts at 0 -- so it never parsed cache/load_menu_catalog.log, the "empire"
  * lookup failed, and the boot never pushed the task that starts the save autoload. */
+/* A host file system that reports no times at all (0: the Switch emulators' SD card, some FAT tools) gets a
+ * fixed date instead (2011-06-07, the game's release), or the catalog loader above skips the file and the
+ * boot stalls at the loading screen for ever -- the Eden/Eglantine stall after british_text.psarc. */
+static uint64_t fs_time_or_default(time_t t) { return t ? (uint64_t)t : 1307404800ull; }
 static void write_stat(uint32_t sb, uint32_t mode, uint64_t size, const struct stat* st)
 {
     vm_write32(sb + 0x00, mode);
     vm_write32(sb + 0x04, 0);            /* uid */
     vm_write32(sb + 0x08, 0);            /* gid */
-    vm_write64(sb + 0x0C, st ? (uint64_t)st->st_atime : 0);   /* atime */
-    vm_write64(sb + 0x14, st ? (uint64_t)st->st_mtime : 0);   /* mtime */
-    vm_write64(sb + 0x1C, st ? (uint64_t)st->st_ctime : 0);   /* ctime */
+    vm_write64(sb + 0x0C, st ? fs_time_or_default(st->st_atime) : 0);   /* atime */
+    vm_write64(sb + 0x14, st ? fs_time_or_default(st->st_mtime) : 0);   /* mtime */
+    vm_write64(sb + 0x1C, st ? fs_time_or_default(st->st_ctime) : 0);   /* ctime */
     vm_write64(sb + 0x24, size);         /* size */
     vm_write64(sb + 0x2C, 0x200);        /* blksize */
 }
@@ -854,9 +858,9 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
          * (upstream PR #247 writes them itself below). */
         write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
                         (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size), &st);
-        vm_write64(out + 0x0C, uint64_t(st.st_atime));
-        vm_write64(out + 0x14, uint64_t(st.st_mtime));
-        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
+        vm_write64(out + 0x0C, fs_time_or_default(st.st_atime));
+        vm_write64(out + 0x14, fs_time_or_default(st.st_mtime));
+        vm_write64(out + 0x1C, fs_time_or_default(st.st_ctime));
         size_t length = strlen(entry->d_name);
         if (length > 255) length = 255;
         vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;

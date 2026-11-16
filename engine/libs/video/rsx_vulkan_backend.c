@@ -884,6 +884,17 @@ static int vk_pick_device(void)
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     VK_LOG("using device %d: %s\n", best, p.deviceName);
+    {   /* GitHub #27: the character shadow masks read their own pixel on AMD by default */
+        static int told;
+        const int how = rsx_fp_set_host_vendor(p.vendorID);
+        if (!told) { told = 1;
+            VK_LOG("RSX_FP_OWNPX: %s\n",
+                   how == 1 ? "on (AMD GPU default: shadow masks c70407ba5c029d1c, 25f427a67ef667f7 read their own pixel; RSX_FP_OWNPX=0 turns it off)"
+                 : how == 2 ? "on (the RSX_FP_OWNPX list set)"
+                 : how == 3 ? "off (RSX_FP_OWNPX=0)"
+                 : how == 0 ? "off (not an AMD GPU)"
+                            : "decided before the device was known"); }
+    }
     return 0;
 }
 
@@ -1441,6 +1452,22 @@ static int vk_batch_arena_grow(vk_buffer* b, VkDeviceSize request, int overflowe
     return vk_batch_arena(b, old > request ? old : request, floor_size, usage);
 }
 
+/* (freeze) The staging arena's first size. At 64 MB the first frame of the world
+ * (644 textures, 64-72 MB of uploads in one batch) filled it, and a full arena
+ * mid-batch is a submit-and-wait: 94-152 ms on top of that frame. 128 MB holds
+ * it. PS3RECOMP_VK_STAGE_MB=64: the old size (16..1024). */
+static VkDeviceSize vk_stage_floor(void)
+{
+    static VkDeviceSize v;
+    if (!v) {
+        const char* e = getenv("PS3RECOMP_VK_STAGE_MB");
+        int mb = (e && *e) ? atoi(e) : 128;
+        if (mb < 16) mb = 16;
+        if (mb > 1024) mb = 1024;
+        v = (VkDeviceSize)mb << 20;
+    }
+    return v;
+}
 /* `bytes` of transfer staging that lives until the batch completes: the
  * replacement for a temporary buffer created, used and destroyed per call.
  * Returns the offset into s_batch.sarena, or -1. May flush (before the
@@ -1456,7 +1483,7 @@ static int64_t vk_batch_stage(VkDeviceSize bytes)
         if (pass) break;
         const int was_recording = s_batch.recording;   /* a full arena mid-batch, not a first use */
         vk_batch_flush();
-        if (vk_batch_arena_grow(&s_batch.sarena, bytes, was_recording, 1024ull << 20, 64u << 20,
+        if (vk_batch_arena_grow(&s_batch.sarena, bytes, was_recording, 1024ull << 20, vk_stage_floor(),
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, "staging"))
             return -1;
     }
@@ -4347,6 +4374,10 @@ static void vk_rdoc_poll(void)
 
 /* Blit the offscreen target into the next swapchain image and present it. */
 static void vk_present_window_body(void);
+/* (freeze) outside the async-present block below: vk_present_window uses them on every path, and builds
+ * without the async present (VK_TQ_NO_ASYNC_PRESENT, e.g. Linux) did not see them (v0.5.4 Linux build error) */
+static int vk_pa_hold_take(void);     /* (freeze) vk_pipe_async.inc */
+static int vk_pa_hold_ok;             /* (freeze) the frame being drawn ends in vk_present_async */
 #ifndef VK_TQ_NO_ASYNC_PRESENT
 /* PS3RECOMP_VK_PRESENT_ASYNC (rsx3, default on; =0 = the present below, on this
  * thread): the RSX thread ends the frame's pass, waits for the frame cap's beat
@@ -4377,9 +4408,10 @@ static int vk_present_async_ok(void)
 }
 /* The worker's half (also run on the RSX thread, direct, when no record fits). */
 static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore acq,
-                              VkImage cimg, VkImageView cview, u32 cw, u32 ch)
+                              VkImage cimg, VkImageView cview, u32 cw, u32 ch, int hold)
 {
     int sc = s_vk.windowed && s_vk.swapchain && !s_sc_minimized;
+    if (hold) sc = 0;                           /* (freeze) submitted, not shown: the last picture stays */
     if (sc && s_present_dirty) {                /* [overlay] present mode / fullscreen changed live */
         s_present_dirty = 0;
         vk_swapchain_lost();
@@ -4488,7 +4520,7 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
 }
 static void vk_present_exec(const tq_present_rec* r)
 {
-    vk_present_finish(r->h.cb, r->fence, r->acq, r->img, r->view, r->w, r->ht);
+    vk_present_finish(r->h.cb, r->fence, r->acq, r->img, r->view, r->w, r->ht, (int)r->hold);
 }
 static void vk_present_async(void)
 {
@@ -4500,8 +4532,10 @@ static void vk_present_async(void)
     vk_image* const di = vk_disp_img();     /* [res] the scaled display image when on */
     vk_barrier_image(di->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     vk_frame_limit();                       /* the cap's beat, before the frame goes to the worker */
+    const int hold = vk_pa_hold_take();     /* (freeze) a pass of this frame had no pipeline yet */
     tq_present_rec* p = (tq_present_rec*)(void*)tq_alloc(TQ_PRESENT, sizeof(tq_present_rec), s_vk.cmd);
     if (p) {
+        p->hold = (u32)hold;
         p->fence = s_vk.fence; p->acq = s_vk.sem_acquire;
         p->img = di->img; p->view = di->view; p->w = vk_disp_w(); p->ht = vk_disp_h();
         p->seq = ++s_tq_pres_sent;
@@ -4512,7 +4546,7 @@ static void vk_present_async(void)
         const int was = s_tq.direct;
         s_tq.direct = 1;
         vk_present_finish(s_vk.cmd, s_vk.fence, s_vk.sem_acquire, di->img, di->view,
-                          vk_disp_w(), vk_disp_h());
+                          vk_disp_w(), vk_disp_h(), hold);
         s_tq.direct = was;
     }
     s_fif_pending[s_fif_cur] = 1;           /* waited for when the slot comes round */
@@ -4523,6 +4557,7 @@ static void vk_present_async(void)
     s_tq_nodrain = 1;
     vk_fif_advance();
     s_tq_nodrain = 0;
+    vk_pa_hold_ok = vk_present_async_ok();  /* (freeze) the next frame: held only if it ends here too */
 }
 #endif
 /* The present records through postfx's and the overlay's own entry points (and
@@ -4536,6 +4571,8 @@ static void vk_present_window(void)
 #ifndef VK_TQ_NO_ASYNC_PRESENT
     if (vk_present_async_ok()) { vk_present_async(); return; }
 #endif
+    vk_pa_hold_ok = 0;                          /* (freeze) this path shows every frame */
+    (void)vk_pa_hold_take();
     if (vk_display_dark()) {                    /* (rsx5) as minimized: submitted, paced, not shown */
         vk_dark_note(1);
         vk_batch_flush();
@@ -7338,7 +7375,23 @@ static void vk_eng_image_infos(VkDescriptorImageInfo ii[RSX_MAX_TEXTURES], VkDes
         VkImageView v = h ? vk_eng_sample_view(h) : VK_NULL_HANDLE;
         const int is_cube = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].faces == 6;
         const int is_vol  = h && h < VK_ENG_MAX_OBJ && s_eobj[h].kind == VK_ENG_TEXTURE && s_eobj[h].depth > 1;
-        if ((cube_mask >> u) & 1u) { if (!v || !is_cube) v = vk_eng_dummy_view(0); }
+        if ((cube_mask >> u) & 1u) {
+            if (!v || !is_cube) {
+                /* Reported once per unit and cause (2026-11-14: the lighting
+                 * composite's ambient cube on unit 8 read as this black cube
+                 * leaves every unlit pixel at RGB 0; the draw engine's
+                 * "cube unit ... shares its address" line names the lookup).
+                 * Since v0.5.5 the engine binds the guest cube there; only the
+                 * first case is reported. */
+                static int said;   /* one line a session (v0.5.5: quiet by default) */
+                if (!said) { said = 1;
+                    if (h && v) VK_LOG("engine: unit %u reads a cube but h%u is a %ux%u 2D image: 1x1 black cube instead\n",
+                                       u, h, h < VK_ENG_MAX_OBJ ? s_eobj[h].w : 0u, h < VK_ENG_MAX_OBJ ? s_eobj[h].h : 0u);
+                    else VK_LOG("engine: unit %u reads a cube but %s: 1x1 black cube instead\n",
+                                u, !h ? "no texture is bound" : "the bound texture has no view"); }
+                v = vk_eng_dummy_view(0);
+            }
+        }
         else if ((vol_mask >> u) & 1u) {
             if (v && !is_vol) { static int said; if (said++ < 4)
                 VK_LOG("engine: unit %u reads a volume but a %ux%u 2D texture is bound (compressed volume?): black stand-in\n",
@@ -10081,9 +10134,52 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char* dev_exts[2];
+    const char* dev_exts[3];
     u32 ndext = 0;
     if (s_vk.windowed) dev_exts[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    /* (amdnan) PS3RECOMP_VK_NAN_PRESERVE: the guest programs declare
+     * SignedZeroInfNanPreserve (rsx_shader_spirv.h). Without it a driver may
+     * compile them as if no value were ever NaN or infinite, and the
+     * decompiler's NaN handling -- SAT's flush to 0, MIN/MAX's other operand,
+     * the IEEE compares, NRM's zero guard, the export guards -- and the
+     * game's own NaN filters are then free to vanish or turn around; GitHub
+     * #27: flickering black spots on the cutscene faces on AMD's Windows
+     * driver (RDNA3), not on NVIDIA or RADV. Default (#27): on for an AMD GPU
+     * (vendorID 0x1002), off for every other GPU (their SPIR-V as before);
+     * =0 off, =1 on. Needs VK_KHR_shader_float_controls (before the budget
+     * extension: a failed device creation drops the last one) and the 32-bit
+     * property.
+     * PS3RECOMP_VK_DENORM=preserve|ftz (test switch; unset = the driver's own
+     * choice, on every GPU): every guest program also declares DenormPreserve
+     * (the RSX keeps fp32 denormals, RPCS3 #20078) or DenormFlushToZero (what
+     * NVIDIA does) for fp32, when the device offers it. */
+    int nanp = 0, denorm = 0, nanp_how;   /* how: 0 default off, 1 AMD default, 2 set on, 3 set off */
+    { VkPhysicalDeviceProperties dp;
+      pvkGetPhysicalDeviceProperties(s_vk.phys, &dp);
+      const char* e = getenv("PS3RECOMP_VK_NAN_PRESERVE");
+      const char* all = getenv("PS3RECOMP_AMD_NAN_FIX");   /* =0: every #27 AMD default off */
+      const int amd_fix = dp.vendorID == 0x1002u &&
+                          !(all && (!*all || !strcmp(all, "0") || !strcmp(all, "off")));
+      const int want = e ? (*e && *e != '0') : amd_fix;
+      nanp_how = e ? (want ? 2 : 3) : want;
+      const char* d = getenv("PS3RECOMP_VK_DENORM");
+      const int want_d = !d ? 0 : !strcmp(d, "preserve") ? 1 : !strcmp(d, "ftz") ? 2 : 0;
+      if ((want || want_d) && props2 &&
+          vk_has_device_extension(s_vk.phys, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) {
+          PFN_vkGetPhysicalDeviceProperties2KHR gp2 = (PFN_vkGetPhysicalDeviceProperties2KHR)
+              pvkGetInstanceProcAddr(s_vk.instance, "vkGetPhysicalDeviceProperties2KHR");
+          VkPhysicalDeviceFloatControlsPropertiesKHR fc = {
+              .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR };
+          VkPhysicalDeviceProperties2KHR p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR,
+                                                .pNext = &fc };
+          if (gp2) {
+              gp2(s_vk.phys, &p2);
+              nanp = want && fc.shaderSignedZeroInfNanPreserveFloat32 ? 1 : 0;
+              denorm = want_d == 1 ? (fc.shaderDenormPreserveFloat32 ? 1 : 0)
+                     : want_d == 2 ? (fc.shaderDenormFlushToZeroFloat32 ? 2 : 0) : 0;
+          }
+      }
+      if (nanp || denorm) dev_exts[ndext++] = VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME; }
     /* (lowend) VK_EXT_memory_budget: the heap's use and budget (vk_vram.inc) */
     s_vram.budget_ok = s_vram.props2 && vk_has_device_extension(s_vk.phys, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (s_vram.budget_ok) dev_exts[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
@@ -10117,7 +10213,25 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         dci.ppEnabledExtensionNames = ndext ? dev_exts : NULL;
         dr_ = pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device);
     }
+    if (dr_ != VK_SUCCESS && (nanp || denorm)) {   /* (amdnan) nor over float controls */
+        nanp = denorm = 0;
+        dci.enabledExtensionCount = --ndext;
+        dci.ppEnabledExtensionNames = ndext ? dev_exts : NULL;
+        dr_ = pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device);
+    }
     VK_CHECK(dr_, "vkCreateDevice");
+    rsx_spirv_set_nan_preserve(nanp);
+    rsx_spirv_set_denorm(denorm);
+    {   /* GitHub #27: one startup line for every NaN rule and how it was decided */
+        static const char* const how_txt[4] = { "off", "on (AMD default)", "on (set)", "off (set)" };
+        char fp[192];
+        rsx_fp_nan_rules_describe(fp, sizeof fp);
+        VK_LOG("#27 NaN rules: PS3RECOMP_VK_NAN_PRESERVE %s, PS3RECOMP_VK_DENORM %s, %s"
+               " (=0 turns one off, =1 on; PS3RECOMP_AMD_NAN_FIX=0 = all AMD defaults off)\n",
+               nanp ? how_txt[nanp_how & 3]
+                    : (nanp_how == 1 || nanp_how == 2) ? "off (the driver does not offer it)" : how_txt[nanp_how & 3],
+               denorm == 1 ? "preserve" : denorm == 2 ? "ftz" : "driver default", fp);
+    }
     VK_LOG("GPU memory: %u MB (heap %d)%s\n", vk_vram_device_local_mb(), s_vram.dl_heap,
            s_vram.budget_ok ? ", budget numbers on (VK_EXT_memory_budget)" : ", no budget numbers");
     if (vk_load_device_functions()) return -1;

@@ -2042,7 +2042,13 @@ static inline int spu_spin_core_ok(void)
 static __attribute__((noinline, cold)) int spu_spin_us_init(void)
 {
     const char* e = getenv("PS3_SPU_SPIN_US");
-    int v = e ? atoi(e) : 30;
+    /* (spurt3) unset: 30 us where the CPU has cores to spare, 0 (sleep at once) where it has fewer
+     * physical cores than the game has busy threads (ps3_host_core_scarce, host_place.c: under 8). There
+     * the spinning worker takes its core's second hardware thread from a working one: 18.7% of a thread
+     * over the five workers at inFAMOUS 2's cathedral spire on 4 cores / 8 threads, for the same fps and
+     * a better 1% low without it (26.2 -> 22.6 ms, work/brain/perf60/LOG.md). A number = that number. */
+    extern int ps3_host_core_scarce(void);
+    int v = (e && *e) ? atoi(e) : (ps3_host_core_scarce() ? 0 : 30);
     if (v < 0) v = 0;
     if (v > 1000) v = 1000;
     const char* l = getenv("PS3_SPU_SPIN_LEAN");
@@ -3263,26 +3269,6 @@ static __attribute__((noinline, cold)) int spu_ovl_fast_init(void)
     return on;
 }
 
-/* PS3_SPU_OVL_BOX (default 1 in the Switch build, 0 elsewhere; 0 = scan the 16 slots on every GET, as before): the scan below looks for
- * an occupied slot that the GET overlaps; the context keeps a span that covers every occupied slot
- * (spu_context.res_lo / res_hi, spu_resident_box_update), and a GET outside it overlaps none. */
-static int s_ovl_box = -1;
-static __attribute__((noinline, cold)) int ovl_box_init(void)
-{
-    const char* e = getenv("PS3_SPU_OVL_BOX");
-#ifdef __SWITCH__
-    const int on = !(e && e[0] == '0');       /* the Switch build: on unless =0 */
-#else
-    const int on = e && e[0] == '1';          /* the PC builds: off (the slot scan on every GET, as upstream) unless =1 */
-#endif
-    __atomic_store_n(&s_ovl_box, on, __ATOMIC_RELAXED);
-    return on;
-}
-static inline int ovl_box_on(void)
-{
-    const int v = __atomic_load_n(&s_ovl_box, __ATOMIC_RELAXED);
-    return __builtin_expect(v >= 0, 1) ? v : ovl_box_init();
-}
 
 void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
 {
@@ -3291,13 +3277,34 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     if (fast) {
         const uint32_t lsa = (uint32_t)(ls - ctx->ls);
         int overlap = 0;
-        if (!ovl_box_on() || (lsa < ctx->res_hi && lsa + size > ctx->res_lo))
-            for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-                if (!ctx->resident_code[slot].image_id) continue;
-                const uint32_t base = ctx->resident_code[slot].lsa;
-                const uint32_t end = base + ctx->resident_code[slot].size;
-                if (lsa < end && lsa + size > base) { overlap = 1; break; }
+        /* (spurt3) PS3_SPU_OVL_BBOX (default 1; 0 = walk the 16 slots at every GET, as before): the lowest
+         * and highest local-store address any resident span covers, kept in the context with
+         * its span generation (ib_gen changes with every span change; a new context starts with no box; the job recorder's save/restore
+         * writes the slots without it, so the box is only trusted while the recorder is off). A GET
+         * outside the box overlaps no span: the walk would find nothing. */
+        static int s_bbox = -1;
+        if (__builtin_expect(s_bbox < 0, 0)) { const char* e = getenv("PS3_SPU_OVL_BBOX"); s_bbox = !(e && e[0] == '0'); }
+        int walk = 1;
+        if (s_bbox && !g_spu_jobrec_mode) {
+            if (__builtin_expect(ctx->ovl_bb_gen1 != (uint32_t)ctx->ib_gen + 1u, 0)) {
+                uint32_t lo = 0xFFFFFFFFu, hi = 0;
+                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                    if (!ctx->resident_code[slot].image_id) continue;
+                    const uint32_t base = ctx->resident_code[slot].lsa;
+                    const uint32_t end = base + ctx->resident_code[slot].size;
+                    if (base < lo) lo = base;
+                    if (end > hi) hi = end;
+                }
+                ctx->ovl_bb_lo = lo; ctx->ovl_bb_hi = hi; ctx->ovl_bb_gen1 = (uint32_t)ctx->ib_gen + 1u;
             }
+            walk = lsa < ctx->ovl_bb_hi && lsa + size > ctx->ovl_bb_lo;
+        }
+        for (unsigned slot = 0; walk && slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+            if (!ctx->resident_code[slot].image_id) continue;
+            const uint32_t base = ctx->resident_code[slot].lsa;
+            const uint32_t end = base + ctx->resident_code[slot].size;
+            if (lsa < end && lsa + size > base) { overlap = 1; break; }
+        }
         if (!overlap && ovl_cannot_match(ea, ls, lsa, size)) return;
     }
     spu_overlay_note_get_full(ctx, ea, ls, size);

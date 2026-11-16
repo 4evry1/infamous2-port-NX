@@ -45,6 +45,25 @@ extern "C" {
 /* 1 when built with glslang, 0 when the stub is in. */
 int rsx_hlsl_to_spirv_available(void);
 
+/* 1: every module rsx_hlsl_to_spirv writes from now on declares
+ * SignedZeroInfNanPreserve for 32-bit floats (SPV_KHR_float_controls), so
+ * the driver may not assume the guest programs never see a NaN or an
+ * infinity -- their `x == x` guards and NaN-flushing clamps then stay in.
+ * Only for a device that enabled VK_KHR_shader_float_controls and reports
+ * shaderSignedZeroInfNanPreserveFloat32. Set before the first translation
+ * (the shader cache's fingerprint canaries go through the same path, so
+ * the setting is part of every cache key). The GLSL passes are untouched. */
+void rsx_spirv_set_nan_preserve(int on);
+
+/* 1: every module rsx_hlsl_to_spirv writes from now on also declares
+ * DenormPreserve for 32-bit floats, 2: DenormFlushToZero, 0: neither (the
+ * driver's own choice). Same rules as rsx_spirv_set_nan_preserve: only for a
+ * device that enabled VK_KHR_shader_float_controls and reports the matching
+ * shaderDenorm*Float32 property; set before the first translation (part of
+ * every cache key through the fingerprint canaries). GitHub #27 test switch
+ * PS3RECOMP_VK_DENORM. */
+void rsx_spirv_set_denorm(int mode);
+
 /* Translate one HLSL shader whose entry point is `main` into SPIR-V 1.0 for a
  * Vulkan 1.0 client.
  *   hlsl      : NUL-terminated HLSL, as the decompilers emit it.

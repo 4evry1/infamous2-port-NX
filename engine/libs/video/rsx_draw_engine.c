@@ -43,6 +43,7 @@
 #include "../../include/ps3emu/ps3_ftrace.h"    /* PS3_FTRACE: compile / texture spans */
 #include "../../include/ps3emu/ps3_settings.h"  /* the PC menu's live settings (PS3RECOMP_DOF, ...) */
 #include "../../include/ps3emu/ps3_lightfx.h"   /* the menu's Lighting page (PS3RECOMP_SOFT_SHADOWS, ...) */
+#include "../../include/ps3emu/ps3_title_view.h" /* (dofov) PS3RECOMP_DOF=play: the title says gameplay or cutscene */
 
 /* Knobs PS3_TOGGLE_FILE can change while the game runs (their watchers only
  * store; the RSX thread reads). */
@@ -122,6 +123,11 @@ static void eng_soft_bias_set(int id, int v) { (void)id; __atomic_store_n(&s_sof
 static int s_shade_backface = -1;
 static void eng_shade_backface_set(int id, int v) { (void)id; __atomic_store_n(&s_shade_backface, v != 0, __ATOMIC_RELAXED); }
 #define ENG_SHADE_BACKFACE_FP 0xf384f111ad5956baull
+/* PS3RECOMP_ENG_CUBE_GUEST (live, after PS3T_ENG_CUBE_GUEST; default on since
+ * v0.5.5, =0 = the old lookup order) and PS3RECOMP_ENG_CUBELOG=1 (read once, diagnostic):
+ * see eng_cube_unit, before sink_bind_textures. */
+static int s_cube_guest = -1;
+static void eng_cube_guest_set(int id, int v) { (void)id; __atomic_store_n(&s_cube_guest, v != 0, __ATOMIC_RELAXED); }
 /* PS3RECOMP_DOF=0 / PS3RECOMP_EDGE_BLUR=0 (live, the PC menu's Graphics
  * page): inFAMOUS 2's depth of field and its screen-edge blur turned off.
  * Unset or 1 = the game's own picture.
@@ -150,11 +156,44 @@ static void eng_shade_backface_set(int id, int v) { (void)id; __atomic_store_n(&
  * (every input is a finite UNORM sample). Nothing else in the frame
  * changes (the game still makes the two quarter-size images; they are
  * small). A change builds the other variant of this one pipeline (part of
- * its key). */
+ * its key).
+ * (dofov, 2026-11-13) PS3RECOMP_DOF=play: off in gameplay only. The game's
+ * gameplay depth of field is one steady far blur (0.55 in the docks
+ * tutorial); its cutscenes set their own strength and focus per shot (0.3 to
+ * 1.0: the focus pulls on faces). Which one a frame is, only the title knows
+ * (include/ps3emu/ps3_title_view.h: the port's camera-mode hooks): at each
+ * frame's end the setting in effect for the next frame (s_fx_dof) is 0 while
+ * the title says "the player's camera", 1 otherwise. Both variants of the
+ * pipeline stay built, so a cut costs nothing; the frame of a cut may still
+ * have the other one (the title's mark comes from the guest's camera update
+ * of that frame, the draws are recorded after it). A title that says nothing
+ * (-1): off, as "Off" (the player asked for no blur in gameplay). */
 #define ENG_DOF_BLEND_FP 0x59313a119f622eb5ull
 static int s_fx_dof = -1, s_fx_edge = -1;   /* 1 on (the game's), 0 off, -1 not read yet */
+static int s_fx_dof_mode = 1;                /* (dofov) the setting: 0 off, 1 on, 2 off in gameplay */
 static int eng_fx_on(const char* v) { return !(v && v[0] == '0' && v[1] == 0); }
-static int eng_fx_dof_apply(const char* v) { __atomic_store_n(&s_fx_dof, eng_fx_on(v), __ATOMIC_RELAXED); return 1; }
+static int eng_fx_dof_mode_of(const char* v)
+{
+    if (v && (!strcmp(v, "play") || !strcmp(v, "gameplay") || !strcmp(v, "2"))) return 2;
+    return eng_fx_on(v);
+}
+/* The value in effect for the next frame (the pipeline key and the delta engine's knobs read s_fx_dof). */
+static void eng_fx_dof_frame(void)
+{
+    const int mode = __atomic_load_n(&s_fx_dof_mode, __ATOMIC_RELAXED);
+    int on = mode != 0;
+    if (mode == 2) {
+        extern unsigned long long ps3_ms_now(void);
+        on = ps3_title_view_gameplay(ps3_ms_now()) == 0;   /* off in gameplay and when the title says nothing */
+    }
+    if (__atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED) != on) __atomic_store_n(&s_fx_dof, on, __ATOMIC_RELAXED);
+}
+static int eng_fx_dof_apply(const char* v)
+{
+    __atomic_store_n(&s_fx_dof_mode, eng_fx_dof_mode_of(v), __ATOMIC_RELAXED);
+    eng_fx_dof_frame();
+    return 1;
+}
 static int eng_fx_edge_apply(const char* v) { __atomic_store_n(&s_fx_edge, eng_fx_on(v), __ATOMIC_RELAXED); return 1; }
 /* Replace every `from` in `buf` with `to`; the count, or -1 when it would not fit. */
 static int eng_hlsl_replace(char* buf, size_t cap, const char* from, const char* to)
@@ -718,6 +757,7 @@ static struct {
     u32 n_verts;
     u32 vbuf;          /* a cached persistent vertex buffer this draw uses, else 0 */
     int vbuf_hit;      /* dc.verts was NOT filled: the cache supplied the vertices */
+    const void* vce;   /* (dofov) that cache entry (eng_vc_entry): its position box, PS3RECOMP_WIDE_FILL */
 
     rsx_vertex_layout_plan layout;
     rsx_vertex_fetch_plan fetch_plan;
@@ -4338,7 +4378,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * DOF/edge-blur pass are off (bit 0 depth of field, bit 1 edge blur). */
     if (__builtin_expect(__atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED) < 0, 0)) {
         __atomic_store_n(&s_fx_edge, eng_fx_on(getenv("PS3RECOMP_EDGE_BLUR")), __ATOMIC_RELAXED);
-        __atomic_store_n(&s_fx_dof, eng_fx_on(getenv("PS3RECOMP_DOF")), __ATOMIC_RELAXED);
+        __atomic_store_n(&s_fx_dof_mode, eng_fx_dof_mode_of(getenv("PS3RECOMP_DOF")), __ATOMIC_RELAXED);
+        eng_fx_dof_frame();   /* (dofov) =play: from the title's view */
     }
     const u32 fx_off = (!fixed && in_fp == ENG_DOF_BLEND_FP)
                      ? (u32)(!__atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED)) |
@@ -4697,6 +4738,7 @@ static void dc_reset(void)
     dc.refs_remapped = 0;
     dc.vbuf = 0;
     dc.vbuf_hit = 0;
+    dc.vce = NULL;
     dc.fetch_ok = 1;
     dc.inl = NULL;
     dc.inl_bytes = 0;
@@ -4923,8 +4965,25 @@ typedef struct {
     u8 seen, changes;
     u8 wt_ok;                    /* rsx_wtrack: spans armed, wt_content is their hash */
     u8 unhashed;                 /* (rsx-vtx) PS3RECOMP_ENG_LAZY_HASH: seen once, bytes not hashed yet */
+    u8 wbox_ok;                  /* (dofov) wbox holds the position attribute's box (PS3RECOMP_WIDE_FILL) */
     u64 wt_stamp, wt_content;
+    float wbox[6];               /* (dofov) x0 x1 y0 y1 z0 z1 of attribute 0 when the vbuf was made */
 } eng_vc_entry;
+/* (dofov) PS3RECOMP_WIDE_FILL: keep each cached vertex buffer's position box (only while a wide picture pins
+ * a HUD: set with PS3_ASPECT_HUD_AFTER), so a pinned draw from the cache can still be measured. */
+static int s_wide_box;
+/* The box of attribute 0 over n decoded vertices (dc.verts, float4 per attribute); 0 = no positions. */
+static int eng_pos_box(const u8* verts, const rsx_vertex_layout_plan* lay, u32 n, float* b)
+{
+    const s8 ps = lay->slot_by_attr[0];
+    if (ps < 0 || !verts || !n || !lay->stride) return 0;
+    b[0] = b[2] = b[4] = 1e30f; b[1] = b[3] = b[5] = -1e30f;
+    for (u32 v = 0; v < n; v++) {
+        const float* q = (const float*)(verts + (size_t)v * lay->stride + (size_t)ps * 16u);
+        for (int c = 0; c < 3; c++) { if (q[c] < b[2 * c]) b[2 * c] = q[c]; if (q[c] > b[2 * c + 1]) b[2 * c + 1] = q[c]; }
+    }
+    return b[0] <= b[1];
+}
 #define ENG_VC_SIZE   65536u
 #define ENG_VC_BUDGET (512ull << 20)
 static eng_vc_entry s_vc[ENG_VC_SIZE];
@@ -5014,6 +5073,7 @@ static void eng_vc_drop(eng_vc_entry* e)
 {
     if (e->vbuf) { g.be->vbuf_release(g.be->user, e->vbuf); s_vc_bytes -= e->bytes; }
     e->vbuf = 0; e->bytes = 0;
+    e->wbox_ok = 0;   /* (dofov) */
 }
 
 /* The table full: keep what was drawn recently, forget the rest. Skinned and
@@ -5242,7 +5302,8 @@ static void eng_vc_after_fetch(eng_vc_entry* e, u64 content, u32 stride)
             }
             if (s_vc_bytes + bytes <= ENG_VC_BUDGET) {
                 e->vbuf = g.be->vbuf_create(g.be->user, dc.verts, bytes);
-                if (e->vbuf) { e->bytes = bytes; e->n = dc.n_refs; e->stride = stride; s_vc_bytes += bytes; ds_vc_new++; }
+                if (e->vbuf) { e->bytes = bytes; e->n = dc.n_refs; e->stride = stride; s_vc_bytes += bytes; ds_vc_new++;
+                               e->wbox_ok = s_wide_box && eng_pos_box(dc.verts, &dc.layout, dc.n_refs, e->wbox); }   /* (dofov) */
             }
         }
         e->changes = 0;
@@ -5664,7 +5725,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                     dc.refs_lazy = e->span > 1u; dc.lazy_base = base_index;
                     dc.plan_stale = 1;
                     pv->last_frame = g.frames;
-                    dc.vbuf = pv->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
+                    dc.vbuf = pv->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs; dc.vce = pv;
                     e->last_frame = g.frames;
                     s_ic_hit = 1; ds_ic_hit++; ds_vc_hit++; ds_pair_hit++;
                     s_dl_pv = pv; s_dl_psig = psig;   /* (rnd1) PS3RECOMP_ENG_DELTA */
@@ -5698,7 +5759,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                 ve->n == dc.n_refs && ve->stride == layout->stride) {
                 if (pv_chk && ve != pv_chk) fd2_pair_vfail("the search found another vertex-cache entry");   /* (fastdraw) */
                 ve->last_frame = g.frames;
-                dc.vbuf = ve->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs;
+                dc.vbuf = ve->vbuf; dc.vbuf_hit = 1; dc.n_verts = dc.n_refs; dc.vce = ve;
                 e->last_frame = g.frames;
                 if (psig) eng_pair_note(e, ve, psig, pxgen);
                 s_ic_hit = 1; ds_ic_hit++; ds_vc_hit++;
@@ -5831,6 +5892,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             dc.layout = *layout;
             dc.vbuf = ve->vbuf;
             dc.vbuf_hit = 1;
+            dc.vce = ve;   /* (dofov) */
             dc.n_verts = dc.n_refs;
             ds_vc_hit++;
             if (dso) { t1 = eng_ds_now(); ds.ns_fetch += t1 - t0;
@@ -6406,6 +6468,140 @@ static u32 eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs, u3
     return tex_mask | (1u << unit);
 }
 
+/* ---- cube units (2026-11-14, the New Marais dusk report) -------------------
+ * inFAMOUS 2's deferred composite (FP f384f111ad5956ba) takes ALL of its
+ * ambient from an 8x8 A8R8G8B8 cube on unit 8 (local 0x0F2EAF00, linear,
+ * pitch 32, crossbar 0xAA93 -- bytes the title writes, not a render target),
+ * sampled by the normal, times fpc[9].x (1: stencil bit 7, the characters) or
+ * fpc[11].x (0.35: the world); unit 9 is the reflection cube. Without it every
+ * pixel that neither the sun nor a point light reaches is RGB 0 -- a street in
+ * shadow, a facade, Cole's unlit side -- while the lit ones look right.
+ *
+ * sink_bind_textures tries, before the guest texture, a depth buffer, a colour
+ * target, a GPU light or SSAO output at the unit's address. Each of those is a
+ * 2D image, and a TextureCube slot given a 2D image gets the backend's 1x1
+ * black cube (vk_eng_image_infos). A colour target matches at ANY size, and a
+ * target is only forgotten when the 64-slot table is full (a session peaks at
+ * ~27), so a target the title once placed at a cube's address would take that
+ * cube for the rest of the session.
+ *
+ * Each (unit, address, kind) found is reported once with PS3RECOMP_ENG_CUBELOG=1;
+ * without it, only the first one and only with PS3RECOMP_ENG_CUBE_GUEST=0 (the
+ * case that leaves the unit black).
+ * PS3RECOMP_ENG_CUBE_GUEST (live, default on since v0.5.5; =0 = the old order):
+ * a square cube unit reads the cube in guest memory whatever else is at its
+ * address (a 2D image can never serve it). v0.5.4 players saw shadowed streets
+ * go black after a long session: the composite's ambient cube took a target.
+ * PS3RECOMP_ENG_CUBELOG=1: F9 (the playlog MARK; this takes the key from
+ * PS3RECOMP_ENG_HUDLOG_KEY) reports the composite's next draw: per cube unit
+ * the registers, what shares its address, the guest bytes per byte lane
+ * (min/max/mean: is the title's cube itself black?), the handle bound, and the
+ * ambient scales fpc[9]/fpc[11] and sun colour fpc[15] it was handed. */
+static int s_cubelog = -1;     /* -1 unread */
+static int s_cube_armed;       /* F9 seen: report the composite's next draw */
+static int s_cube_rep;         /* this draw reports */
+static const char* const k_cube_kind[] = { "nothing", "colour target", "depth buffer", "GPU light output", "GPU SSAO output" };
+
+/* What else sits at a cube's address: 0 nothing, 1 a colour target (the
+ * newest), 2 a depth buffer, 3 a GPU light output, 4 the GPU SSAO output. */
+static int eng_cube_alias(const rsx_dsp_texture* t, u32* sw, u32* sh, u32* age)
+{
+    *sw = *sh = *age = 0;
+    if (t->location == RSX_LOCATION_MAIN && s_gl.on > 0 && (t->offset == s_gl.diff_off || t->offset == s_gl.spec_off)) return 3;
+    if (t->location == RSX_LOCATION_LOCAL && s_gs.on > 0 && t->offset == s_gs.off) return 4;
+    for (u32 i = 0; i < g.n_zdepths; i++)
+        if (g.zdepths[i].handle && g.zdepths[i].location == t->location && g.zdepths[i].offset == t->offset) {
+            *sw = g.zdepths[i].w; *sh = g.zdepths[i].h; *age = s_surf_clock - g.zdepths[i].stamp;
+            return 2;
+        }
+    if (eng_surface_maybe(t->location, t->offset)) {
+        int best = -1;
+        for (u32 i = 0; i < g.n_surfaces; i++)
+            if (g.surfaces[i].handle && g.surfaces[i].location == t->location && g.surfaces[i].offset == t->offset &&
+                (best < 0 || g.surfaces[i].stamp > g.surfaces[best].stamp)) best = (int)i;
+        if (best >= 0) {
+            *sw = g.surfaces[best].w; *sh = g.surfaces[best].h; *age = s_surf_clock - g.surfaces[best].stamp;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Once a draw, before its units: the env, the toggle, F9. */
+static void eng_cube_draw_begin(void)
+{
+    if (__builtin_expect(s_cubelog < 0, 0)) {
+        const char* e = getenv("PS3RECOMP_ENG_CUBE_GUEST");
+        __atomic_store_n(&s_cube_guest, !(e && *e == '0'), __ATOMIC_RELAXED);   /* default on */
+        ps3_toggle_watch(PS3T_ENG_CUBE_GUEST, eng_cube_guest_set);
+        const char* l = getenv("PS3RECOMP_ENG_CUBELOG");
+        s_cubelog = l && *l && *l != '0';
+        if (s_cubelog) fprintf(stderr, "[cubelog] on: F9 reports the next lighting composite's cube units\n");
+    }
+    s_cube_rep = 0;
+    if (!s_cubelog) return;
+    if (__atomic_load_n(&g_rsx_hudlog_key, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&g_rsx_hudlog_key, 0, __ATOMIC_RELAXED);
+        s_cube_armed = 1;
+        rsx_logf("[cubelog] F9 at frame %u: the next composite draw (fp %016llx) follows\n",
+                 g.frames, (unsigned long long)ENG_SHADE_BACKFACE_FP);
+    }
+    s_cube_rep = s_cube_armed && eng_current_fp_structural() == ENG_SHADE_BACKFACE_FP;
+}
+
+/* A cube unit's lookup: reports what shares its address; 1 = bind the guest
+ * cube now (PS3RECOMP_ENG_CUBE_GUEST), 0 = the usual lookups. */
+static int eng_cube_unit(u32 u, const rsx_dsp_texture* t)
+{
+    const int square = t->width && t->width == t->height;
+    const int guest = square && __atomic_load_n(&s_cube_guest, __ATOMIC_RELAXED) > 0;
+    static struct { u32 key, gen, zgen; int kind; } m[RSX_BE_MAX_TEXTURES];
+    const u32 key = t->offset ^ (t->location << 31);
+    u32 sw = 0, sh = 0, age = 0;
+    int kind;
+    if (u < RSX_BE_MAX_TEXTURES && !s_cube_rep && m[u].key == key && m[u].gen == s_surf_gen && m[u].zgen == s_dl_zgen) {
+        kind = m[u].kind;
+    } else {
+        kind = eng_cube_alias(t, &sw, &sh, &age);
+        if (u < RSX_BE_MAX_TEXTURES) { m[u].key = key; m[u].gen = s_surf_gen; m[u].zgen = s_dl_zgen; m[u].kind = kind; }
+        static u64 seen[16]; static u32 ns;
+        const u64 sk = ((u64)key << 8) ^ ((u64)u << 3) ^ (u64)kind;
+        u32 i = 0; while (i < ns && seen[i] != sk) i++;
+        /* quiet by default: every new one with PS3RECOMP_ENG_CUBELOG=1, else
+         * one line a session and only when the guest cube is off */
+        if (kind && i == ns && ns < 16 && (s_cubelog > 0 || (!guest && ns == 0))) { seen[ns++] = sk;
+            fprintf(stderr, "[rsx engine] cube unit %u (%u:0x%08X %ux%u fmt 0x%02X, fp %016llx) shares its address with a %s"
+                            " %ux%u (last bound %u target binds ago): %s\n",
+                    u, t->location, t->offset, t->width, t->height, t->format,
+                    (unsigned long long)eng_current_fp_structural(), k_cube_kind[kind], sw, sh, age,
+                    guest ? "PS3RECOMP_ENG_CUBE_GUEST reads the guest cube"
+                          : "the unit is given that 2D image and reads a 1x1 black cube (PS3RECOMP_ENG_CUBE_GUEST=0; unset = the guest cube)");
+        }
+    }
+    if (s_cube_rep) {
+        const u32 span = eng_texture_span(t->format, t->width, t->height, t->mipmaps, t->pitch, 1);
+        const u8* src = span ? eng_guest_ptr(NULL, t->location, t->offset, span) : NULL;
+        u32 mn[4] = { 255, 255, 255, 255 }, mx[4] = { 0, 0, 0, 0 }; double sum[4] = { 0, 0, 0, 0 };
+        for (u32 i = 0; src && i < span; i++) {
+            const u32 v = src[i], l = i & 3u;
+            if (v < mn[l]) mn[l] = v;
+            if (v > mx[l]) mx[l] = v;
+            sum[l] += v;
+        }
+        const double n = span ? span / 4.0 : 1.0;
+        rsx_logf("[cubelog] frame %u unit %u: loc %u off 0x%08X fmt 0x%02X %ux%u mips %u pitch %u remap 0x%08X ctl0 0x%08X;"
+                 " at its address: %s %ux%u (%u binds ago); %s\n",
+                 g.frames, u, t->location, t->offset, t->format, t->width, t->height, t->mipmaps, t->pitch, t->remap,
+                 t->control0, k_cube_kind[kind], sw, sh, age,
+                 guest ? "CUBE_GUEST on: guest cube bound" : (kind ? "CUBE_GUEST off: that 2D image is bound" : "guest cube bound"));
+        if (src)
+            rsx_logf("[cubelog]   guest bytes (%u, byte lanes 0..3 in memory order): min %u %u %u %u  max %u %u %u %u  mean %.1f %.1f %.1f %.1f\n",
+                     span, mn[0], mn[1], mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n);
+        else rsx_logf("[cubelog]   guest bytes: not readable (span %u)\n", span);
+    }
+    return guest;
+}
+
 static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               u32 current_zslot,
                               u32 textures[RSX_BE_MAX_TEXTURES],
@@ -6414,6 +6610,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
     u32 mask = 0;
     s_fbf.cand = 0; s_fbf.applied = 0;
     s_tex_volatile = 0;   /* (rnd1) PS3RECOMP_ENG_DELTA: set below by every state-dependent path */
+    eng_cube_draw_begin();   /* PS3RECOMP_ENG_CUBE_GUEST / _CUBELOG */
     const u32 fp_reads = eng_bind_unread() ? 0xFFFFu : eng_fp_tex_mask();
     const rsx_dsp_texture* units = eng_draw_textures();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
@@ -6470,6 +6667,15 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                   fprintf(stderr, "[sign] unit %u signed=0x%X biased=%u fmt 0x%02X %ux%u loc %u off 0x%08X remap 0x%08X filter 0x%08X addr 0x%08X\n",
                           u, t.filter >> 28, (t.wrap >> 12) & 1u, t.format, t.width, t.height, t.location, t.offset, t.remap, t.filter, t.wrap); } } }
 
+        /* A cube unit reads the guest cube straight away (eng_cube_unit;
+         * default since v0.5.5). PS3RECOMP_ENG_CUBE_GUEST=0: the lookups
+         * below, as before. */
+        if (t.cubemap && eng_cube_unit(u, &t)) {
+            textures[u] = eng_texture_slot(t.location, t.offset, t.format, t.width, t.height,
+                                           t.mipmaps, t.pitch, 1, t.remap & 0x1FFFFu, 1u);
+            if (!textures[u]) s_tex_volatile = 1;   /* (rnd1) a failed texture may be made at the next bind */
+            continue;
+        }
         /* A depth-format texture over a depth buffer reads that depth buffer,
          * even when a colour target is bound at the same address too: a
          * depth-only pass (inFAMOUS 2's sun shadow cascades) leaves a dummy
@@ -6771,6 +6977,59 @@ static u32 uploaded_hud_n(u32 n_verts, u32 n_draw, int indexed) { return indexed
  * last draw was in, a count of frames that drew ("slices"), the slice that
  * last drew a composite (0 none yet) and whether this one has. */
 static u64 s_hud_fp[8];
+static u64 s_hud_comp_vp;                 /* (dofov) the composite's vertex program (PS3RECOMP_WIDE_FILL) */
+/* (dofov) PS3RECOMP_WIDE_FILL, the UI's quads: the title's 2D draws (inFAMOUS 2: fp 2921adcb9c915692 and its
+ * kin) place each element with two matrices in the vertex constants -- clip = ((pos.x c[256] + pos.y c[257]
+ * + pos.z c[258] + c[259]).xyz) . rows c[260..263] -- so the hurt overlay is the same program as a prompt's
+ * box, a quad of +-256 scaled over the screen. Such a program is recognised by its decompiled text (the
+ * eight products, once per program), and a draw of it fills the picture when its position box, through
+ * those two matrices, covers the whole guest screen. */
+static struct { u64 hash; int ui; } s_wide_vpk[32];
+static u32 s_wide_vpk_n, s_wide_vpk_at;
+static int eng_wide_ui_vp(const eng_vp_memo* vm)
+{
+    if (!vm || !vm->instrs || vm->vpc_full) return 0;
+    for (u32 i = 0; i < s_wide_vpk_n; i++) if (s_wide_vpk[i].hash == vm->hash) return s_wide_vpk[i].ui;
+    int ui = 0;
+    if (vm->vpc_lo >= 256u && vm->vpc_lo + vm->vpc_n <= 468u) {
+        static char txt[64 * 1024];
+        if (rsx_vp_decompile_compact_ex(vm->bytes, vm->instrs * 16u, 0, vm->input_mask, txt, sizeof txt) > 0) {
+            static const char* const pat[] = {
+                "((v[0]).xxxx),((vp_c[256]).xyzx)", "((v[0]).yyyy),((vp_c[257]).xyzx)",
+                "((v[0]).zzzz),((vp_c[258]).xyzx)", "((vp_c[259]).xyzx)",
+                "),((vp_c[260]).xyzw)", "),((vp_c[261]).xyzw)", "),((vp_c[262]).xyzw)", "((vp_c[263]).xyzw)" };
+            ui = 1;
+            for (u32 k = 0; k < sizeof pat / sizeof pat[0]; k++) if (!strstr(txt, pat[k])) { ui = 0; break; }
+        }
+    }
+    const u32 i = s_wide_vpk_n < 32u ? s_wide_vpk_n++ : (s_wide_vpk_at++ & 31u);
+    s_wide_vpk[i].hash = vm->hash; s_wide_vpk[i].ui = ui;
+    if (ui) { static u32 said; if (said++ < 8) fprintf(stderr, "[engine] aspect: vertex program %016llx is a UI quad (two matrices)\n",
+                                                        (unsigned long long)vm->hash); }
+    return ui;
+}
+/* The position box b (x0 x1 y0 y1 z0 z1) through c[256..259] and c[260..263]: 1 = it covers the guest screen
+ * (every corner in front, x and y past 0.98 of w on both sides). out (optional): the clip box x0 x1 y0 y1 (left
+ * as it was when a corner is behind the camera). */
+static int eng_wide_covers(const float* b, float* out)
+{
+    float m[8][4];
+    for (int r = 0; r < 8; r++) memcpy(m[r], g.rsx.constants[256 + r], sizeof m[r]);
+    float xn = 1e30f, xx = -1e30f, yn = 1e30f, yx = -1e30f;
+    for (int i = 0; i < 8; i++) {
+        const float px = b[i & 1], py = b[2 + ((i >> 1) & 1)], pz = b[4 + ((i >> 2) & 1)];
+        float w3[3], c[4];
+        for (int k = 0; k < 3; k++) w3[k] = px * m[0][k] + py * m[1][k] + pz * m[2][k] + m[3][k];
+        for (int k = 0; k < 4; k++) c[k] = w3[0] * m[4][k] + w3[1] * m[5][k] + w3[2] * m[6][k] + m[7][k];
+        if (!(c[3] > 0.0f)) return 0;
+        const float x = c[0] / c[3], y = c[1] / c[3];
+        if (x < xn) xn = x; if (x > xx) xx = x; if (y < yn) yn = y; if (y > yx) yx = y;
+    }
+    if (out) { out[0] = xn; out[1] = xx; out[2] = yn; out[3] = yx; }
+    return xn <= -0.98f && xx >= 0.98f && yn <= -0.98f && yx >= 0.98f;
+}
+static int s_wide_fill = 1;               /* (dofov) PS3RECOMP_WIDE_FILL, read with PS3_ASPECT_HUD_AFTER */
+static unsigned long long s_wide_filled;  /* (dofov) draws after the composite that filled (the [widelog] line) */
 static int s_hud_n = -1, s_hud_after;
 static u32 s_hud_frame = ~0u, s_hud_slice, s_hud_seen;
 
@@ -6852,7 +7111,9 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
     /* (fastdraw) PS3RECOMP_ENG_FASTDRAW: a draw whose state is all the previous
      * draw's, with resident vertices and indices, takes the short tail
      * (rsx_draw_fast.inc); verifying, the tail below runs and is compared */
-    if ((dl_use & DL_STATE) == DL_STATE && s_fd_on > 0) {
+    /* (dofov) not after a wide frame's composite: whether such a draw is pinned with the HUD or fills the
+     * picture also depends on its vertices and constants (PS3RECOMP_WIDE_FILL), which the short tail does not see */
+    if ((dl_use & DL_STATE) == DL_STATE && s_fd_on > 0 && !(s_wide_box && s_hud_after)) {
         s_fdn.state++;
         if (indexed && fd_takes(n_draw)) {
             if (!s_fd_verify) { fd_draw(prim, topology, &layout, n_draw); return; }
@@ -7464,6 +7725,23 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
                     (unsigned long long)eng_current_fp_structural(), g.zdepths[zslot].offset);
         }
     }
+    /* PS3RECOMP_ENG_CUBELOG=1 (eng_cube_unit): the reporting composite draw's
+     * bound handles and the ambient constants it was handed. */
+    if (__builtin_expect(s_cube_rep, 0)) {
+        s_cube_rep = 0; s_cube_armed = 0;
+        const float* k = (const float*)g.fp_cb;
+        const u32 nk = g.fp_constants ? g.fp_constants->count : 0u;
+        char tb[256]; int tp = 0; tb[0] = 0;
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && tp < (int)sizeof tb - 16; u++)
+            if (tex_mask & (1u << u)) tp += snprintf(tb + tp, sizeof tb - (size_t)tp, " u%u=h%u", u, textures[u]);
+        rsx_logf("[cubelog]   bound:%s\n", tb);
+        if (k && nk > 15u)
+            rsx_logf("[cubelog]   ambient scale fpc[9].x %g (stencil bit 7) fpc[11].x %g (world); sun fpc[15] (%g %g %g); fpc[22] (%g %g %g %g)%s\n",
+                     k[9 * 4], k[11 * 4], k[15 * 4], k[15 * 4 + 1], k[15 * 4 + 2],
+                     nk > 22u ? k[22 * 4] : 0.0f, nk > 22u ? k[22 * 4 + 1] : 0.0f, nk > 22u ? k[22 * 4 + 2] : 0.0f,
+                     nk > 22u ? k[22 * 4 + 3] : 0.0f, nk > 22u ? "" : " (fewer than 23 constants)");
+        else rsx_logf("[cubelog]   fragment constants: %u (not the composite's layout)\n", nk);
+    }
     /* PS3RECOMP_ENG_HUDLOG=<sec>: DIAGNOSTIC (PS3_ASPECT). Every draw without
      * a depth test into a single target, for the first world frame <sec>
      * seconds after the first draw and the two after it (a game frame spans
@@ -7617,10 +7895,13 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
           draws++;
           const unsigned long long now = ps3_ms_now();
           if (now - last >= 1000ull) {
-              if (emax >= 0.0f) fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight max %.3f, dof strength max %.3f\n",
-                                        (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, emax, dmax);
-              else fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight cached, dof strength max %.3f\n",
-                           (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, dmax);
+              /* (dofov) the setting, what it gives now, what the title says (1 gameplay, 0 not, -1 nothing) */
+              const int dmode = __atomic_load_n(&s_fx_dof_mode, __ATOMIC_RELAXED);
+              const int deff = __atomic_load_n(&s_fx_dof, __ATOMIC_RELAXED), dview = ps3_title_view_gameplay(now);
+              if (emax >= 0.0f) fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight max %.3f, dof strength max %.3f (setting %d, on %d, view %d)\n",
+                                        (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, emax, dmax, dmode, deff, dview);
+              else fprintf(stderr, "[fxlog] t=%.0f s (clock %.1f) DOF pass x%u: edge weight cached, dof strength max %.3f (setting %d, on %d, view %d)\n",
+                           (double)(now - t0) / 1000.0, (double)now / 1000.0, draws, dmax, dmode, deff, dview);
               last = now; emax = -1.0f; dmax = 0.0f; draws = nread = 0;
           } } }
     /* PS3_ASPECT_HUD_AFTER=<fp hex>[,<fp hex>..]: the title's 2D overlay for
@@ -7643,20 +7924,94 @@ static void sink_end_body(void* user, const rsx_dispatch* r)
             const char* asp2 = getenv("PS3RECOMP_ASPECT");
             const int wide = (asp && *asp && strcmp(asp, "16:9")) || (asp2 && *asp2 && strcmp(asp2, "16:9"));
             const char* e = wide ? getenv("PS3_ASPECT_HUD_AFTER") : NULL;
+            { const char* wf = getenv("PS3RECOMP_WIDE_FILL"); s_wide_fill = !(wf && wf[0] == '0'); }   /* (dofov) */
             while (e && *e && s_hud_n < 8) { s_hud_fp[s_hud_n++] = strtoull(e, (char**)&e, 16); if (*e == ',') e++; else break; }
+            s_wide_box = s_hud_n > 0 && s_wide_fill;
             if (s_hud_n) fprintf(stderr, "[engine] aspect: %d composite program(s) (PS3_ASPECT_HUD_AFTER, first %016llx): "
-                                         "display draws after them keep 16:9\n", s_hud_n, (unsigned long long)s_hud_fp[0]);
+                                         "display draws after them keep 16:9%s\n", s_hud_n, (unsigned long long)s_hud_fp[0],
+                                         s_wide_fill ? ", except full-screen passes (the composite's vertex program, or a UI "
+                                                       "quad over the whole screen; PS3RECOMP_WIDE_FILL=0: those too)" : "");
             else if (wide) fprintf(stderr, "[engine] aspect: no PS3_ASPECT_HUD_AFTER: the HUD stretches with the picture\n"); }
-        int hud = 0, display = 0;
+        int hud = 0, display = 0, filled = 0, wui = 0;
+        float wbx[6] = { 0 }, wcb[4] = { 0 };   /* (dofov) a UI quad's position box and its clip box */
         if (s_hud_n) {
             if (g.frames != s_hud_frame) { s_hud_frame = g.frames; s_hud_slice++; s_hud_after = 0; }
-            const eng_fp_memo* hfm = NULL;
-            const u64 fk = eng_guest_programs(NULL, &hfm) && hfm ? hfm->structural : 0;
+            const eng_fp_memo* hfm = NULL; const eng_vp_memo* hvm = NULL;
+            const u64 fk = eng_guest_programs(&hvm, &hfm) && hfm ? hfm->structural : 0;
+            const u64 vk = hfm && hvm ? hvm->hash : 0;
             int composite = 0;
             for (int k = 0; k < s_hud_n; k++) if (fk && fk == s_hud_fp[k]) composite = 1;
             display = g.surfaces[target].w == g.width && g.surfaces[target].h == g.height;
-            if (composite) { s_hud_after = 1; s_hud_seen = s_hud_slice; }
+            if (composite) { s_hud_after = 1; s_hud_seen = s_hud_slice; s_hud_comp_vp = vk; }
             else if (display) hud = s_hud_after || !s_hud_seen || s_hud_slice - s_hud_seen > 1u;
+            /* (dofov) PS3RECOMP_WIDE_FILL (default 1): a draw after the composite that covers the whole guest
+             * screen is a full-screen effect (the hurt overlay, fades, colour flashes), not a HUD piece: it fills
+             * the wide picture like the 3D frame under it (stretched across, as the game drew it over 16:9).
+             * Two ways to know: it uses the composite's own vertex program (the post passes' screen mesh), or it
+             * is a UI quad (eng_wide_ui_vp) whose position box, through its two matrices, covers the screen (the
+             * box comes from the vertices read now, or from the vertex cache entry they were made from). The
+             * HUD's pieces (meters, minimap, prompts, subtitles, text) cover less and stay pinned. Only in a
+             * frame with a composite (s_hud_after): a frame of overlay alone (menus, movies, loading) keeps its
+             * 16:9 and its bars. 0 = every draw after the composite pinned (v0.5). */
+            if (hud && s_hud_after && s_wide_fill) {
+                if (vk && vk == s_hud_comp_vp) filled = 1;
+                else if ((wui = eng_wide_ui_vp(hvm)) != 0) {
+                    int have = 0;
+                    if (!dc.vbuf_hit && dc.verts) have = eng_pos_box(dc.verts, &layout, uploaded_hud_n(dc.n_verts, n_draw, indexed), wbx);
+                    else if (dc.vce && ((const eng_vc_entry*)dc.vce)->wbox_ok) { memcpy(wbx, ((const eng_vc_entry*)dc.vce)->wbox, sizeof wbx); have = 1; }
+                    if (!have) wui = 3;                                   /* a UI quad whose vertices are unknown: pinned */
+                    else if (eng_wide_covers(wbx, wcb)) filled = 2;
+                    /* ... or one that reaches past the screen's left or right edge (the hurt overlay's blood splats
+                     * sit half off the screen: pinned, the 16:9 border cut them with a hard vertical line) */
+                    else if (wcb[0] < -1.001f || wcb[1] > 1.001f) filled = 3;
+                }
+                if (filled) { hud = 0; s_wide_filled++; }
+            }
+            /* (dofov) PS3RECOMP_WIDE_LOG=1 (diagnostic): once a second, the draws pinned as the HUD (after the
+             * composite, display-sized): program, vertex count, the position attribute's range, the guest
+             * viewport, the blend -- what tells a full-screen tint or fade from a HUD piece. */
+            { static int wl = -1; static unsigned long long wl_last; static u32 wl_n;
+              static struct { u64 fp, vph; u32 n, cnt; float x0, x1, y0, y1; float vs0, vs1, vt0, vt1; u32 sf, df, tm; int fill, ui; float cb[4]; } wl_e[32];
+              if (wl < 0) { const char* e = getenv("PS3RECOMP_WIDE_LOG"); wl = e && *e == '1'; }
+              if (wl && (hud || filled)) {
+                  float mn[2] = { 1e30f, 1e30f }, mx[2] = { -1e30f, -1e30f };
+                  const s8 ps = layout.slot_by_attr[0];
+                  if (ps >= 0 && dc.verts && !(dc.vbuf_hit && indexed))
+                      for (u32 v = 0; v < uploaded_hud_n(dc.n_verts, n_draw, indexed); v++) {
+                          const float* q = (const float*)((const u8*)dc.verts + (size_t)v * layout.stride + (size_t)ps * 16u);
+                          for (int c = 0; c < 2; c++) { if (q[c] < mn[c]) mn[c] = q[c]; if (q[c] > mx[c]) mx[c] = q[c]; } }
+                  const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR), df = rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR);
+                  const eng_vp_memo* wvm = NULL; const eng_fp_memo* wfm = NULL;
+                  eng_guest_programs(&wvm, &wfm);
+                  const u64 vph = wvm ? wvm->hash : 0;
+                  u32 i = 0;
+                  for (; i < wl_n; i++)
+                      if (wl_e[i].fp == fk && wl_e[i].vph == vph && wl_e[i].fill == filled && wl_e[i].n == dc.n_verts && wl_e[i].x0 == mn[0] && wl_e[i].x1 == mx[0] &&
+                          wl_e[i].y0 == mn[1] && wl_e[i].y1 == mx[1] && wl_e[i].vs0 == vp.scale[0] && wl_e[i].vt0 == vp.translate[0]) break;
+                  if (i == wl_n && wl_n < 32u) {
+                      wl_e[i].fp = fk; wl_e[i].vph = vph; wl_e[i].tm = tex_mask; wl_e[i].fill = filled; wl_e[i].n = dc.n_verts; wl_e[i].cnt = 0;
+                      wl_e[i].ui = wui; memcpy(wl_e[i].cb, wcb, sizeof wcb);
+                      if (wui == 1 || filled == 2) { mn[0] = wbx[0]; mx[0] = wbx[1]; mn[1] = wbx[2]; mx[1] = wbx[3]; }
+                      wl_e[i].x0 = mn[0]; wl_e[i].x1 = mx[0]; wl_e[i].y0 = mn[1]; wl_e[i].y1 = mx[1];
+                      wl_e[i].vs0 = vp.scale[0]; wl_e[i].vs1 = vp.scale[1]; wl_e[i].vt0 = vp.translate[0]; wl_e[i].vt1 = vp.translate[1];
+                      wl_e[i].sf = sf; wl_e[i].df = df; wl_n++;
+                  }
+                  if (i < wl_n) wl_e[i].cnt++;
+                  extern unsigned long long ps3_ms_now(void);
+                  const unsigned long long now = ps3_ms_now();
+                  if (now - wl_last >= 1000ull) {
+                      wl_last = now;
+                      for (u32 k = 0; k < wl_n; k++)
+                          fprintf(stderr, "[widelog] clock %.1f frame %u %s ui=%d clip x[%.3f,%.3f] y[%.3f,%.3f] fp=%016llx vp=%016llx (composite vp %016llx) tex=0x%X n=%u x%u pos x[%g,%g] y[%g,%g] vps=(%g %g) vpt=(%g %g) blend sf=0x%08X df=0x%08X\n",
+                                  (double)now / 1000.0, g.frames, wl_e[k].fill == 1 ? "FILLc" : wl_e[k].fill == 2 ? "FILLq" : wl_e[k].fill ? "FILLe" : "pin  ",
+                                  wl_e[k].ui, wl_e[k].cb[0], wl_e[k].cb[1], wl_e[k].cb[2], wl_e[k].cb[3], (unsigned long long)wl_e[k].fp,
+                                  (unsigned long long)wl_e[k].vph, (unsigned long long)s_hud_comp_vp,
+                                  wl_e[k].tm, wl_e[k].n, wl_e[k].cnt,
+                                  wl_e[k].x0, wl_e[k].x1, wl_e[k].y0, wl_e[k].y1, wl_e[k].vs0, wl_e[k].vs1, wl_e[k].vt0, wl_e[k].vt1,
+                                  wl_e[k].sf, wl_e[k].df);
+                      wl_n = 0;
+                  }
+              } }
         }
         g.be->set_hud(g.be->user, hud ? 1 : (s_hud_n && display ? 2 : 0), g.surfaces[target].w);
     }
@@ -8145,6 +8500,7 @@ presented:;
               done = 1; FILE* f = fopen(mark, "w"); if (f) fclose(f);
               fprintf(stderr, "[rsx engine] world mark: frame %u, %u draws -> %s\n", g.frames, g.guest_draws, mark); } } }
     g.frames++;
+    if (__atomic_load_n(&s_fx_dof_mode, __ATOMIC_RELAXED) == 2) eng_fx_dof_frame();   /* (dofov) =play */
     if (rsx_wt_mode()) rsx_wt_frame(g.frames);
     s_icon_gen = rsx_button_icons_frame();
     eng_ds_frame_end(g.guest_draws);
