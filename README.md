@@ -1,5 +1,50 @@
 <div align="center">
 
+# ⚡ inFAMOUS 2 port NX: Nintendo Switch
+
+**Your own PS3 copy of inFAMOUS 2, recompiled into a native Nintendo Switch homebrew program.**<br>
+No emulator on the console.
+
+[![Nintendo Switch: homebrew](https://img.shields.io/badge/Nintendo%20Switch-homebrew%20(.nro)-E60012?logo=nintendoswitch&logoColor=white)](switch/README.md)
+[![Status: experimental](https://img.shields.io/badge/status-experimental-eb6834)](switch/README.md#status)
+[![Renderer: Vulkan (NVK)](https://img.shields.io/badge/renderer-Vulkan%20(NVK)-AC162C?logo=vulkan&logoColor=white)](switch/README.md)
+[![Fork of SamiEnazi/infamous2-port](https://img.shields.io/badge/fork%20of-SamiEnazi%2Finfamous2--port-2a78d6)](https://github.com/SamiEnazi/infamous2-port)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1baf7a)](LICENSE)
+
+</div>
+
+This is the **Nintendo Switch fork** of [SamiEnazi/infamous2-port](https://github.com/SamiEnazi/infamous2-port),
+the native PC port of inFAMOUS 2. It adds a Switch target (`switch/`) next to the PC builds: a Horizon layer under
+the port's engine, a build for aarch64 with devkitA64 and libnx, and rendering through Vulkan on Mesa's NVK driver.
+For the PC port itself, its releases and its bug reports, go to the upstream repository.
+
+> 🧪 **Experimental: playable, slow.** About 9-10 fps in light scenes and 7-8 fps in heavy ones on one tested
+> console (CPU at 1785 MHz); the CPU is the limit, not the GPU. Audio is mostly smooth. Details and known issues:
+> **[switch/README.md](switch/README.md)**.
+
+**Nothing of the game is in this repository, and there are no ready-made downloads.** You build the program from
+your own copy of the game, on a Linux PC:
+
+```
+tools/setup.sh --prepare-only --disc <your game folder> --rpcs3 <RPCS3's data folder>
+SWITCH_DEV_IMAGE=<your Switch build image> switch/build.sh
+switch/build.sh sdcard <your SD card's root>
+```
+
+| You need | |
+|---|---|
+| 💿 Your copy of inFAMOUS 2 | The disc folder that holds `PS3_GAME`, and the 1.04 update installed in [RPCS3](https://rpcs3.net) with the PS3 firmware. |
+| 🐧 A Linux x86-64 PC | Docker and about 60 GB free while building. |
+| 🐳 A Switch build image | devkitA64, libnx and Mesa's NVK driver; the exact contents are in [switch/README.md](switch/README.md#what-you-need). |
+| 🎮 A Switch running Atmosphère | A microSD card with about 20 GB free. |
+
+Everything below this line is the upstream PC port's README, kept as it is: its features, numbers and install steps
+describe the **PC** builds, not the Switch one.
+
+---
+
+<div align="center">
+
 ![inFAMOUS 2 native PC port: native 1080p up to 4K, 2x the fps of RPCS3, any controller, cheats menu, enhanced lighting, HD fire and smoke, save manager](docs/social-preview.png)
 
 # ⚡ inFAMOUS 2: native PC port
