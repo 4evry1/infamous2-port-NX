@@ -1180,6 +1180,19 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
                       eal, xfer_size, (dest_lsa & ~15u) | (eal & 15u), spu_ls_read32(spu, 0x4010),
                       spu_ls_read32(spu, 0x4014), spu_ls_read32(spu, 0x4018), spu_ls_read32(spu, 0x4020)); }
 
+#ifdef __SWITCH__
+        /* The Switch build: a GET list's copies wait on their source lines coming from memory (console run 52:
+         * most of gm_copy_from's samples on its first loads; the transfers are many and small). Start the next
+         * element's source on its way while this one is copied. A prefetch never faults. */
+        if ((base_cmd & 0x40) && i + 1 < num_left) {
+            extern uint8_t* vm_base;
+            const uint32_t nel = (elem_lsa + (i + 1) * 8) & SPU_LS_MASK;
+            const uint32_t nsz = spu_ls_read32(spu, nel) & 0x7FFF;
+            const uint8_t* np = vm_base + spu_ls_read32(spu, nel + 4);
+            __builtin_prefetch(np, 0, 0);
+            if (nsz > 64) __builtin_prefetch(np + 64, 0, 0);
+        }
+#endif
         if (xfer_size) {
             /* Each list element occupies whole LS quadwords, even for
              * 1/2/4/8-byte transfers. The EA supplies its byte offset within

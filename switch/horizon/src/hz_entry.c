@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define HZ_APP "sdmc:/switch/infamous2-port"
-#define HZ_VERSION "hz-0.50"
+#define HZ_VERSION "hz-0.51"
 
 int __real_main(int argc, char **argv);
 int __real_pthread_attr_setstacksize(pthread_attr_t *attr, size_t size);
