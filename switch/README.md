@@ -75,7 +75,7 @@ text screen while it loads; the game follows.
 | `switch/horizon/` | The Horizon layer: `main`, threads and their priorities, TLS, memory mapping, the window (NVK surface), audio output (audout), input, logs, self-tests of the SPU and VMX float paths, a sampling profiler. |
 | `switch/cmake/` | The clang toolchain for aarch64 (devkitA64's headers and libnx) and glslang's lookup for the engine. |
 | `switch/scripts/lift.sh` | Translates the game with the PC port's own tools, with the x86 SIMD paths off and `switch/natives-switch.txt`. |
-| `switch/natives-switch.txt`, `switch/natives/` | The native SPU job rewrites used on the Switch (Edge Geometry with NEON paths, jobs 204, 208, 210, 216). |
+| `switch/natives-switch.txt`, `switch/natives/` | The native SPU job rewrites used on the Switch (Edge Geometry with NEON paths, jobs 204, 208, 209, 210, 211, 216; the start-up data clear of jobs 212 and 210). |
 | `switch/scripts/compile.sh`, `link.sh` | Compile with clang, link with devkitA64's g++ and libnx, wrap as NRO. |
 | `switch/tools/` | Readers for the console's sampling profiles (`hz_*.py`, run inside the build image) and timeline traces (`ftrace_crit.py`). |
 

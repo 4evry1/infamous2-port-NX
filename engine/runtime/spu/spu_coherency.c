@@ -21,9 +21,35 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* PS3_COH_FAST (default 1 under __SWITCH__, 0 elsewhere; -DPS3_COH_FAST=1 turns it on in a host build; build the unit tests both ways):
+ * the reservation walks that every lock-line command makes, without the cost the Switch's Cortex-A57 charges for them.
+ *   - A walker of the context registry or of the PPU reservation records (a PUTLLC / PUTLLUC commit, a PPU store to a
+ *     reserved line) read every slot with a load-ACQUIRE. On AArch64 that is an LDAR, and LDARs do not overlap each other,
+ *     so a pass over 9 contexts and up to a few dozen PPU records was one serialized chain of L1 hits per commit. The
+ *     loads need no acquire: what orders them is the full fence the walker issues first (ppu_resv_clear) or the lock-line
+ *     stripe it holds (notify_spus: a slot is cleared only under every stripe, and filled by a release compare-and-swap),
+ *     and a context pointer is dereferenced through an address dependency. They are relaxed loads now: the same values, the same order of
+ *     decisions, pipelined.
+ *   - A GETLLAR asked "is my context in the registry?" with a scan of every slot. Each thread remembers the slot it was
+ *     found or put in last and looks there first (a plain load of that one slot, compared with the context's address): a
+ *     hit is the same answer the scan gives; a miss runs the old scan. */
+#ifndef PS3_COH_FAST
+#  ifdef __SWITCH__
+#    define PS3_COH_FAST 1
+#  else
+#    define PS3_COH_FAST 0
+#  endif
+#endif
+#if PS3_COH_FAST
+#  define COH_SCAN_ORDER __ATOMIC_RELAXED
+#else
+#  define COH_SCAN_ORDER __ATOMIC_ACQUIRE
 #endif
 
 /* ===========================================================================
@@ -258,12 +284,19 @@ static inline unsigned ll_stripe_of(uint32_t ea)
 /* SPU_LL_GLOBAL=1: every transaction takes one single lock -- exactly the
  * global lock this replaced (not all 64 stripes, which costs far more), for
  * an A/B in the same binary. */
-static int ll_global(void)
+/* The read of the environment is out of line: with it inline, every function that asks which lock to take had a frame
+ * and saved registers for a call it makes once. Same switch, same answer. */
+static int s_ll_global = -1;   /* plain int: __atomic builtins below */
+static __attribute__((noinline, cold)) int ll_global_init(void)
 {
-    static int on = -1;   /* plain int: __atomic builtins below */
-    int v = __atomic_load_n(&on, __ATOMIC_RELAXED);
-    if (v < 0) { v = getenv("SPU_LL_GLOBAL") ? 1 : 0; __atomic_store_n(&on, v, __ATOMIC_RELAXED); }
+    const int v = getenv("SPU_LL_GLOBAL") ? 1 : 0;
+    __atomic_store_n(&s_ll_global, v, __ATOMIC_RELAXED);
     return v;
+}
+static inline int ll_global(void)
+{
+    const int v = __atomic_load_n(&s_ll_global, __ATOMIC_RELAXED);
+    return __builtin_expect(v >= 0, 1) ? v : ll_global_init();
 }
 
 uint64_t spu_lockline_mask_ea(uint32_t ea)
@@ -413,6 +446,34 @@ int      spu_lockline_read_valid(uint32_t ea, uint32_t q) { return ll_seq_valid(
 void spu_lockline_lock(void)   { spu_lockline_lock_mask(~0ull); }
 void spu_lockline_unlock(void) { spu_lockline_unlock_mask(~0ull); }
 
+/* The single-line forms the SPU atomics use (spu_coherency.h). Same stripe, same take / drop, same deferred-wake
+ * depth as spu_lockline_lock_mask / unlock_mask with spu_lockline_mask_ea(ea): without the mask round trip (a call,
+ * a shift, a count-trailing-zeros loop) on either side of a PUTLLC / PUTLLUC. */
+void spu_lockline_lock_ea(uint32_t ea)
+{
+    ll_take(ll_global() ? &g_ll_single : &g_ll[ll_stripe_of(ea)]);
+    t_coh_defer.depth++;
+}
+
+void spu_lockline_unlock_ea(uint32_t ea)
+{
+    ll_drop(ll_global() ? &g_ll_single : &g_ll[ll_stripe_of(ea)]);
+    coh_defer_t* d = &t_coh_defer;
+    if (--d->depth <= 0) { d->depth = 0; if (d->n) coh_defer_flush(); }
+}
+
+/* The sequence word spu_lockline_read_begin / _valid read for `ea`, and the wait read_begin makes when it is odd. */
+const uint32_t* spu_lockline_seq_ptr(uint32_t ea)
+{
+    return (const uint32_t*)(const void*)&ll_for_read(ea)->seq;
+}
+
+uint32_t spu_lockline_seq_wait(const uint32_t* seq)
+{
+    ll_stripe* s = (ll_stripe*)(void*)((char*)(void*)(uintptr_t)seq - offsetof(ll_stripe, seq));
+    return (uint32_t)ll_seq_wait(s);
+}
+
 /* ===========================================================================
  * The reserved-line bitmap
  *
@@ -548,7 +609,25 @@ static inline int coh_mark_once_on(void)
     const int v = __atomic_load_n(&s_coh_mark_once, __ATOMIC_RELAXED);
     return __builtin_expect(v >= 0, 1) ? v : coh_mark_once_init();
 }
+#if PS3_COH_FAST
+/* The early return of coh_mark_line (below), in the caller: a line already marked with the bitmap armed is the
+ * common GETLLAR, and its answer is three loads -- the flag, the bitmap byte, the armed word, in that order, as
+ * before. The rest (the first reservation of a line) stays out of line. */
+static void coh_mark_line_slow(uint32_t ea);
+static inline __attribute__((always_inline)) void coh_mark_line(uint32_t ea)
+{
+    const uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    if (__builtin_expect(coh_mark_once_on(), 1) &&
+        (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) & bit) &&
+        __atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE))
+        return;
+    coh_mark_line_slow(ea);
+}
+static __attribute__((noinline)) void coh_mark_line_slow(uint32_t ea)
+#else
 static void coh_mark_line(uint32_t ea)
+#endif
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     /* Atomic, though the writers hold the lock-line lock: spu_coh_is_reserved
@@ -626,7 +705,9 @@ static void ppu_resv_clear(uint32_t line, int except)
     const int hi = __atomic_load_n(&s_ppu_resv_hi, __ATOMIC_ACQUIRE);
     for (int i = 0; i < hi; i++) {
         if (i == except) continue;
-        uint64_t v = PSLOT_LV(i);
+        /* PS3_COH_FAST: relaxed -- the fence above is what orders these loads after the caller's stores, and the
+         * only thing done with a record is the compare-exchange below, which carries its own ordering. */
+        uint64_t v = __atomic_load_n(&s_ppu_resv[i].lv, COH_SCAN_ORDER);
         if ((v >> 32) && (uint32_t)v == line)
             __atomic_compare_exchange_n(&s_ppu_resv[i].lv, &v, v & 0xFFFFFFFFull, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
@@ -701,11 +782,41 @@ void spu_coh_ppu_thread_exit(void)
     t_ppu_slot = -1;
 }
 
-void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+#if PS3_COH_FAST
+/* The slot this thread last found its context in, or put it in (PS3_COH_FAST): a thread runs one SPU context at
+ * a time, so the slot is nearly always the same one. */
+#ifdef _WIN32
+static __declspec(thread) int t_coh_slot_hint;
+#else
+static __thread int t_coh_slot_hint;
+#endif
+static void coh_register(spu_context* ctx);
+static inline __attribute__((always_inline)) void coh_reserve_inl(spu_context* ctx, uint32_t ea)
 {
+    coh_mark_line(ea);
+    if (!ctx) return;
+    /* The hint is a slot index below SPU_COH_MAX_CTX (it is only ever set from one); this is a plain read of that one
+     * slot. Found = the context is a member, which is all the scan below answers before it goes on to look for a free
+     * slot. */
+    if (__atomic_load_n(&s_coh_ctxs[t_coh_slot_hint], __ATOMIC_RELAXED) == ctx) return;
+    coh_register(ctx);
+}
+void spu_coh_reserve(spu_context* ctx, uint32_t ea) { coh_reserve_inl(ctx, ea); }
+const uint32_t* spu_coh_getllar_enter(spu_context* ctx, uint32_t ea)
+{
+    coh_reserve_inl(ctx, ea);
+    return spu_lockline_seq_ptr(ea);
+}
+static __attribute__((noinline)) void coh_register(spu_context* ctx)
+#else
+void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+#endif
+{
+#if !PS3_COH_FAST
     coh_mark_line(ea);
 
     if (!ctx) return;
+#endif
     /* Already a member anywhere? Look at every slot before taking a free one:
      * stopping at the first free slot re-added a context that sat in a later
      * slot (an earlier context's slot had since been freed), and unregister
@@ -715,7 +826,12 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * other contexts join under other lines' stripes. */
     const int hi0 = COH_CTX_HI();
     for (int i = 0; i < hi0; i++)
-        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return;
+        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) {
+#if PS3_COH_FAST
+            t_coh_slot_hint = i;
+#endif
+            return;
+        }
     if (s_coh_ctx_cap < 0) {
         const char* e = getenv("PS3_COH_CTX_MAX");
         const int v = e ? atoi(e) : 0;
@@ -726,6 +842,9 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
         spu_context* none = NULL;
         if (__atomic_compare_exchange_n(&s_coh_ctxs[i], &none, ctx, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+#if PS3_COH_FAST
+            t_coh_slot_hint = i;
+#endif
             { int hi = __atomic_load_n(&s_coh_ctx_hi, __ATOMIC_RELAXED);
               while (hi < i + 1 &&
                      !__atomic_compare_exchange_n(&s_coh_ctx_hi, &hi, i + 1, 0,
@@ -753,6 +872,30 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * still get their events; this one would silently never wake, so say so. */
     ps3_lim_full(&s_lim_coh_ctx, "more than %d reserving SPU contexts -- spu=0x%X will not "
                  "receive lock-line events", s_coh_ctx_cap, ctx->spu_id);
+}
+
+#if !PS3_COH_FAST
+const uint32_t* spu_coh_getllar_enter(spu_context* ctx, uint32_t ea)
+{
+    spu_coh_reserve(ctx, ea);
+    return spu_lockline_seq_ptr(ea);
+}
+#endif
+
+/* What a GETLLAR leaves behind, for PS3_SPU_ATOM_VERIFY to look at (spu_channels.c): the context is in the
+ * registry, and the line is marked with the bitmap armed. */
+int spu_coh_is_registered(spu_context* ctx)
+{
+    for (int i = 0; i < SPU_COH_MAX_CTX; i++)
+        if (__atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE) == ctx) return 1;
+    return 0;
+}
+
+int spu_coh_line_marked(uint32_t ea)
+{
+    const uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+    return __atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE) &&
+           ((__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) >> (line & 7)) & 1u);
 }
 
 /* Drop a context from the reserving set.
@@ -825,15 +968,31 @@ int spu_coh_is_reserved(uint32_t addr)
  *
  * The PUTLLC path already guards this case by dropping its own reservation
  * before notifying; this gives the DMA path the same ability. */
+#if PS3_COH_FAST
+/* spu_resv_break (spu_context.h) with a relaxed first read: the walkers below call it for every registered context on
+ * every commit, and the owner's reservation word is written (released) by its own thread on every GETLLAR, so the
+ * load-acquire it started with was one more serialized LDAR per context. The caller's fence (ppu_resv_clear, or the
+ * stripe it holds) is what orders the read after its own stores; the compare-exchange below is unchanged. */
+static inline int coh_resv_break(spu_context* c, uint32_t line)
+{
+    uint64_t v = __atomic_load_n(&c->resv_word, __ATOMIC_RELAXED);
+    if (!(v >> 32) || ((uint32_t)v & ~127u) != line) return 0;
+    return __atomic_compare_exchange_n(&c->resv_word, &v, v & 0xFFFFFFFFull, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+#else
+#  define coh_resv_break spu_resv_break
+#endif
+
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
     ppu_resv_clear(line, -1);
     const int hi = COH_CTX_HI();
     for (int i = 0; i < hi; i++) {
-        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
+        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], COH_SCAN_ORDER);
         if (!c || (const void*)c == self) continue;
-        if (spu_resv_break(c, line)) {
+        if (coh_resv_break(c, line)) {
             spu_ev_raise(c, SPU_EVENT_LR);
             __atomic_fetch_add(&g_spu_lr_raise, 1ul, __ATOMIC_RELAXED);   /* raised under different stripes */
             coh_wake(c);
@@ -860,9 +1019,14 @@ static void notify_spus(uint32_t line)
 {
     const int hi = COH_CTX_HI();
     for (int i = 0; i < hi; i++) {
-        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], __ATOMIC_ACQUIRE);
+        /* A slot is cleared only under every stripe (spu_coh_unregister) and the caller holds this line's, so a
+         * pointer read here stays valid for the rest of the pass. A slot is filled under one stripe only (the
+         * registering line's), but the filling compare-and-swap publishes the pointer with release, and the context
+         * behind it is reached through an address dependency on the load; that is why PS3_COH_FAST may read it
+         * relaxed. */
+        spu_context* c = __atomic_load_n(&s_coh_ctxs[i], COH_SCAN_ORDER);
         if (!c) continue;
-        if (spu_resv_break(c, line)) {        /* lost: PUTLLC must fail */
+        if (coh_resv_break(c, line)) {        /* lost: PUTLLC must fail */
             spu_ev_raise(c, SPU_EVENT_LR);
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who

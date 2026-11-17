@@ -15,12 +15,37 @@ jobmod_d0d15ec83992_ea2a0 0xD0A8 0xA3C8 0xA798 0x4448 0x99E8:0x98B0 0xC7B8
 #
 # image 210 (jobmod_867e5d2348b3_e2898): the culling-tree walk, worker 0x4358 (switch/natives/job210_native.c,
 # from ThiagoFraga761/infamous2-pc jobbc11_native.c, MIT; NEON float layer).
-jobmod_867e5d2348b3_e2898 0x4358
+jobmod_867e5d2348b3_e2898 0x4358 0x698C:0x68E4
 #
 # image 208 (jobmod_7393701cbd39_e1390): the flat instance culler, worker 0x4030 (switch/natives/job208_native.c,
 # from ThiagoFraga761/infamous2-pc job207_native.c, MIT; NEON float layer).
 jobmod_7393701cbd39_e1390 0x4030
 #
+# image 209 (jobmod_867e48f161e0_e10e8): the detail-level and fade updater beside it, worker 0x4030 (switch/natives/
+# job209_native.c, written for this port). 1.2% of the busy samples lifted (hz-0.52, gameplay idle at a dock), nearly
+# all of it in the per-box loop. PS3_NATIVE_J209=0 in env.txt turns it off, =2 is a check run against the lifted worker.
+jobmod_867e48f161e0_e10e8 0x4030
+#
+# image 211 (jobmod_87926738de5c_e4640): the normal-map stage of the 64 x 64 grid simulation, 0x45F8 (switch/natives/
+# job211_native.c, written for this port): the tables, the two lifted transform passes (it calls them), then the 4096-texel
+# normal map and the mip chain. 0.54% of the busy samples lifted. PS3_NATIVE_J211=0 in env.txt turns it off, =2 is a
+# check run against the lifted function.
+jobmod_87926738de5c_e4640 0x45F8
+#
 # image 216 (jobmod_9cb47b0cc0eb_e60c0): the BSP polygon clipper 0x68D8 (natives/spu/job216_bsp_native.c; it undoes
 # itself and lets the lifted code run on any input it cannot take). PS3_NATIVE_J220=0 in env.txt turns it off.
 jobmod_9cb47b0cc0eb_e60c0 0x68D8
+#
+# images 212 (jobmod_87c8e5f63136_e2f28) and 210 (above): the start-up clear of the module's data area, the first loop
+# of every job module (switch/natives/job212_native.c; 0x701C and 0x698C, each goes on at its constructors, 0x6F74 and
+# 0x68E4). 0.1% and 0.075% of the busy samples lifted. PS3_NATIVE_J212=0 in env.txt turns both off, =2 is a check run.
+jobmod_87c8e5f63136_e2f28 0x701C:0x6F74
+#
+# image 218 (jobmod_ab654d30fd90_efe70): the skeletal animation job's kernels (switch/natives/job218_native.c, written
+# for this port): 0x16320 blends two joint arrays four joints at a time, each rotation along the shorter arc and the other
+# two quadwords linearly; 0x17280 the same weights over one float a joint; 0x1C510 unpacks bit-packed rotation quaternions
+# (three stored components, the fourth rebuilt); 0x17780 builds each joint's 3x4 matrix from rotation, translation and
+# scale; 0x18B80 multiplies two arrays of 3x4 matrices; 0x5814 is the loop of the skeleton function that applies a 4x4
+# transform to every joint matrix (the job goes on at 0x5928). PS3_NATIVE_J218=0 in env.txt turns all off, =2 is a
+# check run against the lifted code.
+jobmod_ab654d30fd90_efe70 0x16320 0x17280 0x1C510 0x17780 0x18B80 0x5814:0x5928

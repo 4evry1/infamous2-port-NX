@@ -981,6 +981,371 @@ static inline int spu_putllc_precheck_on(void)
     return __builtin_expect(v >= 0, 1) ? v : spu_putllc_precheck_init();
 }
 
+/* ===========================================================================
+ * PS3_SPU_ATOM_FAST (default 1 under __SWITCH__, 0 elsewhere; -DPS3_SPU_ATOM_FAST=1 -DPS3_GM_WIDE_COPY=1 builds it
+ * on an x86-64 / AArch64 host, which is how the unit tests exercise it; PS3_SPU_ATOM_FAST=0 in the environment runs the
+ * full path on every command, for an A/B).
+ *
+ * The lock-line commands -- GETLLAR, PUTLLC, PUTLLUC -- were one 8.8 KB function (spu_mfc_atomic_body_full below)
+ * carrying every diagnostic of the port's history inline: a 1.2 KB frame with ten saved registers, a dozen
+ * `static _Atomic` switches each read with a load-ACQUIRE (an LDAR, which on the Cortex-A57 waits for every earlier
+ * store-release to drain: the RESV_DROP's STLR was followed by two or three of them), a call to the lock guard on every
+ * commit, and, per GETLLAR, calls for the stripe sequence word, the reservation mark and the validation twice. In
+ * the gameplay profiles (console runs 55/56, hz-0.51) the function and the helpers it calls were ~4% of all busy CPU.
+ *
+ * The fast path does the same operations in the same order with the same fences and memory orders, minus what cannot
+ * matter when no diagnostic is on:
+ *   - one configuration word, read once (a plain load from its own cache line), replaces the switches. Any trace /
+ *     watch / stat switch of the atomic path (SPU_POLLTRACE, SPU_ATOMTRACE, SPU_ATOM_EA, SPU_ATOMICSTAT,
+ *     SPU_LLARWATCH, SPU_PUTLLC_WHY, SPU_LOCKGUARD), or g_barrier_sync_watch being armed, sends the command to the
+ *     full path unchanged;
+ *   - so does anything unusual: an EA whose page is not yet known to be committed, a guest address that is not
+ *     16-byte aligned, a GETLLAR that has lost the seqlock 64 times (the full path reads under the stripe);
+ *     nothing has been done to the guest or to the reservation word's meaning by then (the reservation was already
+ *     dropped, which is what the full path does first), so the full path starts from the same state;
+ *   - the 128-byte line is moved as eight 16-byte accesses at 16-byte-aligned guest addresses (what gm_copy_from /
+ *     gm_copy_to do for it), the GETLLAR's snapshot is written from the registers the line was read into (it was
+ *     read back from the local store, which holds the same bytes), the PUTLLC compare is gm_equal's eight loads and
+ *     a branch-free reduce;
+ *   - the stripe's sequence word is read through a pointer (spu_lockline_seq_ptr): the acquire load, the acquire
+ *     fence and the second load of spu_lockline_read_begin / _valid, inline, without a call each;
+ *   - a successful PUTLLC drops the reservation once, before the notify (a second drop after it stored the value
+ *     already stored: only this SPU's own next GETLLAR can make the reservation valid again).
+ * PS3_SPU_ATOM_VERIFY=1 checks the fast path against the generic routines on live traffic (see atom_verify_*).
+ * =========================================================================*/
+#ifndef PS3_SPU_ATOM_FAST
+#  if defined(__SWITCH__) && defined(__aarch64__)
+#    define PS3_SPU_ATOM_FAST 1
+#  else
+#    define PS3_SPU_ATOM_FAST 0
+#  endif
+#endif
+#if PS3_SPU_ATOM_FAST && !PS3_GM_WIDE_COPY
+#  undef PS3_SPU_ATOM_FAST
+#  define PS3_SPU_ATOM_FAST 0
+#endif
+
+#if PS3_SPU_ATOM_FAST
+extern uint32_t g_barrier_sync_watch;
+extern uint8_t  g_vm_page_bitmap[65536 / 8];
+
+#define ATOM_CFG_OFF         1   /* PS3_SPU_ATOM_FAST=0, or a diagnostic switch of the atomic path is set */
+#define ATOM_CFG_COUNT       2   /* PS3_SPU_PUTLLC_COUNT (see the PUTLLC case of the full path) */
+#define ATOM_CFG_NOPRECHECK  4   /* PS3_SPU_PUTLLC_PRECHECK=0 */
+#define ATOM_CFG_VERIFY      8   /* PS3_SPU_ATOM_VERIFY=1 */
+/* On a cache line of its own: every lock-line command reads it, and a neighbour that is written would take it away. */
+static struct { int v; char pad[60]; } s_atom_cfg_line __attribute__((aligned(64))) = { -1, { 0 } };
+
+static void atom_verify_summary(void);
+static __attribute__((noinline, cold)) int spu_atom_cfg_init(void)
+{
+    const char* f = getenv("PS3_SPU_ATOM_FAST");
+    const char* c = getenv("PS3_SPU_PUTLLC_COUNT");
+    const char* p = getenv("PS3_SPU_PUTLLC_PRECHECK");
+    const char* v = getenv("PS3_SPU_ATOM_VERIFY");
+    int cfg = 0;
+    if ((f && f[0] == '0') || getenv("SPU_POLLTRACE") || getenv("SPU_ATOMTRACE") || getenv("SPU_ATOM_EA") ||
+        getenv("SPU_ATOMICSTAT") || getenv("SPU_LLARWATCH") || getenv("SPU_PUTLLC_WHY") || getenv("SPU_LOCKGUARD"))
+        cfg |= ATOM_CFG_OFF;
+#ifdef __SWITCH__
+    if (c && c[0] == '1') cfg |= ATOM_CFG_COUNT;            /* the Switch build: off unless asked for */
+#else
+    if (!(c && c[0] == '0')) cfg |= ATOM_CFG_COUNT;         /* the PC builds: on, as upstream, unless =0 */
+#endif
+    if (p && p[0] == '0') cfg |= ATOM_CFG_NOPRECHECK;
+    if (v && v[0] == '1' && !(cfg & ATOM_CFG_OFF)) cfg |= ATOM_CFG_VERIFY;
+    static int s_said;
+    if (!__atomic_exchange_n(&s_said, 1, __ATOMIC_ACQ_REL)) {        /* the first commands (any thread) until the configuration word is set */
+        fprintf(stderr, "[spu-atom] lock-line fast path %s%s\n", (cfg & ATOM_CFG_OFF) ? "off (the full path runs every command)" : "on",
+                (cfg & ATOM_CFG_VERIFY) ? ", VERIFY: every command is checked against the generic routines" : "");
+        if (cfg & ATOM_CFG_VERIFY) atexit(atom_verify_summary);
+    }
+    __atomic_store_n(&s_atom_cfg_line.v, cfg, __ATOMIC_RELAXED);
+    return cfg;
+}
+
+/* 1 = the 64 KB page of `ea` is known committed (mfc_ea_range_committed's bitmap test, which for a 128-byte line at a
+ * 128-byte-aligned EA is one page and one load-acquire). Anything else goes to the full path, which asks the OS. */
+static inline __attribute__((always_inline)) int atom_page_known(uint32_t ea)
+{
+    return (__atomic_load_n(&g_vm_page_bitmap[ea >> 19], __ATOMIC_ACQUIRE) >> ((ea >> 16) & 7)) & 1;
+}
+
+/* The 128-byte line, eight 16-byte accesses, ascending, at a 16-byte-aligned guest address (gm_copy_from /
+ * gm_copy_to's wide loops for n = 128). gm_ld128 / gm_st128 are volatile accesses: none is merged, split or moved
+ * past another. */
+#define ATOM_LD8(l, g) \
+    const gm_v128 l##0 = gm_ld128((g)),       l##1 = gm_ld128((g) + 16), l##2 = gm_ld128((g) + 32), l##3 = gm_ld128((g) + 48), \
+                  l##4 = gm_ld128((g) + 64),  l##5 = gm_ld128((g) + 80), l##6 = gm_ld128((g) + 96), l##7 = gm_ld128((g) + 112)
+#define ATOM_ST8(d, l) do {                                                                                   \
+    memcpy((d),       &l##0, 16); memcpy((d) + 16, &l##1, 16); memcpy((d) + 32,  &l##2, 16); memcpy((d) + 48,  &l##3, 16); \
+    memcpy((d) + 64,  &l##4, 16); memcpy((d) + 80, &l##5, 16); memcpy((d) + 96,  &l##6, 16); memcpy((d) + 112, &l##7, 16); \
+} while (0)
+
+/* gm_equal(mem, snap, 128): equal iff every byte is (the same eight loads and reduce, inline). */
+static inline __attribute__((always_inline)) int atom_line_equal(const uint8_t* mem, const uint8_t* snap)
+{
+    gm_v128 b[8], acc;
+    memcpy(&b[0], snap, 16);       memcpy(&b[1], snap + 16, 16);  memcpy(&b[2], snap + 32, 16);  memcpy(&b[3], snap + 48, 16);
+    memcpy(&b[4], snap + 64, 16);  memcpy(&b[5], snap + 80, 16);  memcpy(&b[6], snap + 96, 16);  memcpy(&b[7], snap + 112, 16);
+    acc = gm_ld128(mem) ^ b[0];
+    acc |= gm_ld128(mem + 16) ^ b[1];   acc |= gm_ld128(mem + 32) ^ b[2];   acc |= gm_ld128(mem + 48) ^ b[3];
+    acc |= gm_ld128(mem + 64) ^ b[4];   acc |= gm_ld128(mem + 80) ^ b[5];   acc |= gm_ld128(mem + 96) ^ b[6];
+    acc |= gm_ld128(mem + 112) ^ b[7];
+    return (acc[0] | acc[1]) == 0;
+}
+
+/* spu_line_copy for a 16-byte-aligned guest line: the RSX range keeps the top-down release stores, anything else is
+ * eight ascending 16-byte stores (gm_copy_to's wide loop). */
+static inline __attribute__((always_inline)) void atom_line_store(uint32_t ea, uint8_t* mem, const uint8_t* ls)
+{
+    if (__builtin_expect(spu_put_is_rsx(ea & ~127u, MFC_ATOMIC_LINE), 0)) { gm_copy_to_desc(mem, ls, MFC_ATOMIC_LINE); return; }
+    gm_v128 a[8];
+    memcpy(&a[0], ls, 16);       memcpy(&a[1], ls + 16, 16);  memcpy(&a[2], ls + 32, 16);  memcpy(&a[3], ls + 48, 16);
+    memcpy(&a[4], ls + 64, 16);  memcpy(&a[5], ls + 80, 16);  memcpy(&a[6], ls + 96, 16);  memcpy(&a[7], ls + 112, 16);
+    gm_st128(mem, a[0]);       gm_st128(mem + 16, a[1]);  gm_st128(mem + 32, a[2]);  gm_st128(mem + 48, a[3]);
+    gm_st128(mem + 64, a[4]);  gm_st128(mem + 80, a[5]);  gm_st128(mem + 96, a[6]);  gm_st128(mem + 112, a[7]);
+}
+
+/* ---- PS3_SPU_ATOM_VERIFY ------------------------------------------------------------------------------------
+ * Each lock-line command, after the fast path has run it, is checked against the generic routines the fast path
+ * stands in for. Nothing is changed by a check; a failed one is counted and the first few are logged. What is checked:
+ *   GETLLAR  the snapshot is the line in the local store; the reservation word names the line; the context is in the
+ *            registry and the line is marked with the bitmap armed; the stripe sequence word the fast path read is the
+ *            one spu_lockline_read_valid validates (it must accept a value just read, retried once if a writer got in);
+ *            the local store holds what gm_copy_from_scalar reads from the guest line now (when the line has not been
+ *            written since: same stripe sequence word, and two reads agree);
+ *   PUTLLC   the precheck verdict equals the generic expression's (re-evaluated once if the line moved between);
+ *            after a commit the guest line holds the staged bytes (counted separately when a later writer got in);
+ *   PUTLLUC  after the store, as for a PUTLLC commit. */
+static unsigned long long s_av_ok, s_av_bad, s_av_late, s_av_t0;
+static __attribute__((noinline, cold)) void atom_verify_report(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned long long now = (unsigned long long)ts.tv_sec;
+    unsigned long long t0 = __atomic_load_n(&s_av_t0, __ATOMIC_RELAXED);
+    if (!t0) { __atomic_store_n(&s_av_t0, now, __ATOMIC_RELAXED); return; }
+    if (now - t0 < 10 || !__atomic_compare_exchange_n(&s_av_t0, &t0, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    fprintf(stderr, "[spu-atom] VERIFY: %llu commands checked, %llu differ, %llu overtaken by a later writer\n",
+            __atomic_load_n(&s_av_ok, __ATOMIC_RELAXED) + __atomic_load_n(&s_av_bad, __ATOMIC_RELAXED),
+            __atomic_load_n(&s_av_bad, __ATOMIC_RELAXED), __atomic_load_n(&s_av_late, __ATOMIC_RELAXED));
+}
+static void atom_verify_summary(void)
+{
+    fprintf(stderr, "[spu-atom] VERIFY total: %llu commands checked, %llu differ, %llu overtaken by a later writer\n",
+            s_av_ok + s_av_bad, s_av_bad, s_av_late);
+}
+static __attribute__((noinline, cold)) void atom_verify_done(const char* what, spu_context* ctx, uint32_t ea, unsigned bad, int late)
+{
+    if (late) __atomic_fetch_add(&s_av_late, 1, __ATOMIC_RELAXED);
+    if (!bad) {
+        const unsigned long long n = __atomic_fetch_add(&s_av_ok, 1, __ATOMIC_RELAXED) + 1;
+        if ((n & 0x3FFF) == 0) atom_verify_report();
+        return;
+    }
+    const unsigned long long n = __atomic_fetch_add(&s_av_bad, 1, __ATOMIC_RELAXED) + 1;
+    if (n <= 16)
+        fprintf(stderr, "[spu-atom] VERIFY DIFFER #%llu: %s img=%d spu=%u ea=0x%08X checks failed 0x%X\n",
+                n, what, ctx->image_id, (unsigned)(ctx->spu_id & 7u), ea, bad);
+}
+static __attribute__((noinline, cold)) void atom_verify_getllar(spu_context* ctx, uint32_t ea, const uint8_t* mem,
+                                                                 const uint8_t* ls, const uint32_t* sq, uint32_t q_end)
+{
+    unsigned bad = 0; int late = 0;
+    if (memcmp(ctx->resv_line, ls, MFC_ATOMIC_LINE)) bad |= 1;                  /* snapshot == what the SPU got */
+    if (RESV_EA(ctx) != ea) bad |= 2;                                           /* the reservation names the line */
+    if (!spu_coh_is_registered(ctx)) bad |= 4;                                  /* registered */
+    if (!spu_coh_line_marked(ea)) bad |= 8;                                     /* marked, armed */
+    {   /* the pointer the fast path used is the stripe the generic API validates against: with that stripe held (by the
+         * generic mask API, so nothing else can move its sequence word) the word read through the pointer is the one
+         * spu_lockline_read_valid compares with */
+        const uint64_t m = spu_lockline_mask_ea(ea);
+        spu_lockline_lock_mask(m);
+        const uint32_t q = __atomic_load_n(sq, __ATOMIC_RELAXED);
+        if (!spu_lockline_read_valid(ea, q)) bad |= 16;
+        spu_lockline_unlock_mask(m);
+    }
+    {   /* the copy: what the generic scalar copy reads now (only meaningful while the line has not been written) */
+        uint8_t s1[MFC_ATOMIC_LINE], s2[MFC_ATOMIC_LINE];
+        gm_copy_from_scalar(s1, mem, MFC_ATOMIC_LINE);
+        if (memcmp(s1, ls, MFC_ATOMIC_LINE)) {
+            gm_copy_from_scalar(s2, mem, MFC_ATOMIC_LINE);
+            const int stable = !memcmp(s1, s2, MFC_ATOMIC_LINE) && __atomic_load_n(sq, __ATOMIC_ACQUIRE) == q_end;
+            if (stable) bad |= 32; else late = 1;
+        }
+    }
+    atom_verify_done("GETLLAR", ctx, ea, bad, late);
+}
+/* The PUTLLC precheck verdict: `nf` (the fast path's) against the generic expression. */
+static __attribute__((noinline, cold)) void atom_verify_putllc_pre(spu_context* ctx, uint32_t ea, const uint8_t* mem, int nf)
+{
+    unsigned bad = 0;
+    for (int k = 0; k < 2; k++) {
+        const int o = !RESV_VALID(ctx) || RESV_EA(ctx) != ea || !gm_equal(mem, ctx->resv_line, MFC_ATOMIC_LINE);
+        const int n = k ? (!RESV_VALID(ctx) || RESV_EA(ctx) != ea || !atom_line_equal(mem, ctx->resv_line)) : nf;
+        if (o == n) { bad = 0; break; }
+        bad = 1;
+    }
+    atom_verify_done("PUTLLC-precheck", ctx, ea, bad, 0);
+}
+/* spu_lockline_lock_ea(ea) took the stripe the sequence word of `ea` belongs to: a held stripe's word is odd. */
+static __attribute__((noinline, cold)) void atom_verify_locked(spu_context* ctx, uint32_t ea)
+{
+    atom_verify_done("lock_ea", ctx, ea, (*spu_lockline_seq_ptr(ea) & 1u) ? 0u : 1u, 0);
+}
+/* After a PUTLLC commit or a PUTLLUC: the guest line holds the bytes that were staged. */
+static __attribute__((noinline, cold)) void atom_verify_commit(const char* what, spu_context* ctx, uint32_t ea,
+                                                                const uint8_t* mem, const uint8_t* ls)
+{
+    uint8_t s1[MFC_ATOMIC_LINE];
+    unsigned bad = 0; int late = 0;
+    gm_copy_from_scalar(s1, mem, MFC_ATOMIC_LINE);
+    if (memcmp(s1, ls, MFC_ATOMIC_LINE)) late = 1;      /* a later writer, or a commit that stored something else */
+    atom_verify_done(what, ctx, ea, bad, late);
+}
+
+/* The [spu-spin] report (see the GETLLAR case of the full path). */
+static __attribute__((noinline, cold)) void atom_spin_report(spu_context* ctx, uint32_t ea)
+{
+    const uint8_t* m = vm_base + ea;
+    fprintf(stderr, "[spu-spin] img=%d pc=0x%05X lr=0x%05X GETLLAR ea=0x%08X x4M; line:"
+                    " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+            ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
+            m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+}
+
+/* Each returns 1 when it ran the command, -1 when the full path should (nothing has been committed by then). */
+static inline __attribute__((always_inline)) int atom_getllar(spu_context* ctx, int cfg)
+{
+    uint8_t* const vb = vm_base;
+    const uint32_t ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    const uint8_t* const mem = vb + ea;
+    if (__builtin_expect(!vb || ((uintptr_t)mem & 15u) || !atom_page_known(ea), 0)) return -1;
+    uint8_t* const ls = &ctx->ls[ctx->mfc_lsa & SPU_LS_MASK];
+
+    if (g_yz_lockstep_on) yz_lockstep_tick(ctx);
+    RESV_DROP(ctx);
+    const uint32_t* const sq = spu_coh_getllar_enter(ctx, ea);
+    uint32_t q = 0;
+    for (unsigned tries = 0; ; ) {
+        if (__builtin_expect(++tries > 64, 0)) return -1;            /* writers keep the stripe busy: read under it */
+        q = __atomic_load_n(sq, __ATOMIC_ACQUIRE);                  /* spu_lockline_read_begin */
+        if (__builtin_expect(q & 1u, 0)) q = spu_lockline_seq_wait(sq);
+        ATOM_LD8(l, mem);                                           /* ONE read of the line ... */
+        ATOM_ST8(ls, l);                                            /* ... to the local store ... */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);                    /* spu_lockline_read_valid */
+        if (__atomic_load_n(sq, __ATOMIC_RELAXED) != q) continue;   /* torn: a writer was in */
+        ATOM_ST8(ctx->resv_line, l);                                /* ... and the snapshot, from the same bytes */
+        RESV_SET(ctx, ea, 1);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(sq, __ATOMIC_RELAXED) == q || !RESV_VALID(ctx)) break;
+    }
+    ctx->atomic_stat = 4;
+    {   /* the spin detector of the full path */
+        static SPU_THREAD_LOCAL uint32_t t_ea; static SPU_THREAD_LOCAL unsigned long t_n;
+        if (ea != t_ea) { t_ea = ea; t_n = 0; }
+        else if (__builtin_expect(++t_n == 4000000, 0)) atom_spin_report(ctx, ea);
+    }
+    if (__builtin_expect(cfg & ATOM_CFG_VERIFY, 0)) atom_verify_getllar(ctx, ea, mem, ls, sq, q);
+    return 1;
+}
+
+static inline __attribute__((always_inline)) int atom_putllc(spu_context* ctx, int cfg)
+{
+    uint8_t* const vb = vm_base;
+    const uint32_t ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    uint8_t* const mem = vb + ea;
+    if (__builtin_expect(!vb || ((uintptr_t)mem & 15u) || !atom_page_known(ea), 0)) return -1;
+    const uint8_t* const ls = &ctx->ls[ctx->mfc_lsa & SPU_LS_MASK];
+
+    if (__builtin_expect(cfg & ATOM_CFG_COUNT, 0)) __atomic_fetch_add(&g_spu_putllc_count, 1u, __ATOMIC_RELAXED);
+    /* PS3_SPU_PUTLLC_PRECHECK: a PUTLLC that can only fail fails without the stripe (see the full path). One read of
+     * the reservation word gives the valid bit and the line together. */
+    {
+        int nf = 0;
+        if (!(cfg & ATOM_CFG_NOPRECHECK) || (cfg & ATOM_CFG_VERIFY)) {
+            const uint64_t w = SPU_RESV_LOAD(ctx);
+            nf = !(int)(w >> 32) || (uint32_t)w != ea || !atom_line_equal(mem, ctx->resv_line);
+        }
+        if (__builtin_expect(cfg & ATOM_CFG_VERIFY, 0)) atom_verify_putllc_pre(ctx, ea, mem, nf);
+        if (!(cfg & ATOM_CFG_NOPRECHECK) && nf) {
+            ctx->atomic_stat = 1;                  /* PUTLLC_FAILURE -> retry */
+            RESV_DROP(ctx);                        /* reservation consumed */
+            return 1;
+        }
+    }
+    spu_lockline_lock_ea(ea);
+    if (__builtin_expect(cfg & ATOM_CFG_VERIFY, 0)) atom_verify_locked(ctx, ea);
+    int ok;
+    {
+        const uint64_t w = SPU_RESV_LOAD(ctx);
+        ok = (int)(w >> 32) && (uint32_t)w == ea && atom_line_equal(mem, ctx->resv_line);
+    }
+    if (ok) {
+        atom_line_store(ea, mem, ls);              /* commit local store */
+        RESV_DROP(ctx);                            /* consumed, before the notify: no self-LR */
+        spu_coh_notify_write(ea);
+        ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+    } else {
+        ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+        RESV_DROP(ctx);                            /* reservation consumed */
+    }
+    spu_lockline_unlock_ea(ea);
+    if (ok && g_spu_line_commit_hook) g_spu_line_commit_hook(ea);
+    if (__builtin_expect((cfg & ATOM_CFG_VERIFY) && ok, 0)) atom_verify_commit("PUTLLC", ctx, ea, mem, ls);
+    return 1;
+}
+
+static inline __attribute__((always_inline)) int atom_putlluc(spu_context* ctx, int cfg)
+{
+    uint8_t* const vb = vm_base;
+    const uint32_t ea = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
+    uint8_t* const mem = vb + ea;
+    if (__builtin_expect(!vb || ((uintptr_t)mem & 15u) || !atom_page_known(ea), 0)) return -1;
+    const uint8_t* const ls = &ctx->ls[ctx->mfc_lsa & SPU_LS_MASK];
+
+    spu_lockline_lock_ea(ea);
+    if (__builtin_expect(cfg & ATOM_CFG_VERIFY, 0)) atom_verify_locked(ctx, ea);
+    atom_line_store(ea, mem, ls);                  /* unconditional store */
+    spu_coh_notify_write(ea);                      /* invalidates every reservation on the line, this SPU's included */
+    RESV_DROP(ctx); ctx->atomic_stat = 2;          /* PUTLLUC complete */
+    spu_lockline_unlock_ea(ea);
+    if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea);
+    if (__builtin_expect(cfg & ATOM_CFG_VERIFY, 0)) atom_verify_commit("PUTLLUC", ctx, ea, mem, ls);
+    return 1;
+}
+#endif /* PS3_SPU_ATOM_FAST */
+
+/* Not inlined into the dispatcher below: its 1.2 KB frame and saved registers must not be paid by the fast path. With the
+ * fast path compiled in it is also cold (laid out away from the hot text); without it, it is the only path and stays as it was. */
+#if PS3_SPU_ATOM_FAST
+static __attribute__((noinline, cold)) int spu_mfc_atomic_body_full(spu_context* ctx, uint32_t cmd);
+#else
+static __attribute__((noinline)) int spu_mfc_atomic_body_full(spu_context* ctx, uint32_t cmd);
+#endif
+
+/* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
+static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
+{
+#if PS3_SPU_ATOM_FAST
+    int cfg = __atomic_load_n(&s_atom_cfg_line.v, __ATOMIC_RELAXED);
+    if (__builtin_expect(cfg < 0, 0)) cfg = spu_atom_cfg_init();
+    if (__builtin_expect(!(cfg & ATOM_CFG_OFF) && !g_barrier_sync_watch, 1)) {
+        int r;
+        switch (cmd) {
+        case MFC_GETLLAR_CMD:  r = atom_getllar(ctx, cfg); break;
+        case MFC_PUTLLC_CMD:   r = atom_putllc(ctx, cfg);  break;
+        case MFC_PUTLLUC_CMD:
+        case MFC_PUTQLLUC_CMD: r = atom_putlluc(ctx, cfg); break;
+        default:               return 0;               /* not a lock-line command: nothing for the atomic unit */
+        }
+        if (__builtin_expect(r >= 0, 1)) return r;
+    }
+#endif
+    return spu_mfc_atomic_body_full(ctx, cmd);
+}
+
+/* The full path: every command when a diagnostic switch is set, and whatever the fast path hands back. */
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 /* hz-0.32: the trace switches below (SPU_POLLTRACE, SPU_ATOMTRACE and its YDKJ_* companions,
  * SPU_ATOM_EA) are read once into one flag. Each block kept its own static switch, so every MFC
@@ -1001,7 +1366,7 @@ static int spu_atom_trace_on(void)
 #define SPU_ATOM_TRACE() 1
 #endif
 
-static int spu_mfc_atomic_body(spu_context* ctx, uint32_t cmd)
+static int spu_mfc_atomic_body_full(spu_context* ctx, uint32_t cmd)
 {
     uint64_t llm = 0;
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
@@ -1800,6 +2165,14 @@ void spu_mfc_cmd(spu_context* ctx, uint32_t cmd)
 {
     if (__builtin_expect(g_spu_jobrec_mode != 0, 0)) { spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(cmd)); return; }
     if (cmd == MFC_GETLLAR_CMD || cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) {
+#if PS3_SPU_ATOM_FAST
+        /* The line is about to be read (GETLLAR; PUTLLC's compare) and it is usually owned by another core -- the
+         * PPU or a peer SPU wrote it last -- so the first load of it waits for a cross-core transfer (the hottest
+         * instruction of the old body, run 56). A prefetch is a hint: it cannot fault, orders against nothing (a DMB
+         * does not wait for it), and starts that transfer before the fence and the checks the fast path makes first. */
+        if (cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
+            __builtin_prefetch(vm_base + (ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1)), 0, 3);
+#endif
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         spu_mfc_atomic_body(ctx, cmd);
         __atomic_thread_fence(__ATOMIC_SEQ_CST);

@@ -24,9 +24,10 @@ if [ "${1:-}" != "post-only" ]; then
         || fail "the lift (see work/logs/lift-switch.log)"
 fi
 # The native SPU rewrites as TUs of their own, built like the lifted SPU TUs (the port's CMake globs spu/*/spu_recomp.c).
-# job210 and job208 are Switch-only (switch/natives): the PC build compiles every natives/spu/*.c on its own.
+# job210, job208, job209, job211, job218 and job212 are Switch-only (switch/natives): the PC build compiles every natives/spu/*.c on its own.
 for f in natives/spu/job204_native.c natives/spu/edge223_native.c natives/spu/job216_bsp_native.c \
-         switch/natives/job210_native.c switch/natives/job208_native.c; do
+         switch/natives/job210_native.c switch/natives/job208_native.c switch/natives/job209_native.c \
+         switch/natives/job211_native.c switch/natives/job218_native.c switch/natives/job212_native.c; do
     W="$P/spu/zz_native_$(basename "$f" .c)"
     mkdir -p "$W"
     printf '%s\n' '/* native SPU rewrite, built like the lifted SPU TUs */' "#include \"$R/$f\"" > "$W/spu_recomp.c"

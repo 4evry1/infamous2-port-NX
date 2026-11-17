@@ -67,6 +67,26 @@ void     spu_lockline_unlock_mask(uint64_t mask);
 uint32_t spu_lockline_read_begin(uint32_t ea);
 int      spu_lockline_read_valid(uint32_t ea, uint32_t seq);
 
+/* Entry points for the SPU lock-line commands (spu_channels.c, PS3_SPU_ATOM_FAST: GETLLAR / PUTLLC /
+ * PUTLLUC). Each is the same operation as the generic calls named beside it, with fewer calls and no
+ * repeated flag loads between them; nothing here changes what a stripe, a sequence word or the registry
+ * holds, or the order any of it is read or written in.
+ *
+ *   spu_lockline_seq_ptr(ea)   the stripe's sequence word that spu_lockline_read_begin / _valid read. The
+ *                              caller does the seqlock itself: begin = load-acquire of *p (spu_lockline_seq_wait
+ *                              when odd), valid = acquire fence, then *p == the value begin returned.
+ *   spu_lockline_lock_ea(ea)   spu_lockline_lock_mask(spu_lockline_mask_ea(ea))
+ *   spu_lockline_unlock_ea(ea) spu_lockline_unlock_mask(spu_lockline_mask_ea(ea))
+ *   spu_coh_getllar_enter()    spu_coh_reserve(ctx, ea), then spu_lockline_seq_ptr(ea)
+ *   spu_coh_is_registered / spu_coh_line_marked: what PS3_SPU_ATOM_VERIFY checks a GETLLAR against. */
+const uint32_t* spu_lockline_seq_ptr(uint32_t ea);
+uint32_t        spu_lockline_seq_wait(const uint32_t* seq);
+void            spu_lockline_lock_ea(uint32_t ea);
+void            spu_lockline_unlock_ea(uint32_t ea);
+const uint32_t* spu_coh_getllar_enter(spu_context* ctx, uint32_t ea);
+int             spu_coh_is_registered(spu_context* ctx);
+int             spu_coh_line_marked(uint32_t ea);
+
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
  *
