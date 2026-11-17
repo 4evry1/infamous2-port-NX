@@ -385,14 +385,20 @@ def ecb_encrypt(key, data):
     if _CryptoAES is not None:
         return _CryptoAES.new(key, _CryptoAES.MODE_ECB).encrypt(data)
     aes = _AES(key)
-    return b''.join(aes.encrypt_block(data[i:i + 16]) for i in range(0, len(data), 16))
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        out += aes.encrypt_block(data[i:i + 16])
+    return bytes(out)
 
 
 def ecb_decrypt(key, data):
     if _CryptoAES is not None:
         return _CryptoAES.new(key, _CryptoAES.MODE_ECB).decrypt(data)
     aes = _AES(key)
-    return b''.join(aes.decrypt_block(data[i:i + 16]) for i in range(0, len(data), 16))
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        out += aes.decrypt_block(data[i:i + 16])
+    return bytes(out)
 
 
 def cbc_decrypt(key, iv, data):
@@ -686,11 +692,16 @@ def decrypt_self(in_path, out_path, keys):
 # ---------------------------------------------------------------------------
 # Game update PKG -> folder
 # ---------------------------------------------------------------------------
+PKG_CHUNK = 8 * 1024 * 1024      # 8 MiB: a multiple of the AES block size, so a file never sits in memory whole
+
+
 def _pkg_keystream(used, riv, hdr60, start_block, nblocks, keys):
     if used in ('finalized', 'psp'):
         base = int.from_bytes(riv, 'big')
-        ctrs = b''.join(((base + start_block + i) & ((1 << 128) - 1)).to_bytes(16, 'big')
-                        for i in range(nblocks))
+        mask = (1 << 128) - 1
+        ctrs = bytearray()
+        for i in range(nblocks):
+            ctrs += ((base + start_block + i) & mask).to_bytes(16, 'big')
         key = keys.get('ps3_gpkg_key', 16) if used == 'finalized' else keys.get('psp_pkg_key', 16)
         return ecb_encrypt(key, ctrs)
     qa = hdr60[0:0x10]
@@ -704,6 +715,34 @@ def _pkg_keystream(used, riv, hdr60, start_block, nblocks, keys):
         k[0x38:0x40] = ((start_block + i) & ((1 << 64) - 1)).to_bytes(8, 'big')
         out += hashlib.sha1(bytes(k)).digest()[:0x10]
     return bytes(out)
+
+
+def _pkg_decrypt_chunks(used, start, length, read, riv, hdr60, keys):
+    """[start, start+length) decrypted in PKG_CHUNK pieces, so memory stays flat for any file size."""
+    sb = start // 16
+    off = start - sb * 16
+    total = off + length
+    done = 0
+    while done < total:
+        n = min(PKG_CHUNK, total - done)
+        n -= n % 16                     # whole AES blocks, so the next piece starts aligned
+        if n <= 0:
+            n = total - done
+        chunk = read(sb * 16 + done, n)
+        if not chunk:
+            break
+        nb = (len(chunk) + 15) // 16
+        ks = _pkg_keystream(used, riv, hdr60, sb + done // 16, nb, keys)
+        m = min(len(chunk), len(ks))
+        if m:
+            a = int.from_bytes(chunk[:m], 'big') ^ int.from_bytes(ks[:m], 'big')
+            dec = a.to_bytes(m, 'big')
+        else:
+            dec = b''
+        if done == 0 and off:
+            dec = dec[off:]
+        yield dec
+        done += n
 
 
 def _pkg_out_path(out_dir, name):
@@ -744,15 +783,7 @@ def extract_pkg(in_path, out_dir, keys):
             return f.read(n)
 
         def decrypt_range(used, start, length):
-            sb = start // 16
-            off = start - sb * 16
-            nb = (off + length + 15) // 16
-            chunk = raw(sb * 16, nb * 16)
-            ks = _pkg_keystream(used, riv, hdr60, sb, min(nb, len(chunk) // 16 + 1), keys)
-            m = min(len(chunk), len(ks))
-            a = int.from_bytes(chunk[:m], 'big') ^ int.from_bytes(ks[:m], 'big')
-            dec = a.to_bytes(m, 'big')
-            return dec[off:off + length]
+            return b''.join(_pkg_decrypt_chunks(used, start, length, raw, riv, hdr60, keys))
 
         def parse_table(used):
             hdr_len = min(data_size, item_count * 0x20 + (1 << 20))
@@ -797,12 +828,13 @@ def extract_pkg(in_path, out_dir, keys):
         for nm, fo, fs, k in names:
             if fs <= 0:
                 continue
-            blob = decrypt_range(k, fo, fs)
             op = _pkg_out_path(out_dir, nm)
             try:
                 os.makedirs(os.path.dirname(op), exist_ok=True)
                 with open(op, 'wb') as g:
-                    g.write(blob)
+                    # written as it is decrypted: a 3 GB entry never sits in memory
+                    for piece in _pkg_decrypt_chunks(k, fo, fs, raw, riv, hdr60, keys):
+                        g.write(piece)
             except OSError as e:
                 raise Ps3ToolError('cannot write %s: %s' % (op, e))
             count += 1
