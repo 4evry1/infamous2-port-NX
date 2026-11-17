@@ -20,6 +20,7 @@ want = {   # module -> the hooks (spu_native_entry) its lift must carry
     "jobmod_9cb47b0cc0eb_e60c0": ["0x68D8u"],
     "jobmod_87c8e5f63136_e2f28": ["0x701Cu"],
     "jobmod_ab654d30fd90_efe70": ["0x16320u", "0x17280u", "0x1C510u", "0x17780u", "0x18B80u", "0x5814u"],
+    "jobmod_14e77a6441c8_e6ce0": ["0x6D28u"],
 }
 bad = []
 for mod, addrs in want.items():

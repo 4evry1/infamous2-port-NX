@@ -54,3 +54,10 @@ jobmod_87c8e5f63136_e2f28 0x701C:0x6F74
 # transform to every joint matrix (the job goes on at 0x5928). PS3_NATIVE_J218=0 in env.txt turns all off, =2 is a
 # check run against the lifted code.
 jobmod_ab654d30fd90_efe70 0x16320 0x17280 0x1C510 0x17780 0x18B80 0x5814:0x5928
+#
+# image 201 (jobmod_14e77a6441c8_e6ce0): the job's sort, 0x6D28 (switch/natives/job201_native.c, written for this port): a
+# recursive quicksort of 36-byte records by squared distance from a point, the farthest first, with the partition 0x5DF8
+# in it; one native call does the whole sort (it is hooked at its entry, so the lifted code's own recursive calls are
+# offered to it again when it declines). 0.36% of the busy samples lifted (hz-0.52, gameplay idle at a dock), nearly all
+# of it in the partition. PS3_NATIVE_J201=0 in env.txt turns it off, =2 is a check run against the lifted code.
+jobmod_14e77a6441c8_e6ce0 0x6D28
