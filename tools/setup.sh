@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Linux Setup (tools/setup_build.ps1's counterpart): from your own copy of inFAMOUS 2 to a native
 # Linux build, in this folder only (nothing is installed system-wide, no root needed).
 #   tools/setup.sh --disc <folder holding PS3_GAME> --rpcs3 <RPCS3's folder> [--rpcs3-bin <rpcs3 AppImage>]
@@ -107,7 +107,12 @@ else ok MISS Python "python3 3.10+ with venv (Debian/Ubuntu: python3-venv)"; fi
 gccdir=""
 for d in $(ls -d /usr/lib/gcc/x86_64-*linux-gnu/* /usr/lib/gcc/x86_64-*linux/* 2>/dev/null | sort -V -r); do
     v=$(basename "$d"); for inc in /usr/include/c++/"$v" /usr/include/c++/"${v%%.*}"; do
-        [ -f "$inc/vector" ] && [ -f "$d/libstdc++.so" -o -f "$d/libstdc++.a" ] && { gccdir="$d"; break 2; }; done
+        [ -f "$inc/vector" ] || continue
+        # libstdc++ sits next to GCC's crt files on Debian/Ubuntu, in the distro's lib dir on others (Fedora's
+        # /usr/lib64, NixOS FHS environments): clang's --gcc-install-dir finds it in either place
+        for lib in "$d" /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu; do
+            [ -f "$lib/libstdc++.so" -o -f "$lib/libstdc++.a" ] && { gccdir="$d"; break 3; }
+        done; done
 done
 [ -n "$gccdir" ] && ok ok "C++ headers and libraries" "$gccdir" || ok MISS "C++ headers and libraries" "install them (Debian/Ubuntu: build-essential; Fedora: gcc-c++; Arch: base-devel)"
 for t in curl tar xz unzip; do command -v $t >/dev/null && ok ok $t found || ok MISS $t "install it"; done
@@ -377,13 +382,16 @@ if [ ! -f "$deps/glslang-install-linux/lib/cmake/glslang/glslang-config.cmake" ]
     rm -rf "$deps/glslang-build-linux"   # (a failed try leaves CMake's compiler checks cached)
     "$PORT_CMAKE" -S "$deps/glslang-src" -B "$deps/glslang-build-linux" -G Ninja -DCMAKE_MAKE_PROGRAM="$PORT_NINJA" \
         -DCMAKE_C_COMPILER="$PORT_LLVM/bin/clang" -DCMAKE_CXX_COMPILER="$PORT_LLVM/bin/clang++" -DCMAKE_BUILD_TYPE=Release \
-        -DPython3_EXECUTABLE="$venv/bin/python" -DCMAKE_INSTALL_PREFIX="$deps/glslang-install-linux" -DBUILD_SHARED_LIBS=OFF \
+        -DPython3_EXECUTABLE="$venv/bin/python" -DCMAKE_INSTALL_PREFIX="$deps/glslang-install-linux" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
         -DBUILD_EXTERNAL=OFF -DENABLE_OPT=OFF -DENABLE_GLSLANG_BINARIES=OFF -DGLSLANG_TESTS=OFF -DENABLE_HLSL=ON \
         -DENABLE_SPIRV=ON -DGLSLANG_ENABLE_INSTALL=ON -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld > "$deps/glslang-build.log" 2>&1 \
         && "$PORT_CMAKE" --build "$deps/glslang-build-linux" -j "$jobs" >> "$deps/glslang-build.log" 2>&1 \
         && "$PORT_CMAKE" --install "$deps/glslang-build-linux" >> "$deps/glslang-build.log" 2>&1 \
         || fail "building glslang failed (see $deps/glslang-build.log)"
 fi
+# without glslang the build still succeeds, but the game draws nothing (no guest programs): stop here instead
+[ -f "$deps/glslang-install-linux/lib/cmake/glslang/glslang-config.cmake" ] \
+    || fail "glslang is not where the build looks for it ($deps/glslang-install-linux/lib/cmake/glslang); see $deps/glslang-build.log"
 echo "  deps ready"
 
 # ------------------------------------------------------------------------------------------------

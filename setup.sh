@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # inFAMOUS 2 native port -- Linux: one script for everything (launchers such as Quiver run this).
 #   ./setup.sh                    first time: find your game, build it (15-60 min), then play;
 #                                 after that: just play

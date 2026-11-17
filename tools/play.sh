@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Play the native Linux build of inFAMOUS 2 (tools/play.ps1's Linux counterpart).
 #   tools/play.sh [--fullscreen] [--volume 0-100] [--fps N] [--spu-lighting] [--no-log] [--no-hud]
 #                 [--no-kbm] [--trace] [--exe <path>]

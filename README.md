@@ -410,6 +410,11 @@ cd infamous2-port
 Vulkan loader, SDL2) and puts everything else in the port's own folder. Please [report](../../issues) how it
 runs on your distribution and GPU.
 
+**NixOS:** there is no `/usr/lib` or `/usr/include` for Setup's checks and the downloaded build tools, so build
+and play inside the FHS environment in [`tools/nixos/fhs-env.nix`](tools/nixos/fhs-env.nix) (the commands are at
+the top of that file). Tested on NixOS 26.05 with a Radeon 780M; the desktop entry needs its `Exec` line pointed
+at the environment, as that file explains.
+
 ## 🔄 Updates
 
 - When the game starts it asks GitHub whether a new version is out: in the background, at most every 6 hours,
