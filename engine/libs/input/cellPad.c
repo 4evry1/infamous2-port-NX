@@ -2001,9 +2001,9 @@ volatile int      g_pad_overlay_open;
 volatile uint32_t g_pad_overlay_toggle;
 volatile uint32_t g_pad_overlay_nav, g_pad_overlay_nav2;
 /* g_pad_overlay_open == 2: a SYSTEM dialog holds the pad (the save-data list,
- * libs/video/vk_overlay_saves.cpp). The scripted buttons (PAD_SCRIPT, PAD_FILE)
- * then go to it -- as a player's would -- instead of the title: port 0's mask of
- * them on its latest read, here. */
+ * libs/video/vk_overlay_saves.cpp); 1: the F2 menu is open. The scripted buttons
+ * (PAD_SCRIPT, PAD_FILE) then go to it -- as a player's would -- instead of the
+ * title: port 0's mask of them on its latest read, here. */
 volatile uint32_t g_pad_overlay_inject;
 static void pad_overlay_gate(void)
 {
@@ -2601,9 +2601,11 @@ skip_inject: ;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= 0x08;   /* START */
       } }
 
-    /* A system dialog holds the pad (g_pad_overlay_open == 2): the scripted
-     * presses below go to it (g_pad_overlay_inject), not to the title. */
-    const int sysdlg = g_pad_overlay_open == 2 && port_no == 0;
+    /* A system dialog holds the pad (g_pad_overlay_open == 2), or the F2 menu is
+     * open (1, the title reads neutral input then): the scripted presses below go
+     * to it (g_pad_overlay_inject), not to the title -- as a player's pad would
+     * ([menu-e]: tests drive the menu with PAD_FILE / PAD_SCRIPT). */
+    const int sysdlg = g_pad_overlay_open != 0 && port_no == 0;
     uint32_t sysdlg_inj = 0;
 
     /* PAD_SCRIPT="<sec>:<mask>,<sec>:<mask>,..." -- press a NAMED button at a

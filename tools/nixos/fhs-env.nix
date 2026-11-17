@@ -16,7 +16,8 @@ pkgs.buildFHSEnv {
     gcc gcc.cc gcc.cc.lib glibc glibc.dev binutils
     python3 curl gnutar xz unzip gzip which file
     libxml2 zlib ncurses
-    # run: Vulkan, SDL2 (input, window, audio) and what RPCS3's one-time decrypt step needs
+    # run: Vulkan, SDL2 (input, window, audio) and the desktop libraries an RPCS3 AppImage needs. RPCS3 is
+    # optional: setup uses it only to decrypt when ps3tool can't (the digital version)
     vulkan-loader vulkan-headers SDL2
     libGL libglvnd libxkbcommon wayland libx11 libxext libxrandr libxi libxcursor
     libxcb xcb-util-cursor fontconfig freetype alsa-lib libpulseaudio pipewire udev dbus

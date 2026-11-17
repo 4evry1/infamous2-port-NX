@@ -39,6 +39,7 @@ file(GLOB_RECURSE HLE_SOURCES CONFIGURE_DEPENDS
     "libs/font/*.c"
     "libs/misc/*.c"
     "libs/hardware/*.c"
+    "libs/game/*.c"         # title logic redone natively (Track D: inf2_dlogic.c, hooks from cheats/hooks.txt)
     "runtime/diag/*.c"      # yz_frontier_trace, used by the live draw engine
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
@@ -97,7 +98,10 @@ file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS
 #    *inside the game build* by clang so the tail call is guaranteed -- a plain
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
-list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+#  - runtime/game_module/: the game module's own side of ps3emu/ps3_module.h (the shared state's
+#    storage, its C runtime bits, its import slots), compiled with the lifted code into the game
+#    module by tools/build_module.py, never into the engine (slim split, 2026-11-14).
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/runtime/game_module/|/spu_dispatch_mt\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -110,6 +114,14 @@ add_library(ps3recomp_runtime STATIC
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+# The game module's shared state (ps3emu/ps3_module.h): every engine TU reaches the module's copy
+# through ps3_mv_* (runtime/module/ps3_module_vars.h, force-included; slim split, 2026-11-14).
+if(MSVC)
+    target_compile_options(ps3recomp_runtime PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/runtime/module/ps3_module_vars.h")
+else()
+    target_compile_options(ps3recomp_runtime PRIVATE -include "${CMAKE_CURRENT_SOURCE_DIR}/runtime/module/ps3_module_vars.h")
+endif()
 
 # HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE

@@ -61,6 +61,8 @@
 
 #include "ppu_recomp.h"
 #include "ps3emu/ppu_hooks.h"
+#include "ps3emu/ps3_module.h"
+
 #include "ps3emu/ps3_cheats.h"
 #ifndef PS3_CHEATS_HAVE_NO_CASUAL   /* a toolkit without it: every cheat counts for RecompLauncher */
 #define PS3_CHEAT_NO_CASUAL 0
@@ -87,7 +89,33 @@
 #include <string.h>
 #ifndef _WIN32
 #include <sys/stat.h>
+
 #endif
+
+/* The game's own functions this file calls (slim split, 2026-11-14): they are the game module's,
+ * built on the player's PC, so they are found by guest address in its function table (once per
+ * call site) instead of being linked by name. */
+static ppu_hook_body cheats_game_fn(uint32_t addr)
+{
+    ppu_hook_body f = (ppu_hook_body)ps3_module_ppu_fn(addr);
+    if (!f) {
+        fprintf(stderr, "[cheats] FATAL: the game module has no function at 0x%08X\n", addr);
+        fflush(stderr);
+        abort();
+    }
+    return f;
+}
+#define CHEATS_GAME_FN(addr) ([]() -> ppu_hook_body { static const ppu_hook_body f = cheats_game_fn(addr); return f; }())
+#define func_0012F6E0 CHEATS_GAME_FN(0x0012F6E0u)
+#define func_0012FC6C CHEATS_GAME_FN(0x0012FC6Cu)
+#define func_00130228 CHEATS_GAME_FN(0x00130228u)
+#define func_001307C4 CHEATS_GAME_FN(0x001307C4u)
+#define func_00154CB4 CHEATS_GAME_FN(0x00154CB4u)
+#define func_00154DB4 CHEATS_GAME_FN(0x00154DB4u)
+#define func_002F96AC CHEATS_GAME_FN(0x002F96ACu)
+#define func_0030EFF0 CHEATS_GAME_FN(0x0030EFF0u)
+#define func_00363E54 CHEATS_GAME_FN(0x00363E54u)
+#define func_004AE348 CHEATS_GAME_FN(0x004AE348u)
 
 /* The in-game menu (libs/video/vk_overlay.cpp): 1 while F2's menu is open. The karma rank pick waits for 0. */
 extern "C" int vk_overlay_menu_open(void);
@@ -1863,8 +1891,7 @@ ps3_cheat s_spot = { "spot", "Spot", s_spot_help, "Saved spots", PS3_CHEAT_CHOIC
 ps3_cheat s_spotgo = { "spotgo", "Go to saved spot (F7)", s_go_help, "Saved spots", PS3_CHEAT_ACTION, apply_spot_go,
     0, 0, 0, NULL, NULL, 0, NULL, PS3_CHEAT_HOTKEY };
 ps3_cheat s_spotsave = { "spotsave", "Save this spot",
-    "Adds where Cole stands now, the way he faces and the camera's angles as a new spot (Spot 1, Spot 2, ...) "
-    "and picks it.", "Saved spots", PS3_CHEAT_ACTION, apply_spot_save, 0, 0, 0, NULL, NULL, 0, NULL, PS3_CHEAT_NO_CASUAL };
+    "Adds where Cole stands now (and the camera) as a new spot.", "Saved spots", PS3_CHEAT_ACTION, apply_spot_save, 0, 0, 0, NULL, NULL, 0, NULL, PS3_CHEAT_NO_CASUAL };
 
 /* The page's texts and the combo (menu thread; also at start). spots.ini changed on disk: read again. */
 void spots_texts_locked()
@@ -1875,16 +1902,14 @@ void spots_texts_locked()
     const char* where = s_spots_path[0] ? s_spots_path : "this session only (PS3_CHEATS_SPOTS is empty)";
     if (s_nspots) {
         const Spot& s = s_spots[s_spot_sel];
-        snprintf(s_spot_help, sizeof s_spot_help, "x %.0f  y %.0f  z %.0f, %s, %s. Spots are kept in %s: rename or delete "
-                 "them there.", (double)s.x, (double)s.y, (double)s.z, s.has_facing ? "facing as saved" : "facing as Cole is",
-                 s.has_cam ? "camera as saved" : "camera as it is", where);
+        snprintf(s_spot_help, sizeof s_spot_help, "The spot Go to saved spot (F7) uses. Kept in %s.\nx %.0f  y %.0f  z %.0f, %s, %s.",
+                 where, (double)s.x, (double)s.y, (double)s.z, s.has_facing ? "facing as saved" : "facing as Cole is",
+                 s.has_cam ? "camera as saved" : "camera as it is");
     } else
-        snprintf(s_spot_help, sizeof s_spot_help, "No saved spots: Save this spot adds one. Spots are kept in %s.", where);
+        snprintf(s_spot_help, sizeof s_spot_help, "No saved spots yet: Save this spot adds one.\nKept in %s.", where);
     char st[240];
     { std::lock_guard<std::mutex> g(s_req_lock); snprintf(st, sizeof st, "%s", s_spot_status); }
-    snprintf(s_go_help, sizeof s_go_help, "Puts Cole at the picked spot, standing still and facing the saved way, and turns "
-             "the camera to the saved view (the game's own placing, as when it puts Cole back after a test play). Use it "
-             "in free play with Cole on his feet. F7 does it too, with the menu open or closed.%s%s",
+    snprintf(s_go_help, sizeof s_go_help, "Puts Cole at the picked spot (F7 too, menu open or closed).%s%s",
              st[0] ? "\nLast: " : "", st);
 }
 
@@ -2025,41 +2050,38 @@ const char* const kSpeed[] = { "Normal", "Frozen", "Quarter speed", "Half speed"
 const char* const kGlide[] = { "Normal", "Longer", "2x as long", "3x as long" };   /* gravity /2, /4, /8: measured 3.1 s -> 6.4 s / 9.2 s */
 
 ps3_cheat s_god = { "god", "Invincibility",
-    "Cole's health never drops (healing still works). If you get stuck where the game expects you to "
-    "die, such as deep water, switch it off.", "Cole", PS3_CHEAT_TOGGLE, apply_god };
+    "Cole's health never drops. Switch it off if you get stuck in deep water.", "Cole", PS3_CHEAT_TOGGLE, apply_god };
 ps3_cheat s_energy = { "energy", "Infinite energy",
-    "Electricity refills every frame: use any power as often as you like.", "Cole", PS3_CHEAT_TOGGLE, apply_energy };
+    "Electricity refills every frame.", "Cole", PS3_CHEAT_TOGGLE, apply_energy };
 char s_ionic_help[600];
 ps3_cheat s_ionic = { "ionic", "Infinite ionic charges", s_ionic_help, "Cole", PS3_CHEAT_TOGGLE, apply_ionic };
 ps3_cheat s_jump = { "jump", "Super jump", "How high Cole jumps.", "Cole", PS3_CHEAT_CHOICE, apply_jump,
     0, 0, 0, NULL, kJump, 5 };
 ps3_cheat s_glide = { "glide", "Longer glide",
-    "Cole sinks more slowly while gliding with the Static Thrusters (hold R1 in the air), so a glide lasts "
-    "longer and goes farther. Only the glide changes: jumps, falls and everyone else are as normal.", "Cole",
+    "Cole sinks more slowly while gliding (hold R1 in the air).", "Cole",
     PS3_CHEAT_CHOICE, apply_glide, 0, 0, 0, NULL, kGlide, 4 };
 ps3_cheat s_onehit = { "onehit", "One-hit kills",
-    "Anyone Cole hurts dies from that hit. Hits from others are unchanged.", "Enemies", PS3_CHEAT_TOGGLE, apply_onehit };
+    "Anyone Cole hurts dies from that hit.", "Enemies", PS3_CHEAT_TOGGLE, apply_onehit };
 ps3_cheat s_speed = { "speed", "Enemy speed", "How fast enemies and other people move.", "Enemies",
     PS3_CHEAT_CHOICE, apply_speed, 0, 0, 0, NULL, kSpeed, 5 };
 ps3_cheat s_noattack = { "noattack", "Enemies hold fire",
-    "Most enemies never attack. Turrets and some mission enemies still do.", "Enemies", PS3_CHEAT_TOGGLE, apply_noattack };
+    "Most enemies never attack (turrets and some mission ones still do).", "Enemies", PS3_CHEAT_TOGGLE, apply_noattack };
 ps3_cheat s_xpc = { "xp", "Add XP", "Experience to spend on powers (pause menu, Powers).", "Progress",
     PS3_CHEAT_ACTION, apply_xp, 5000, 500, 50000, "%d XP", NULL, 0, "Add XP", PS3_CHEAT_SAVES };
 ps3_cheat s_maxbat = { "maxbat", "Max battery",
-    "Cole's battery at its full size (every blast shard level and both battery upgrades). The game "
-    "does not save it; Remember cheats switches it on again at the next start.", "Cole", PS3_CHEAT_TOGGLE, apply_maxbat };
+    "Cole's battery at its full size (not saved by the game).", "Cole", PS3_CHEAT_TOGGLE, apply_maxbat };
 ps3_cheat s_kside = { "karmaside", "Karma lock",
-    "Karma moves only towards the chosen side; the game ignores changes towards the other one.",
+    "Karma moves only towards the chosen side.",
     "Karma", PS3_CHEAT_CHOICE, apply_kside, 0, 0, 0, NULL, kKarmaSide, 3, NULL, PS3_CHEAT_SAVES };
 ps3_cheat s_kmult = { "karmamult", "Karma multiplier",
-    "Karma gains of the locked side (of both sides when the lock is off) count this many times.",
+    "Karma gains count this many times.",
     "Karma", PS3_CHEAT_INT, apply_kmult, 1, 1, 10, "%dx", NULL, 0, NULL, PS3_CHEAT_SAVES };
 ps3_cheat s_kxp = { "karmaxp", "XP for karma",
-    "Each karma point gained on the locked side (either side when the lock is off) also gives this much XP.",
+    "Each karma point gained also gives this much XP.",
     "Karma", PS3_CHEAT_INT, apply_kxp, 0, 0, 20, "%d XP per point", NULL, 0, NULL, PS3_CHEAT_SAVES };
-ps3_cheat s_kblue = { "karmablue", "hero karma", NULL, "Karma", PS3_CHEAT_ACTION, apply_kblue,
+ps3_cheat s_kblue = { "karmablue", "hero karma", "Adds this much hero karma.", "Karma", PS3_CHEAT_ACTION, apply_kblue,
     500, 50, 2500, "%d", NULL, 0, "Add hero karma (blue)", PS3_CHEAT_SAVES };
-ps3_cheat s_kred = { "karmared", "infamous karma", NULL, "Karma", PS3_CHEAT_ACTION, apply_kred,
+ps3_cheat s_kred = { "karmared", "infamous karma", "Adds this much infamous karma.", "Karma", PS3_CHEAT_ACTION, apply_kred,
     500, 50, 2500, "%d", NULL, 0, "Add infamous karma (red)", PS3_CHEAT_SAVES };
 
 /* Karma rank: the game's 7 ranks, top hero to top infamous (entry i = game rank 6 - i), with their ranges. */
@@ -2107,23 +2129,14 @@ void l_texts()
     const uint32_t ref = vm_read32(kEvilShaderRef);
     const long long sw = s_bl_swaps.load(), calls = s_bl_calls.load();
     snprintf(s_black_help, sizeof s_black_help,
-             "Electric arcs are drawn with the shader the game keeps for evil lightning (all its variants) instead of "
-             "their own: L_'s \"Black Lightning\", made for evil (infamous) karma. The code itself does not look at "
-             "karma; it needs the game to have that shader set (the line below says). Patch by L_ (RPCS3), re-made "
-             "for the port.\nNow: the game's evil-lightning shader is %s%s",
+             "Arcs use the game's evil-lightning shader (L_'s Black Lightning patch).\nNow: the shader is %s%s",
              gptr(ref) ? "set" : "NOT set (nothing changes until the game sets it)",
              !g_black ? "." : sw ? "; arcs redrawn with it since switching on." : calls ? "; arcs seen, none redrawn yet." :
                                                                            "; no arc drawn yet since switching on.");
     snprintf(s_fly_help, sizeof s_fly_help,
-             "While gliding (hold R1 in the air): hold Cross to climb, Circle to dive, neither to hover. Needs the game's "
-             "Improved Static Thrusters upgrade (L_'s name; in the code the last of the three thrusters upgrades, power "
-             "0x4C): without it nothing changes and the glide is the game's own. Circle in the air may also start the game's drop attack. Patch by L_ "
-             "(RPCS3), re-made for the port.\n%s", thr_tier_text());
+             "Gliding: hold Cross to climb, Circle to dive (needs Improved Static Thrusters; L_'s patch).\n%s", thr_tier_text());
     snprintf(s_fast_help, sizeof s_fast_help,
-             "Half a second into a glide Cole flies forward at this speed instead of the game's 1350 (upgraded "
-             "thrusters). Needs a Static "
-             "Thrusters upgrade (any of them, power 0x4A or later): without one nothing changes. Patch by L_ (RPCS3, "
-             "2000), re-made for the port.\n%s", thr_tier_text());
+             "Glide speed instead of the game's 1350 (needs a thrusters upgrade; L_'s patch).\n%s", thr_tier_text());
     /* karma rank: the current one (unless a pick waits), the pick, the values */
     const float k = rdf(kKarma);
     const int now = rank_of(k);
@@ -2131,14 +2144,10 @@ void l_texts()
     if (!pend) s_krank.value = kRanks - 1 - now;
     const int want = pend ? g_krank_want.load() : now;
     char pick[200] = "";
-    if (pend) snprintf(pick, sizeof pick, "Changes to %s (karma %.0f) when you close the menu.\n", kRankName[want],
+    if (pend) snprintf(pick, sizeof pick, "changes to %s (karma %.0f) when you close the menu", kRankName[want],
                        (double)kRankKarma[want]);
-    snprintf(s_krank_help, sizeof s_krank_help,
-             "%sNow: %s (karma %.0f). Picking a rank sets karma to the middle of it (Hero 2850, Champion 1750, Guardian "
-             "500, Neutral 0, Thug -500, Outlaw -1750, Infamous -2850) through the game's own karma setter when you "
-             "close the menu, so the karma meter, the rank screen and Cole's look follow. The change is real: the game "
-             "writes it into your save the next time it saves. Karma lock does not block it.",
-             pick, kRankName[now], (double)k);
+    snprintf(s_krank_help, sizeof s_krank_help, "Sets karma to the middle of the rank when you close the menu.\nNow: %s (karma %.0f)%s%s.",
+             kRankName[now], (double)k, pick[0] ? "; " : "", pick);
 }
 
 /* Unlock all powers: the page's texts (menu thread; guest reads only). */
@@ -2153,18 +2162,9 @@ void pw_texts()
         }
         snprintf(now, sizeof now, "\nNow: %d of the game's %d power numbers owned.", owned, kNPowers);
     }
-    snprintf(s_pw_help, sizeof s_pw_help,
-             "Every power in the game is Cole's: bought, unlocked and not switched off by a mission, through the game's "
-             "own power code, so the Powers menu and the power wheel show them at once. Karma does not matter while "
-             "this is on (hero and evil powers together). It checks again every second, so the story cannot take "
-             "them back. Off stops that and takes nothing away.\n"
-             "PERMANENT: the game writes the powers into the save that is loaded the next time it saves. A mission "
-             "that rewards a power may not count your progress while you already own it (bungholio saw it with the "
-             "Pincer Bolt).%s", now);
+    snprintf(s_pw_help, sizeof s_pw_help, "Every power is Cole's at once, hero and evil. Permanent once the game saves.%s", now);
     snprintf(s_pwboth_help, sizeof s_pwboth_help,
-             "Hero and evil karma powers work together, at any karma: the game's own rule once both endings are done "
-             "(its power code skips the karma checks then). Nothing is written to the save; off = the karma rules "
-             "again. Unlock all powers does this too while it is on.%s",
+             "Hero and evil karma powers work together. Nothing is saved.%s",
              ppu_hook_exists(kFnPowerWord) ? "" : "\nThis build lacks its two hook slots (a new lift is needed).");
 }
 
@@ -2175,9 +2175,7 @@ void ionic_text()
     if (const uint32_t c = vm_base ? player() : 0)
         snprintf(now, sizeof now, "\nNow: %d of %d.", (int32_t)vm_read32(kIonicCount), (int32_t)vm_read32(c + kColeIonicMax));
     snprintf(s_ionic_help, sizeof s_ionic_help,
-             "Cole always has 3 ionic charges, the game's most, whether or not the story has given him any yet: they "
-             "refill the moment one is used, so the Ionic powers fire as often as you like (they also need the Ionic "
-             "powers themselves: Unlock all powers). The game saves the count.%s", now);
+             "Always 3 ionic charges (the Ionic powers need Unlock all powers).%s", now);
 }
 
 void refresh()

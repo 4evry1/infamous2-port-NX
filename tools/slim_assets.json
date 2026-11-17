@@ -1,0 +1,93 @@
+{
+ "format": 1,
+ "made": "2026-11-17 06:30:58",
+ "release": "v0.6.0",
+ "engine_kit": "b566b3ab491f",
+ "module": {
+  "abi": 2,
+  "layout": [
+   1104,
+   1100,
+   279520,
+   265840,
+   24,
+   2733544116,
+   2973121090,
+   2
+  ],
+  "file": {
+   "windows": "Infamous2Game.dll",
+   "linux": "libInfamous2Game.so"
+  },
+  "entry": "ps3_game_module",
+  "env_override": "PS3_GAME_MODULE",
+  "next_to": "Infamous2Recomp.exe (the engine finds the module beside itself)",
+  "built_by": "tools/rebuild_win.py with PORT_ENGINE_EXE=<engine exe> PORT_LLVM=<toolchain> (steps inputs..compile; compile = tools/build_module.py)",
+  "sample_build": "clang 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1), no PGO"
+ },
+ "total_download_bytes": 45949429,
+ "assets": [
+  {
+   "role": "engine",
+   "name": "Infamous2-engine-win-x64.zip",
+   "unpack": "zip",
+   "into": "tools-cache\\slim\\engine",
+   "contents": [
+    "Infamous2Recomp.exe",
+    "SDL2.dll"
+   ],
+   "files_sha256": {
+    "Infamous2Recomp.exe": "31D4F86E7AD02EF340B667EB833D8E1CC04023E51AE8D4BC6042886D0DA31251",
+    "SDL2.dll": "F1A82C299206D5BD3231F5EDB16FB7F33AAF4DC7C20BF57C25CF8E92EDA6EC72"
+   },
+   "release": "v0.6.0",
+   "size": 3693658,
+   "sha256": "7F70542D05A904B93C574DB98774F746790E0A4C4876FD12CD1E18F3164437E7"
+  },
+  {
+   "role": "toolchain",
+   "name": "llvm-22.1.8-slim-win-x64.7z",
+   "unpack": "7z (Windows tar.exe: tar -xf <file> -C <dir>)",
+   "into": "tools-cache\\slim\\llvm",
+   "version": "22.1.8",
+   "unpacked_bytes": 185486710,
+   "contents": [
+    "bin/clang.exe",
+    "bin/lld.exe",
+    "bin/llvm-profdata.exe",
+    "lib/clang/22/include/ (177 x86 headers)",
+    "lib/clang/22/lib/windows/clang_rt.profile-x86_64.lib",
+    "LICENSE.TXT"
+   ],
+   "use": "PORT_LLVM=<that folder> (tools/build_module.py: clang.exe --driver-mode=cl, lld.exe -flavor link)",
+   "release": "v0.6.0",
+   "size": 29139370,
+   "sha256": "C8BA2E2E45E63C2ECEDC1D7C75E337793094D60BA420A679FE7A4AAB25D5F5D7"
+  },
+  {
+   "role": "python",
+   "name": "python-3.13.17-embed-amd64.zip",
+   "unpack": "zip",
+   "into": "tools-cache\\slim\\python",
+   "version": "3.13.17",
+   "after_unpack": "delete python3XX._pth (with it the lifter scripts cannot import their sibling modules: no script folder on sys.path); then run tools with -E -s or -I",
+   "upstream": "https://www.python.org/ftp/python/3.13.17/python-3.13.17-embed-amd64.zip",
+   "release": "v0.6.0",
+   "size": 11441267,
+   "sha256": "9E35319BFFEDAB8B36AD44D8F377CB4F1733BCEC257A0B6D04D94F01486DDB38"
+  },
+  {
+   "role": "pycrypto",
+   "name": "pycryptodome-4.3.0-cp39-abi3-win_amd64.whl",
+   "unpack": "zip",
+   "into": "tools-cache\\slim\\python\\Lib\\site-packages",
+   "version": "4.3.0",
+   "optional": true,
+   "use": "tools/ps3tool.py is fast with it (Sony's packages in seconds, not minutes)",
+   "upstream": "https://pypi.org/project/pycryptodome/4.3.0/",
+   "release": "v0.6.0",
+   "size": 1675134,
+   "sha256": "195C9D781905605B3B9DE8567C47986A9D0EE513566B5150EB9400692465B610"
+  }
+ ]
+}

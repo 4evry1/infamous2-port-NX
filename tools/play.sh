@@ -3,8 +3,10 @@
 #   tools/play.sh [--fullscreen] [--volume 0-100] [--fps N] [--spu-lighting] [--no-log] [--no-hud]
 #                 [--no-kbm] [--trace] [--exe <path>]
 # In the game: F1 FPS counter, F2 (or hold L3+R3) the PC settings menu, Alt+Enter / F11 fullscreen,
-# F9 marks a slow moment in the session log. The menu saves to ~/.config/infamous2-port/settings.ini
-# ($XDG_CONFIG_HOME); --fps / --volume / --fullscreen given here win over it for this session.
+# F9 marks a slow moment in the session log. The menu saves to settings.ini in the port's folder (v0.6.0: with
+# mods.ini, spots.ini and the shader cache in work/shader_cache, so the folder can be moved or copied and plays the
+# same; the files of ~/.config/infamous2-port are copied in once); --fps / --volume / --fullscreen given here win
+# over it for this session.
 # Controls: any controller SDL knows (buttons by position, as on a PlayStation pad); keyboard + mouse
 # (WASD, mouse = camera after a click in the window, right button = aim, left = R1, Space = Cross,
 # Shift = Circle, F = Square, Q = Triangle, Enter = START, Esc = PC menu). Remapping: input.toml in
@@ -121,6 +123,24 @@ defaults+="PS3RECOMP_SSAO_STRENGTH=125;PS3RECOMP_LIGHT_DITHER=1;PS3RECOMP_FX_RES
 if [ "$(cat /sys/devices/virtual/dmi/id/board_vendor 2>/dev/null)" = Valve ]; then
     defaults="${defaults/PS3RECOMP_RENDER_SCALE=1.5/PS3RECOMP_RENDER_SCALE=1.0};PS3RECOMP_VK_FULLSCREEN=1"
 fi
+# everything in the port's folder (v0.6.0); an older version's files copied in once (they stay where they were)
+if [ ! -f "$root/work/settings-moved-in.txt" ]; then
+    oldcfg="${XDG_CONFIG_HOME:-$HOME/.config}/infamous2-port"; took=""
+    for f in settings.ini mods.ini spots.ini; do
+        if [ -f "$oldcfg/$f" ] && [ ! -f "$root/$f" ]; then cp -p "$oldcfg/$f" "$root/$f" && took="$took $f"; fi
+    done
+    oldsc="${XDG_CACHE_HOME:-$HOME/.cache}/ps3recomp/shader_cache"
+    if [ ! -d "$root/work/shader_cache" ]; then
+        for d in "$oldsc"/inFAMOUS*; do [ -d "$d" ] && cp -a "$d" "$root/work/shader_cache" && took="$took shader-cache" && break; done
+    fi
+    [ -n "$took" ] && echo "Your settings are kept in this folder now: copied in$took (those files stay where they were)."
+    mkdir -p "$root/work" && echo "$(date '+%F %T')$took" > "$root/work/settings-moved-in.txt"
+fi
+[ -n "${PS3_OVERLAY_INI+x}" ] || export PS3_OVERLAY_INI="$root/settings.ini" PS3_CHEATS_SPOTS="$root/spots.ini" PS3_GAME_MODS_STATE="$root/mods.ini"
+[ -n "${PS3RECOMP_VK_SHADER_CACHE+x}" ] || export PS3RECOMP_VK_SHADER_CACHE="$root/work/shader_cache"
+if ! grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+    echo "This PC's CPU has no AVX2, and the game is built for CPUs with it (Intel 4th gen / AMD Ryzen or newer)."; exit 1
+fi
 export PS3_VFS_ROOT="$game/disc" PS3_HDD0_ROOT="$game/dev_hdd0" PS3_DEV_FLASH="$flash" \
        PS3_GAMEDATA_ROOT="$game/gamedata" PS3_TITLE="inFAMOUS 2" PS3_GAME_MODS_DIR="$mods" \
        PS3_LAUNCHER_RESTART=1 GCM_SEMA_ACQUIRE=1 GCM_SEMA_ACQUIRE_MS=200 GCM_PARK_GRACE_MS=1000 \
@@ -129,6 +149,7 @@ export PS3_VFS_ROOT="$game/disc" PS3_HDD0_ROOT="$game/dev_hdd0" PS3_DEV_FLASH="$
        SDL_GAMECONTROLLER_USE_BUTTON_LABELS=0 SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
 if [ $spulight = 0 ]; then export PS3RECOMP_ENG_GPU_LIGHT=07000B80:07384B80 PS3RECOMP_ENG_GPU_SSAO=0F800000; fi
 [ -f "$toml" ] && export PS3_INPUT_MAP="$toml"
+[ -f "$root/supporters.json" ] && export PS3_SUPPORTERS_FILE="$root/supporters.json"   # F2 > About: the list that came with this copy (nothing is fetched here)
 [ $fullscreen = 1 ] && export PS3RECOMP_VK_FULLSCREEN=1
 [ -n "$fps" ] && export PS3RECOMP_FPS_CAP="$fps"
 [ -n "$volume" ] && export PS3_AUDIO_VOLUME="$volume"

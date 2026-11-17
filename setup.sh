@@ -8,8 +8,8 @@
 #   ./setup.sh --prepare --disc <folder> [--dry-run]   for launchers (recomplauncher.json, as Setup.exe --prepare):
 #                                 build only, no message boxes, no desktop entry, Setup.exe's exit codes
 #                                 (71 no PS3_GAME, 79 the build failed: play/setup.log); --game = --disc
-# The game is built from YOUR copy, here, once: nothing of the game is in this download. You need RPCS3 with the
-# PS3 firmware and the game's 1.04 update installed (RPCS3: File > Install Firmware / Install Packages).
+# The game is built from YOUR copy, here, once: nothing of the game is in this download. RPCS3 is not needed: the
+# game's update and the PS3 firmware files come from Sony's own servers (or from RPCS3, when it has them).
 # Your game folder is found in RPCS3's game list (games.yml) when you added it there; otherwise you are asked.
 set -u -o pipefail
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -23,7 +23,9 @@ prepare=0; dry=0   # --prepare: a launcher's setup step (see the top)
 say() { printf '%s\n' "$*"; }
 gui_msg() {   # a message box when there is no terminal (a launcher started us), else the terminal
     if [ -t 1 ] || [ $prepare = 1 ]; then say "$1"; return; fi   # --prepare: the launcher shows the exit code's message
-    if command -v zenity >/dev/null 2>&1; then zenity --info --title="inFAMOUS 2" --width=520 --text="$1" 2>/dev/null
+    # (zenity's text is Pango markup: a "&" or "<" in a folder name would hide the whole message)
+    local m; m="$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+    if command -v zenity >/dev/null 2>&1; then zenity --info --title="inFAMOUS 2" --width=520 --text="$m" 2>/dev/null
     elif command -v kdialog >/dev/null 2>&1; then kdialog --title "inFAMOUS 2" --msgbox "$1" 2>/dev/null
     else say "$1"; fi
 }
@@ -46,7 +48,7 @@ find_disc() {
 }
 ask_disc() {
     local d=""
-    local text="Choose your inFAMOUS 2 game folder: the one that holds PS3_GAME (Europe or US disc, set up in RPCS3)."
+    local text="Choose your inFAMOUS 2 game folder: the one that holds PS3_GAME (your Europe or US disc's files)."
     if [ -t 0 ]; then
         say "$text"; read -r -p "Game folder: " d
     elif command -v zenity >/dev/null 2>&1; then
@@ -70,7 +72,7 @@ build() {
         [ -z "$disc" ] && disc="$(find_disc)"
         [ -z "$disc" ] && disc="$(ask_disc)"
         if [ -z "$disc" ]; then
-            gui_msg "Setup needs your inFAMOUS 2 game folder (the one holding PS3_GAME). Add the game to RPCS3's list, or run: ./setup.sh --disc <your game folder>"
+            gui_msg "Setup needs your inFAMOUS 2 game folder (the one holding PS3_GAME). Run: ./setup.sh --disc <your game folder>"
             exit 2
         fi
         say "Your game folder: $disc"
