@@ -16,7 +16,7 @@ want = {   # module -> the hooks (spu_native_entry) its lift must carry
     "jobmod_867e5d2348b3_e2898": ["0x4358u", "0x698Cu"],
     "jobmod_7393701cbd39_e1390": ["0x4030u"],
     "jobmod_867e48f161e0_e10e8": ["0x4030u"],
-    "jobmod_87926738de5c_e4640": ["0x45F8u"],
+    "jobmod_87926738de5c_e4640": ["0x45F8u", "0x40E8u", "0x54E8u", "0x5118u", "0x6EB8u", "0x7860u", "0x67A8u"],
     "jobmod_9cb47b0cc0eb_e60c0": ["0x68D8u"],
     "jobmod_87c8e5f63136_e2f28": ["0x701Cu"],
     "jobmod_ab654d30fd90_efe70": ["0x16320u", "0x17280u", "0x1C510u", "0x17780u", "0x18B80u", "0x5814u"],

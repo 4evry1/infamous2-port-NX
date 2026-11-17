@@ -26,11 +26,16 @@ jobmod_7393701cbd39_e1390 0x4030
 # all of it in the per-box loop. PS3_NATIVE_J209=0 in env.txt turns it off, =2 is a check run against the lifted worker.
 jobmod_867e48f161e0_e10e8 0x4030
 #
-# image 211 (jobmod_87926738de5c_e4640): the normal-map stage of the 64 x 64 grid simulation, 0x45F8 (switch/natives/
-# job211_native.c, written for this port): the tables, the two lifted transform passes (it calls them), then the 4096-texel
-# normal map and the mip chain. 0.54% of the busy samples lifted. PS3_NATIVE_J211=0 in env.txt turns it off, =2 is a
-# check run against the lifted function.
-jobmod_87926738de5c_e4640 0x45F8
+# image 211 (jobmod_87926738de5c_e4640): the 64 x 64 grid simulation of the water (switch/natives/job211_native.c, written
+# for this port). 0x45F8 is the normal-map stage: the tables, the spectrum and the two transform passes (it calls them
+# as lifted functions), then the 4096-texel normal map and the mip chain (0.54% of the busy samples lifted). The
+# functions it calls are hooked one by one: 0x40E8 the spectrum (with its angle wrap 0x4030), and the passes of the real
+# 2-D transform that 0x80B8 runs (0x80B8 itself stays lifted): 0x54E8 the bit reversal of the rows, 0x6EB8 the column
+# transform, 0x5118 the bit reversal inside each row, 0x7860 the real-transform step of each row, 0x67A8 the row
+# transform (0x80B8 ends in it; it is reached as a tail call). Together they were 1.0% of the busy samples lifted.
+# PS3_NATIVE_J211=0 in env.txt turns all of it off, =2 is a check run against the lifted functions,
+# PS3_NATIVE_J211_PASSES=<hex mask> chooses the hooks (3F all, 0 none, bit 0 0x40E8 ... bit 5 0x67A8).
+jobmod_87926738de5c_e4640 0x45F8 0x40E8 0x54E8 0x5118 0x6EB8 0x7860 0x67A8
 #
 # image 216 (jobmod_9cb47b0cc0eb_e60c0): the BSP polygon clipper 0x68D8 (natives/spu/job216_bsp_native.c; it undoes
 # itself and lets the lifted code run on any input it cannot take). PS3_NATIVE_J220=0 in env.txt turns it off.
