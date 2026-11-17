@@ -4178,25 +4178,50 @@ static int vk_create_swapchain(void)
         VK_LOG("swapchain images cannot be blit destinations\n"); return -1;
     }
 
+    /* The whole list, however long. It used to be read into 64 slots and a longer list counted as a
+     * failure (VK_INCOMPLETE = VkResult 5), which dropped the window: sound, no picture. That is
+     * what the log of GitHub #54 shows for a Wayland surface (Hyprland, Mesa RADV; #44 the same): Mesa
+     * lists a Wayland surface's formats once per colour space. An X11 surface lists a handful, which is
+     * why SDL_VIDEODRIVER=x11 worked. */
     u32 nf = 0;
-    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, NULL),
-             "vkGetPhysicalDeviceSurfaceFormatsKHR");
-    if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
-    if (nf > 64) nf = 64;
-    VkSurfaceFormatKHR fmts[64];
-    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts),
-             "vkGetPhysicalDeviceSurfaceFormatsKHR");
-    /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
+    VkSurfaceFormatKHR* fmts = NULL;
+    for (int tries = 0; ; tries++) {
+        VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, NULL),
+                 "vkGetPhysicalDeviceSurfaceFormatsKHR");
+        if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
+        fmts = (VkSurfaceFormatKHR*)malloc((size_t)nf * sizeof *fmts);
+        if (!fmts) { VK_LOG("surface formats: out of memory (%u)\n", nf); return -1; }
+        const VkResult fr = pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts);
+        /* INCOMPLETE: the list grew between the two calls. Ask again; after a few tries what was read
+         * is a valid part of the list and is used as it is. */
+        if (fr == VK_SUCCESS || (fr == VK_INCOMPLETE && tries >= 3 && nf)) break;
+        free(fmts); fmts = NULL;
+        if (fr != VK_INCOMPLETE || nf == 0) {
+            VK_LOG("vkGetPhysicalDeviceSurfaceFormatsKHR failed (VkResult %d)\n", (int)fr); return -1;
+        }
+    }
+    /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. Of the entries with that
+     * format, the plain sRGB colour space (a long list also has the same format with HDR / wide-gamut
+     * colour spaces, which need an extension this instance does not enable). */
     VkSurfaceFormatKHR fmt = fmts[0];
     if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
         fmt.format = VK_FORMAT_B8G8R8A8_UNORM;
+        fmt.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     } else {
         static const VkFormat pref[] = { VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM };
         int found = 0;
-        for (size_t k = 0; k < 2 && !found; k++)
+        for (int srgb_only = 1; srgb_only >= 0 && !found; srgb_only--)
+            for (size_t k = 0; k < 2 && !found; k++)
+                for (u32 i = 0; i < nf; i++)
+                    if (fmts[i].format == pref[k] &&
+                        (!srgb_only || fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)) {
+                        fmt = fmts[i]; found = 1; break;
+                    }
+        if (!found)                           /* neither format: any entry in the sRGB colour space */
             for (u32 i = 0; i < nf; i++)
-                if (fmts[i].format == pref[k]) { fmt = fmts[i]; found = 1; break; }
+                if (fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { fmt = fmts[i]; break; }
     }
+    free(fmts);
     VkFormatProperties fp;
     pvkGetPhysicalDeviceFormatProperties(s_vk.phys, fmt.format, &fp);
     if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Play the native Linux build of inFAMOUS 2 (tools/play.ps1's Linux counterpart).
 #   tools/play.sh [--fullscreen] [--volume 0-100] [--fps N] [--spu-lighting] [--no-log] [--no-hud]
-#                 [--no-kbm] [--trace] [--exe <path>]
+#                 [--no-kbm] [--trace] [--exe <path>] [--wayland]
 # In the game: F1 FPS counter, F2 (or hold L3+R3) the PC settings menu, Alt+Enter / F11 fullscreen,
 # F9 marks a slow moment in the session log. The menu saves to settings.ini in the port's folder (v0.6.0: with
 # mods.ini, spots.ini and the shader cache in work/shader_cache, so the folder can be moved or copied and plays the
@@ -17,10 +17,11 @@
 set -u
 root="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 exe="$root/work/port/build/Infamous2Recomp"
-fullscreen=0; volume=""; fps=""; spulight=0; nolog=0; nohud=0; nokbm=0; trace=0
+fullscreen=0; volume=""; fps=""; spulight=0; nolog=0; nohud=0; nokbm=0; trace=0; wayland=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --fullscreen) fullscreen=1 ;;
+        --wayland) wayland=1 ;;   # a Wayland desktop: never start the game again through X11 (see x11_watch)
         --volume) volume="$2"; shift ;;
         --fps) fps="$2"; shift ;;
         --spu-lighting) spulight=1 ;;
@@ -199,6 +200,33 @@ echo "Starting inFAMOUS 2... F1 = FPS counter, F2 = settings."
 [ $nolog = 0 ] && echo "Press F9 in the game window whenever something feels slow or stutters. Session folder: $out"
 t0=$(date +%s)
 run=0
+# A Wayland desktop where the game's window cannot be made (GitHub #54, #44: the game went on without one: sound,
+# no picture, and nothing to close). The cause seen there is fixed in the engine; should another one drop the
+# window, the game is started once more through X11 (XWayland), which worked for those players. Only when the
+# choice is ours: not with --wayland, not when SDL_VIDEODRIVER is set, not without an X display.
+# x11_watch reads this run's part of stderr.log for up to 90 s: the window's swapchain line = all is well;
+# "window disabled" after SDL chose 'wayland' = stop the game (retry-x11 tells the loop below why).
+x11_retry=0
+if [ $wayland = 0 ] && [ -z "${SDL_VIDEODRIVER+x}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${DISPLAY:-}" ]; then x11_retry=1; fi
+x11_watch() {
+    local n0="$1" pid="" new i
+    for i in $(seq 1 90); do
+        sleep 1
+        if [ -z "$pid" ]; then pid="$(cat "$out/game.pid" 2>/dev/null)"; [ -n "$pid" ] || continue; fi
+        kill -0 "$pid" 2>/dev/null || return 0
+        new="$(tail -n +"$((n0 + 1))" "$out/stderr.log" 2>/dev/null)"
+        case "$new" in
+            *"window disabled, continuing headless"*)
+                case "$new" in *"SDL video driver 'wayland'"*)
+                    : > "$out/retry-x11"; kill "$pid" 2>/dev/null
+                    for i in 1 2 3 4 5; do sleep 1; kill -0 "$pid" 2>/dev/null || return 0; done
+                    kill -9 "$pid" 2>/dev/null ;;
+                esac
+                return 0 ;;
+            *"window swapchain "*) return 0 ;;
+        esac
+    done
+}
 # F2 > Mods > "Restart to apply" ends the game with status 0x52455354 ("REST"; a Linux exit status
 # keeps its low byte, 0x54) and the line "[restart] exit 0x52455354": started again here, same
 # settings, same session folder; the game comes back at its title screen (Continue goes on).
@@ -212,8 +240,19 @@ while :; do
         [ -f "$out/hitches.tsv" ] && mv -f "$out/hitches.tsv" "$out/hitches.$((run - 1)).tsv"
     fi
     n0=0; [ -f "$out/stderr.log" ] && n0=$(wc -l < "$out/stderr.log")
-    (cd "$out" && exec "$exe" "$root/work/EBOOT.elf") >> "$out/stdout.log" 2>> "$out/stderr.log"
+    rm -f "$out/game.pid" "$out/retry-x11"; watch=""
+    if [ $x11_retry = 1 ]; then x11_watch "$n0" & watch=$!; fi
+    (cd "$out" && echo "$BASHPID" > "$out/game.pid" && exec "$exe" "$root/work/EBOOT.elf") >> "$out/stdout.log" 2>> "$out/stderr.log"
     rc=$?
+    if [ -n "$watch" ]; then kill "$watch" 2>/dev/null; wait "$watch" 2>/dev/null; fi
+    if [ -f "$out/retry-x11" ]; then
+        rm -f "$out/retry-x11"; x11_retry=0; run=$((run - 1))
+        export SDL_VIDEODRIVER=x11
+        echo "The game could not open its window on Wayland: starting it again through X11 (XWayland)."
+        echo "Please report it with $out/stderr.log; SDL_VIDEODRIVER=x11 tools/play.sh starts it this way at once."
+        echo "=== $(date +%H:%M:%S) no window on Wayland: started again with SDL_VIDEODRIVER=x11 ===" >> "$out/stderr.log"
+        continue
+    fi
     if [ $rc = 84 ] && tail -n +"$((n0 + 1))" "$out/stderr.log" | grep -q '^\[restart\] exit 0x52455354' && [ $run -lt 20 ]; then
         continue
     fi

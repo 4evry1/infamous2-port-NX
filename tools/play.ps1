@@ -97,6 +97,33 @@ if (-not ((Test-Path -LiteralPath $cpuMark) -and ([IO.File]::ReadAllText($cpuMar
     }
     try { New-Item -ItemType Directory -Force (Split-Path -Parent $cpuMark) | Out-Null; [IO.File]::WriteAllText($cpuMark, $cpuKey) } catch {}
 }
+# The game program of v0.6.1 and older needs Microsoft's Visual C++ runtime, which is not part of Windows: on a PC
+# without it the game did not start (v0.6.2's has it built in). Said here instead: the DLL names the program asks
+# for are in its file as plain text; each must be beside it or in Windows' own folder.
+function Get-MissingRuntime([string]$exePath) {
+    $missing = @()
+    try {
+        $fi = Get-Item -LiteralPath $exePath -ErrorAction Stop
+        if ($fi.Length -gt 64MB) { return $missing }
+        $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($fi.FullName))
+        foreach ($dll in "MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll") {
+            if ($text.IndexOf($dll, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            if (Test-Path -LiteralPath (Join-Path $fi.DirectoryName $dll)) { continue }
+            if (Test-Path -LiteralPath (Join-Path ([Environment]::SystemDirectory) $dll)) { continue }
+            $missing += $dll
+        }
+    } catch {}
+    return $missing
+}
+if (-not $Attach) {
+    $noRt = @(Get-MissingRuntime $Exe)
+    if ($noRt.Count) {
+        "This PC doesn't have Microsoft's Visual C++ runtime ($($noRt -join ', ')), and this version of the game needs it."
+        "Either update the port (run Setup.exe in this folder: v0.6.2 and newer do not need it),"
+        "or install the runtime from Microsoft: https://aka.ms/vs/17/release/vc_redist.x64.exe  Then start the game again."
+        exit 1
+    }
+}
 # The desktop shortcut again when the folder was moved or copied (tools\shortcut.ps1; only an install Setup made one for)
 . (Join-Path $PSScriptRoot "shortcut.ps1")
 Update-PortShortcut $realRoot

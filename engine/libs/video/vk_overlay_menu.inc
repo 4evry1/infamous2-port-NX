@@ -422,7 +422,7 @@ static void page_graphics(Rows& R)
     { MRow& r = mrow_choice(R, "res", "Internal resolution", vs({ "720p", "1080p", "1440p", "4K" }), s_ui.scale,
                             [](int i) { s_ui.scale = i; apply_setting(V_RENDER_SCALE, kScale[i]); });
       const float rs = vk_postfx_render_scale();
-      r.d("Above your screen = sharper image and smoother thin lines.").c(3).live(V_RENDER_SCALE)
+      r.d("The game's resolution: what it is drawn at. Lower = faster, higher = sharper.").c(3).live(V_RENDER_SCALE)
        .st(sfmt("Now %u x %u. A restart is needed to see a change.", (unsigned)(1280.0f * rs * vk_postfx_aspect_k() + 0.5f), (unsigned)(720.0f * rs + 0.5f))); }
     /* [aa] feat/aa: one choice for post AA + MSAA, and the thin-lines switch (vk_overlay_aa.inc) */
     { const int a = aa_choice_get();
@@ -1429,7 +1429,7 @@ static void remap_page(ImDrawList* dl, ImVec2 a, float w, float h, double now, b
             txt(cl, f_semi(), 13, ImVec2(bx0 + S(13), cy - S(8)), C_TEXT, "Reset");
             if (hb && ImGui::IsMouseClicked(0) && s_rm.state == RM_IDLE) { s_rm.state = RM_RESET; s_rm.modal_cancel = false; s_rm.open_reset = true; }
             if (focus) { cd.title = "Reset to defaults"; cd.desc = "Every key, mouse button and controller button back to the defaults.";
-                         cd.status = "F1-F3, F7, F9, F11, Esc, Alt and the Windows key stay the window's."; }
+                         cd.status = "F1-F3, F7, F9, F11, Esc and the Windows key stay the window's. Alt binds; Alt+Enter, Alt+Tab and Alt+F4 still work."; }
             continue;
         }
         const PrmRow& r = prm_rows[i];

@@ -92,10 +92,14 @@ extern "C" int vk_overlay_lowend_auto(unsigned vram_mb, int integrated, const ch
 static void lowend_attach(void)
 {
     if (s_le_auto != 1 || s_le_changed <= 0) return;
-    char b[160];
-    if (s_le_integrated) snprintf(b, sizeof b, "Integrated graphics: lighter settings (F2 > Graphics > Low-end PC)");
-    else snprintf(b, sizeof b, "%.1f GB graphics card: lighter settings (F2 > Graphics > Low-end PC)", (double)s_le_mb / 1024.0);
-    notice_for(b, 8.0);
+    /* what it means for the picture, and where to change it (GitHub #73: "the game uses 1920x1080", the
+     * resolution row not found) */
+    char b[200], what[40];
+    if (vk_postfx_render_scale() <= 1.01f) snprintf(what, sizeof what, "lighter settings, 720p picture");
+    else snprintf(what, sizeof what, "lighter settings");
+    if (s_le_integrated) snprintf(b, sizeof b, "Integrated graphics: %s (F2 > Graphics to change)", what);
+    else snprintf(b, sizeof b, "%.1f GB graphics card: %s (F2 > Graphics to change)", (double)s_le_mb / 1024.0, what);
+    notice_for(b, 10.0);
 }
 
 /* 1 = every setting has the low-end value, 2 = the standard one, 0 = neither */

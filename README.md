@@ -48,6 +48,19 @@ and builds it once. On the test PC the whole install took 12 to 15 minutes.
 
 Linux and the Steam Deck: [see below](#linux-and-steam-deck). More detail on copies and keys: [FAQ](#faq).
 
+## What's new in v0.6.2
+
+A stability update.
+
+- **Windows: no Visual C++ runtime needed.** On a PC without it the game did not start ("MSVCP140.dll was not
+  found"). The game now carries what it needs.
+- **Linux: the game's window opens on Wayland** ([#54](../../issues/54), [#44](../../issues/44)); Setup's folder
+  question no longer becomes the folder; and Setup stops, and says what to do, when the game would be built
+  without its shader translator and draw nothing ([#61](../../issues/61), [#69](../../issues/69)).
+- **Direct mouse: a fast flick turns the camera 1:1** ([#59](../../issues/59)): the whole turn at once, nothing
+  after the mouse stops. And the **Alt keys can be bound** ([#68](../../issues/68)).
+- **Low-end PCs:** the start notice names the 720p picture it chose ([#73](../../issues/73)).
+
 ## What's new in v0.6.1
 
 - **Windows 10: Setup installs again.** v0.6.0 stopped on Windows 10 with *"unpacking llvm-22.1.8-slim-win-x64.7z

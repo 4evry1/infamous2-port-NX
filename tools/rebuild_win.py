@@ -362,13 +362,37 @@ def _hash_tree(h, top):
             _hash_file(h, os.path.relpath(p, top).replace("\\", "/"), p)
 
 
+# What of this script no lift step depends on: the compile side (the engine, the game module), the lines for the
+# player, the PGO reports. A change there alone must not translate the player's game again: v0.6.2 changed only
+# the engine's build and every update would have spent 4 to 7 minutes on a lift that came out byte for byte the
+# same. Everything else in this file counts, as Python reads it (comments and blank lines do not).
+NOT_LIFT = {"step_about", "step_announce", "heartbeat", "pgo_profile_names", "pgo_mismatch_summary",
+            "module_build_dir", "engine_build_dir", "step_compile", "step_module", "step_engine", "linux_tools",
+            "linux_compile_flags", "linux_configure_cmd", "step_engine_linux", "linux_log_has"}
+
+
+def _script_lift_code():
+    """this script without the NOT_LIFT functions and its own doc string, as one text"""
+    import ast
+    with open(os.path.abspath(__file__), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    body = [n for n in tree.body if not (isinstance(n, ast.FunctionDef) and n.name in NOT_LIFT)]
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    tree.body = body
+    return ast.dump(tree, include_attributes=False)
+
+
 def fingerprint(step):
     """What a lift step reads, as one hash."""
     h = hashlib.sha256()
     # (v0.6.0: the folders relative to the port's own, so a moved or copied install keeps its lift)
     rel = lambda p: os.path.relpath(os.path.abspath(p), ROOT).replace("\\", "/") if os.path.splitdrive(os.path.abspath(p))[0].lower() == os.path.splitdrive(ROOT)[0].lower() else os.path.abspath(p)
-    h.update(("\0".join(["lift-v2", step, sys.version, str(os.cpu_count()), rel(TK), rel(PORT)]) + "\0").encode())
-    _hash_file(h, "rebuild_win.py", os.path.abspath(__file__))
+    h.update(("\0".join(["lift-v3", step, sys.version, str(os.cpu_count()), rel(TK), rel(PORT)]) + "\0").encode())
+    try:
+        h.update(b"script" + bytes(1) + hashlib.sha256(_script_lift_code().encode("utf-8")).hexdigest().encode())
+    except (OSError, SyntaxError, ValueError):
+        _hash_file(h, "rebuild_win.py", os.path.abspath(__file__))
     _hash_tree(h, os.path.join(TK, "tools"))
     for k in sorted(os.environ, key=str.upper):
         ku = k.upper()
@@ -887,7 +911,20 @@ def step_engine():
         cache = os.path.join(build, "thinlto-cache").replace("\\", "/")
         cache = '"%s"' % cache if " " in cache else cache
         link_rel += " /opt:lldltojobs=%s /lldltocache:%s /lldltocachepolicy:cache_size_bytes=8g" % (jobs, cache)
+    # The C/C++ runtime inside the exe (/MT), so a PC without the Visual C++ 2015-2022 runtime starts the game
+    # (MSVCP140.dll, VCRUNTIME140.dll and VCRUNTIME140_1.dll were needed and are not part of Windows). One runtime
+    # in the process either way: the game module links none (/NODEFAULTLIB, it calls the engine's) and SDL2.dll
+    # has none. glslang must be built the same way (tools/build_deps.py -> deps/glslang-install-mt); a checkout
+    # that only has the older /MD glslang keeps the DLL runtime, and says so (tools/make_slim_assets.py refuses
+    # such an engine for a release).
+    gl_mt = os.path.join(DEPS, "glslang-install-mt", "lib", "cmake", "glslang")
+    static_crt = os.path.isdir(gl_mt) and os.environ.get("PORT_ENGINE_CRT", "static") != "dll"
+    gl_dir = gl_mt if static_crt else os.path.join(DEPS, "glslang-install", "lib", "cmake", "glslang")
+    if not static_crt:
+        print("  note: this engine needs the Visual C++ runtime DLLs (no deps/glslang-install-mt: run "
+              "tools/build_deps.cmd for an engine that needs none)")
     for cmd in ([cmake, "-S", PORT, "-B", build, "-G", "Ninja"] + (["-DCMAKE_RC_COMPILER=" + rc] if rc else []) + [
+                 "-DCMAKE_MSVC_RUNTIME_LIBRARY=" + ("MultiThreaded" if static_crt else "MultiThreadedDLL"),
                  "-DCMAKE_MAKE_PROGRAM=" + port_paths.get("ninja"),
                  "-DCMAKE_C_COMPILER=clang-cl", "-DCMAKE_CXX_COMPILER=clang-cl",
                  "-DCMAKE_BUILD_TYPE=Release", "-DPS3RECOMP_DIR=" + TK, "-DPython3_EXECUTABLE=" + PY,
@@ -896,7 +933,7 @@ def step_engine():
                  "-DPS3RECOMP_VULKAN_INCLUDE_DIR=" + os.path.join(DEPS, "Vulkan-Headers", "include"),
                  "-DPS3RECOMP_SDL2_INCLUDE_PARENT=" + os.path.join(DEPS, "sdl2-inc"),
                  "-DSDL2_DIR=" + os.path.join(DEPS, "SDL2-2.30.10", "cmake"),
-                 "-Dglslang_DIR=" + os.path.join(DEPS, "glslang-install", "lib", "cmake", "glslang"),
+                 "-Dglslang_DIR=" + gl_dir,
                  # The lifted PPU + firmware TUs: -O2 and AVX2 (FMA3). At the old
                  # -O1/baseline every AltiVec vmaddfp lane was a software fmaf()
                  # call and the main thread was CPU-bound in vector math (2026-11-07).
@@ -917,6 +954,7 @@ def step_engine():
                 [cmake, "--build", build, "-j", jobs, "--", "-k", "0"]):
         logf = os.path.join(LOGS, "compile%s.log" % (("-" + os.path.basename(build)) if os.environ.get("PORT_ENGINE_BUILD") else ""))
         log0 = os.path.getsize(logf) if os.path.exists(logf) else 0
+        os.makedirs(LOGS, exist_ok=True)   # (--only engine in a fresh checkout: no step made it yet)
         with open(logf, "a", encoding="utf-8", errors="replace") as lf:
             lf.write("\n$ " + " ".join(cmd) + "\n")
             lf.flush()
@@ -1024,7 +1062,8 @@ def step_engine_linux():
     jobs = os.environ.get("PORT_JOBS", "8")
     pgo = os.environ.get("PORT_ENGINE_PGO", "")
     flags = linux_compile_flags(build, jobs, pgo, os.environ.get("PORT_LIFT_LTO", "0"), tools["profdata"])
-    for cmd in (linux_configure_cmd(build, tools, flags),
+    # REQUIRE_GUEST_PROGRAMS: no glslang = the configure stops (a game built without it draws nothing: #61, #69)
+    for cmd in (linux_configure_cmd(build, tools, flags) + ["-DPS3RECOMP_REQUIRE_GUEST_PROGRAMS=ON"],
                 [tools["cmake"], "--build", build, "-j", jobs, "--", "-k", "0"]):
         logf = os.path.join(LOGS, "compile%s.log" % (("-" + os.path.basename(build)) if os.environ.get("PORT_ENGINE_BUILD") else ""))
         log0 = os.path.getsize(logf) if os.path.exists(logf) else 0
@@ -1036,10 +1075,24 @@ def step_engine_linux():
             p = run_beating(cmd, PORT, lf, env, logf, log0)
             lf.write(f"[exit {p.returncode} after {time.time() - t0:.1f}s]\n")
         if p.returncode != 0:
+            if cmd[1] == "-S" and linux_log_has(logf, log0, "glslang was not found"):
+                raise StepError("the game's shader translator (glslang) was not found by the build, so the game would "
+                                "show a blank picture. Delete the folders deps/glslang-install-linux and "
+                                "deps/glslang-build-linux and run setup again; if it stops here again, send "
+                                f"{logf} and deps/glslang-build.log")
             raise StepError(f"{cmd[1]} exited {p.returncode} (python -I tools/build_errors.py {logf})")
         if pgo.startswith("use:") and cmd[1] == "--build":
             pgo_mismatch_summary(logf, log0)
     print("  engine built:", os.path.join(build, "Infamous2Recomp"))
+
+
+def linux_log_has(logf, log0, text):
+    try:
+        with open(logf, "rb") as f:
+            f.seek(log0)
+            return text.encode() in f.read()
+    except OSError:
+        return False
 
 
 # The three SPU code bodies libsre's SPURS kernel DMAs into local store (system service,

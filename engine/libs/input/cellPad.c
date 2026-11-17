@@ -1798,16 +1798,20 @@ static void pad_win_keys(uint32_t keys[4], const PadInputMap* map)
         ((GetAsyncKeyState(VK_LMENU) & 0x8000) && !PAD_WANT(0x3Au)) ||
         ((GetAsyncKeyState(VK_RMENU) & 0x8000) && !PAD_WANT(0x3Du)))
         return;
+    /* Alt bound to a control and held (GitHub #68): the game gets it and the other keys, but not the second
+     * key of the window's Alt chords -- Enter (fullscreen), Tab (Alt+Tab), F4 (quit) */
+    const int alt = ((GetAsyncKeyState(VK_LMENU) | GetAsyncKeyState(VK_RMENU)) & 0x8000) != 0;
     for (int i = 0; i < PAD_N_SCAN_KEYS; i++) {
         const unsigned mac = kWinScanMac[i][1];
         if (PAD_WANT(mac) && s_scan_vk[i] && (GetAsyncKeyState(s_scan_vk[i]) & 0x8000)) PAD_SET(mac);
     }
     for (int i = 0; i < PAD_N_VK_KEYS; i++) {
         const unsigned mac = kWinVkMac[i][1];
+        if (alt && (mac == 0x24u || mac == 0x30u || mac == 0x76u)) continue;
         if (PAD_WANT(mac) && (GetAsyncKeyState(kWinVkMac[i][0]) & 0x8000)) PAD_SET(mac);
     }
     /* keypad Enter is VK_RETURN too: one Enter for both */
-    if (PAD_WANT(0x4Cu) && (GetAsyncKeyState(VK_RETURN) & 0x8000)) PAD_SET(0x4Cu);
+    if (!alt && PAD_WANT(0x4Cu) && (GetAsyncKeyState(VK_RETURN) & 0x8000)) PAD_SET(0x4Cu);
 #undef PAD_WANT
 #undef PAD_SET
 }

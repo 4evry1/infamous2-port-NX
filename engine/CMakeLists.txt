@@ -49,6 +49,7 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
 option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
+option(PS3RECOMP_REQUIRE_GUEST_PROGRAMS "Vulkan: fail the configure when glslang (the guest shader translator) is missing" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
     if(APPLE)
@@ -390,6 +391,14 @@ if(PS3RECOMP_RSX_VULKAN)
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
         message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
+        # A game built like this starts and plays its sound but draws one solid colour (GitHub #61, #69).
+        # A player's build asks for the configure to stop here instead, with CMake's own reason.
+        if(PS3RECOMP_REQUIRE_GUEST_PROGRAMS)
+            find_package(glslang CONFIG)   # not QUIET this time: says why it was not taken
+            message(FATAL_ERROR
+                "glslang was not found (glslang_DIR='${glslang_DIR}'), so the game would be built without its "
+                "shader translator: sound, but a blank picture. Nothing was built.")
+        endif()
     endif()
 endif()
 

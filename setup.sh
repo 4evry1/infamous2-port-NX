@@ -46,19 +46,27 @@ find_disc() {
     done
     return 1
 }
+# Prints the chosen folder, and nothing else, on stdout: the caller reads it with $(ask_disc). The question and
+# every message go to stderr (GitHub #54: the question was printed on stdout, so it became the "folder").
 ask_disc() {
     local d=""
     local text="Choose your inFAMOUS 2 game folder: the one that holds PS3_GAME (your Europe or US disc's files)."
     if [ -t 0 ]; then
-        say "$text"; read -r -p "Game folder: " d
+        say "$text" >&2; read -r -p "Game folder: " d
+        # typed or dragged into the terminal: quotes around it, a trailing space, ~ for the home folder
+        d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+        case "$d" in \'*\') d="${d#\'}"; d="${d%\'}" ;; \"*\") d="${d#\"}"; d="${d%\"}" ;; esac
+        case "$d" in "~") d="$HOME" ;; "~/"*) d="$HOME/${d#"~/"}" ;; esac
     elif command -v zenity >/dev/null 2>&1; then
-        d="$(zenity --file-selection --directory --title="$text" 2>/dev/null)"
+        d="$(zenity --file-selection --directory --title="$text" 2>/dev/null | tail -n 1)"
     elif command -v kdialog >/dev/null 2>&1; then
-        d="$(kdialog --getexistingdirectory "$HOME" --title "$text" 2>/dev/null)"
+        d="$(kdialog --getexistingdirectory "$HOME" --title "$text" 2>/dev/null | tail -n 1)"
     fi
-    d="${d%/}"
-    [ -n "$d" ] && [ -f "$d/PS3_GAME/PARAM.SFO" ] && { printf '%s\n' "$d"; return 0; }
-    [ -n "$d" ] && [ -f "$(dirname "$d")/PS3_GAME/PARAM.SFO" ] && { dirname "$d"; return 0; }
+    [ "$d" = "/" ] || d="${d%/}"
+    [ -z "$d" ] && return 1
+    [ -f "$d/PS3_GAME/PARAM.SFO" ] && { printf '%s\n' "$d"; return 0; }
+    [ -f "$(dirname "$d")/PS3_GAME/PARAM.SFO" ] && { dirname "$d"; return 0; }   # PS3_GAME itself was picked
+    say "There is no PS3_GAME/PARAM.SFO in: $d" >&2
     return 1
 }
 

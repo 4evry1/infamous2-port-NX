@@ -33,6 +33,7 @@ import lzma
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -70,6 +71,53 @@ def module_interface(dll):
     return {"abi": i.abi, "layout": [int(x) for x in i.layout], "build": (i.build or b"").decode()}
 
 
+def pe_imports(path):
+    """The DLL names a 64-bit PE file imports (its import table; delay-loaded ones are not in it)."""
+    with open(path, "rb") as f:
+        d = f.read()
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    nsec, optsz = struct.unpack_from("<H", d, pe + 6)[0], struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    if struct.unpack_from("<H", d, opt)[0] != 0x20B:
+        sys.exit("%s: not a 64-bit PE file" % path)
+    imp_rva = struct.unpack_from("<I", d, opt + 112 + 8)[0]   # data directory 1: the import table
+    secs = [struct.unpack_from("<IIII", d, opt + optsz + 40 * i + 8) for i in range(nsec)]   # vsize, rva, rawsize, raw
+
+    def off(rva):
+        for vsize, va, rawsize, raw in secs:
+            if va <= rva < va + max(vsize, rawsize):
+                return rva - va + raw
+        sys.exit("%s: bad import table" % path)
+    names = []
+    o = off(imp_rva) if imp_rva else None
+    while o is not None:
+        name_rva = struct.unpack_from("<I", d, o + 12)[0]
+        if not name_rva:
+            break
+        n = off(name_rva)
+        names.append(d[n:d.index(bytes(1), n)].decode("ascii", "replace"))
+        o += 20
+    return names
+
+
+def check_engine_imports(engine_dir):
+    """The engine starts on a plain Windows 10/11: every DLL it imports is Windows' own or in the zip. The Visual
+    C++ runtime DLLs are neither (an engine built against them did not start on a PC without the runtime)."""
+    have = {n.lower() for n in ENGINE_FILES}
+    sysdir = os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32")
+    bad = []
+    for n in pe_imports(os.path.join(engine_dir, "Infamous2Recomp.exe")):
+        low = n.lower()
+        if low in have or low.startswith(("api-ms-win-", "ext-ms-")):
+            continue
+        if low.startswith(("msvcp", "vcruntime", "concrt", "vcomp", "ucrtbased")) or not os.path.isfile(os.path.join(sysdir, n)):
+            bad.append(n)
+    if bad:
+        sys.exit("the engine imports %s: not part of Windows and not in the zip. Build it with the static C runtime "
+                 "(tools/build_deps.py makes deps/glslang-install-mt, then tools/rebuild_win.py --only engine)."
+                 % ", ".join(bad))
+
+
 def engine_kit():
     try:
         r = subprocess.run(["git", "-C", os.path.join(ROOT, "engine"), "rev-parse", "--short=12", "HEAD"],
@@ -97,6 +145,7 @@ def main():
     assets = []
 
     # ---- the engine
+    check_engine_imports(a.engine_dir)
     eng = os.path.join(a.out, "Infamous2-engine-win-x64.zip")
     with zipfile.ZipFile(eng, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for n in ENGINE_FILES:
