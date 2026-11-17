@@ -330,8 +330,11 @@ def info(path):
         if t not in KNOWN:
             out["problem"] = f"this package is {cid}, not inFAMOUS 2"
         elif lay == "disc":
-            out["problem"] = ("this is an update package of the disc version: Setup gets the updates by itself; choose your "
-                              "game (the disc's folder or .iso) instead")
+            # (an update and a DLC package of a disc title carry the same content-id title: not told apart here)
+            out["problem"] = ("this is an update or DLC package of the disc version, not the game: choose your game (the "
+                              "disc's folder or .iso) instead. Setup gets the updates by itself. For DLC: install the package "
+                              "in RPCS3 and run Setup again, it copies the DLC from there; or put the DLC's unlock files "
+                              "(*.edat) in the port's dlc folder")
         else:
             out["needs"] = ["rap"]
         return out

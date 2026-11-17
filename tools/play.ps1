@@ -246,6 +246,22 @@ if (-not (Test-Path -LiteralPath $modsNote)) {
         """Use this one instead"" is used, else the first by folder name, and the other is left out.")
 }
 
+# DLC (GitHub #48, #56): the "dlc" folder. The game's unlock files (*.edat) put there, in it or in subfolders, are
+# copied to where the game opens them (game\dev_hdd0\game\<ID>\USRDIR\dlc\ulf, lower-case names), only when
+# missing or different (tools\port_paths.ps1). Setup copies RPCS3's the same way. Never stops the game.
+try {
+    $dlcDrop = New-DlcDropFolder $root
+    foreach ($td in @(Get-DlcTitleDirs $game)) {
+        $nNew = Copy-DlcDrop $dlcDrop (Join-Path $td.FullName "USRDIR\dlc\ulf")
+        $dlcHave = @(Get-DlcFiles (Join-Path $td.FullName "USRDIR\dlc"))
+        $dlcLic = Get-DlcNeedLicense $dlcHave
+        "DLC: $(if ($dlcHave.Count) { "$($dlcHave.Count) unlock file(s)" } else { 'none' }) in game\dev_hdd0\game\$($td.Name)\USRDIR\dlc" +
+            $(if ($nNew) { " ($nNew new from the dlc folder)" }) +
+            $(if (-not $dlcHave.Count) { " (optional: put your DLC's *.edat files in the dlc folder)" }) +
+            $(if ($dlcLic) { "; $dlcLic need their license (.rap): not supported yet" })
+    }
+} catch { "DLC: the dlc folder could not be read ($_): the game starts without it" }
+
 $vars = @{
     PS3_VFS_ROOT                = "$game\disc"
     PS3_HDD0_ROOT               = "$game\dev_hdd0"

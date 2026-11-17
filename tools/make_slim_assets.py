@@ -9,10 +9,11 @@ instead of 1.4 GB of build tools. Nothing here is game-derived: the engine exe h
 
 Writes into --out:
   Infamous2-engine-win-x64.zip     Infamous2Recomp.exe + SDL2.dll (the prebuilt engine)
-  llvm-<ver>-slim-win-x64.7z       official LLVM: bin/clang.exe, bin/lld.exe, bin/llvm-profdata.exe,
+  llvm-<ver>-slim-win-x64.tar.xz   official LLVM: bin/clang.exe, bin/lld.exe, bin/llvm-profdata.exe,
                                    lib/clang/<maj>/include (the x86 headers), lib/clang/<maj>/lib/
-                                   windows/clang_rt.profile-x86_64.lib (PGO), LICENSE.TXT. Windows'
-                                   own tar.exe unpacks .7z (tar -xf), no 7-Zip needed on the player's PC.
+                                   windows/clang_rt.profile-x86_64.lib (PGO), LICENSE.TXT. Unpacked by the
+                                   embeddable Python below (its tarfile + lzma), so no tar.exe or 7-Zip is
+                                   needed on the player's PC (Windows 10's tar.exe can't read LZMA).
   python-<ver>-embed-amd64.zip     python.org's embeddable Python, unchanged (its SHA-256 can be checked
                                    against python.org's)
   pycryptodome-<ver>-...whl        (--wheel) PyPI's pycryptodome wheel, unchanged: tools/ps3tool.py unpacks Sony's
@@ -28,11 +29,13 @@ import argparse
 import ctypes
 import hashlib
 import json
+import lzma
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import zipfile
@@ -125,17 +128,30 @@ def main():
         if not os.path.isfile(lic):
             sys.exit("no LLVM license text: --llvm-license <llvm/LICENSE.TXT of the release tag>")
         shutil.copy2(lic, os.path.join(stage, "LICENSE.TXT"))
-        tc = os.path.join(a.out, "llvm-%s-slim-win-x64.7z" % ver)
+        # .tar.xz, unpacked on the player's PC by the port's own Python (tarfile + lzma of its standard library).
+        # Not .7z: Windows 10's tar.exe can't read LZMA ("LZMA codec is unsupported", GitHub #62, #70), only
+        # Windows 11's can, and nothing else on a plain Windows unpacks one.
+        tc = os.path.join(a.out, "llvm-%s-slim-win-x64.tar.xz" % ver)
         if os.path.exists(tc):
             os.remove(tc)
-        p = subprocess.run([a.seven_zip, "a", "-t7z", "-mx=9", "-m0=LZMA2", "-mmt=on", tc, "."], cwd=stage,
-                           capture_output=True, text=True)
-        if p.returncode:
-            sys.exit("7z failed: " + p.stdout[-2000:] + p.stderr[-2000:])
+        # (the x86 filter before LZMA2 and a 128 MiB dictionary, as 7-Zip's -mx=9 does for programs: 29 MB instead
+        # of 47 MB with the plain preset; any xz reader takes it, Python's lzma included)
+        filters = [{"id": lzma.FILTER_X86}, {"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME, "dict_size": 128 << 20}]
+        with lzma.LZMAFile(tc, "wb", format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC64, filters=filters) as xz,                 tarfile.open(fileobj=xz, mode="w", format=tarfile.PAX_FORMAT) as t:
+            for d, ds, fs in os.walk(stage):
+                ds.sort()
+                for f in sorted(fs):
+                    full = os.path.join(d, f)
+                    ti = t.gettarinfo(full, os.path.relpath(full, stage).replace("\\", "/"))
+                    ti.uid = ti.gid = 0
+                    ti.uname = ti.gname = ""
+                    ti.mode = 0o755 if f.lower().endswith(".exe") else 0o644
+                    with open(full, "rb") as fh:
+                        t.addfile(ti, fh)
         raw = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(stage) for f in fs)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-    assets.append({"role": "toolchain", "name": os.path.basename(tc), "unpack": "7z (Windows tar.exe: tar -xf <file> -C <dir>)",
+    assets.append({"role": "toolchain", "name": os.path.basename(tc), "unpack": "tar.xz (the port's own Python: tarfile; tools/slim_tools.ps1)",
                    "into": "tools-cache\\slim\\llvm", "version": ver, "unpacked_bytes": raw,
                    "contents": ["bin/clang.exe", "bin/lld.exe", "bin/llvm-profdata.exe",
                                 "lib/clang/%s/include/ (%d x86 headers)" % (major, len(hdrs)), rt.replace("\\", "/"), "LICENSE.TXT"],

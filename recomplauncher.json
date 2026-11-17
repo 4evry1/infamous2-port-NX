@@ -12,7 +12,7 @@
   "prepare": {
     "program": ["Setup.exe"],
     "args": ["--prepare", "--disc", "{game}"],
-    "label": "Building the game from your copy: about 15 minutes, with about 44 MB of the port's tools downloaded from GitHub and the game's update and the PS3 firmware files from Sony's servers. Nothing is installed",
+    "label": "Building the game from your copy: about 15 minutes, with about 48 MB of the port's tools downloaded from GitHub and the game's update and the PS3 firmware files from Sony's servers. Nothing is installed",
     "timeout": 10800
   },
   "start": {

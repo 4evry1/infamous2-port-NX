@@ -8,7 +8,7 @@
 #          files, saves), eboot\, the desktop shortcut, and "Optimise for this PC"'s profile (work\pgo-setup\
 #          setup-*.profdata, ~30 MB): an update compiles with it instead of training again while it still fits
 # Both ways delete what a training left behind: work\port\build-train, the runs' save copies and counters.
-# A later update then downloads the port's tools again (about 44 MB) and translates the game again. Never runs in
+# A later update then downloads the port's tools again (about 48 MB) and translates the game again. Never runs in
 # the development folder (it has PLAN.md) unless -Force. Prints "freed: <GB>" for Setup.
 #   tools\setup_cleanup.ps1 -KeepBuildCache   (what Setup does after a build, unless told otherwise)
 # keeps the port's tools and the build files for the next update instead: tools-cache\slim (about 220 MB) and

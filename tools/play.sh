@@ -114,6 +114,37 @@ In the game, F2 > Mods lists them: turn each one on or off and pick its options 
 the next time the game starts ("Restart to apply" does that at once).
 EOF
 
+# DLC (GitHub #48, #56): the "dlc" folder. The game's unlock files (*.edat) put there, in it or in subfolders, are
+# copied to where the game opens them (game/dev_hdd0/game/<ID>/USRDIR/dlc/ulf, lower-case names: the game opens
+# lower-case), only when missing or different. tools/setup.sh copies RPCS3's the same way. Never stops the game.
+mkdir -p "$root/dlc" 2>/dev/null
+[ -f "$root/dlc/README.txt" ] || cp "$root/tools/dlc_readme.txt" "$root/dlc/README.txt" 2>/dev/null
+for td in "$game"/dev_hdd0/game/*/; do
+    td="${td%/}"
+    case "$td" in *_INSTALL) continue ;; esac
+    [ -f "$td/USRDIR/EBOOT.BIN" ] || continue
+    ulf="$td/USRDIR/dlc/ulf"; nnew=0
+    while IFS= read -r f; do
+        name="$(basename "$f")"; dst="$ulf/${name,,}"
+        if ! cmp -s "$f" "$dst"; then
+            mkdir -p "$ulf" && rm -f "$dst" "$dst.dec" && cp "$f" "$dst" && chmod u+rw "$dst" && nnew=$((nnew + 1))
+        fi
+    done < <(find "$root/dlc" -type f -iname '*.edat' 2>/dev/null | sort)
+    have=0; lic=0
+    while IFS= read -r f; do
+        have=$((have + 1))
+        # the license kind in the file's header: 3 = free; 1 or 2 = bound to a license (.rap)
+        if [ "$(head -c 3 "$f" 2>/dev/null)" = NPD ]; then
+            case "$(od -An -tu1 -j11 -N1 "$f" 2>/dev/null | tr -d ' ')" in 1|2) lic=$((lic + 1)) ;; esac
+        fi
+    done < <(find "$td/USRDIR/dlc" -type f -iname '*.edat' 2>/dev/null)
+    line="DLC: none in game/dev_hdd0/game/$(basename "$td")/USRDIR/dlc (optional: put your DLC's *.edat files in the dlc folder)"
+    [ $have -gt 0 ] && line="DLC: $have unlock file(s) in game/dev_hdd0/game/$(basename "$td")/USRDIR/dlc"
+    [ $nnew -gt 0 ] && line="$line ($nnew new from the dlc folder)"
+    [ $lic -gt 0 ] && line="$line; $lic need their license (.rap): not supported yet"
+    echo "$line"
+done
+
 flash="$game/dev_flash"
 [ -d "$flash/sys" ] || flash="${PORT_DEV_FLASH:-${XDG_CONFIG_HOME:-$HOME/.config}/rpcs3/dev_flash}"
 defaults="PS3RECOMP_FPS_CAP=60;PS3_AUDIO_VOLUME=100;PS3RECOMP_RENDER_SCALE=1.5;PS3RECOMP_SOFT_SHADOWS=2;PS3RECOMP_SSAO=2;"

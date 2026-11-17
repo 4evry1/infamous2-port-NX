@@ -9,7 +9,7 @@
 //      needed: an encrypted disc image's disc key (.dkey), a PSN copy's license (.rap). Their files are only passed
 //      on, by path, to tools\ps3tool.py (a black box).
 //   3. tools\setup_build.ps1 -Source <the pick> -Cleanup [-Pgo]: it downloads the port's own tools (the prebuilt
-//      engine, clang + lld, an embeddable Python: about 44 MB, tools\slim_assets.json), copies or extracts the game
+//      engine, clang + lld, an embeddable Python: about 48 MB, tools\slim_assets.json), copies or extracts the game
 //      INTO the port's folder (the folder can then be moved or copied anywhere), gets the game's update and the
 //      firmware files from Sony's servers (or RPCS3's copies when it has them: RPCS3 is not needed), builds.
 //      Its lines "== [n/10] <step>" (12 steps with -Pgo), "  progress: <n>% <what>", "== FAILED: <why>",
@@ -54,9 +54,9 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("inFAMOUS 2 Native PC Port (unofficial fan project)")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Sami Enazi. MIT license.")]
 [assembly: AssemblyTrademark("inFAMOUS is a trademark of Sony Interactive Entertainment LLC. Not affiliated with Sony or Sucker Punch.")]
-[assembly: AssemblyVersion("0.6.0.0")]
-[assembly: AssemblyFileVersion("0.6.0.0")]
-[assembly: AssemblyInformationalVersion("0.6.0")]
+[assembly: AssemblyVersion("0.6.1.0")]
+[assembly: AssemblyFileVersion("0.6.1.0")]
+[assembly: AssemblyInformationalVersion("0.6.1")]
 
 namespace Inf2Setup
 {
@@ -1249,7 +1249,7 @@ namespace Inf2Setup
                     p.Title = cid.Length >= 16 ? cid.Substring(7, 9) : "";
                     string where = Where(p.Title);
                     if (where == null) { p.Text = "That package is " + cid + ", not inFAMOUS 2."; return p; }
-                    if (p.Title.StartsWith("BC", StringComparison.Ordinal)) { p.Text = "That is an update package of the disc version: Setup gets the updates by itself. Choose your game instead."; return p; }
+                    if (p.Title.StartsWith("BC", StringComparison.Ordinal)) { p.Text = "That is an update or DLC package of the disc version, not the game. Choose your game instead: Setup gets the updates by itself, and takes DLC from RPCS3 (install the package there) or from the port's dlc folder."; return p; }
                     p.Ok = true;
                     p.Text = "inFAMOUS 2 \u00b7 " + where + " " + p.Title + " \u00b7 a .pkg package (your license, the .rap file, is asked for if it is not beside it)";
                     return p;
@@ -2085,7 +2085,7 @@ namespace Inf2Setup
         // (MainForm.StepWeight / StepWeightPgo, SubNames, SubWeight): 10 steps, or 12 with -Pgo (--pgo).
         sealed class BuildProgress
         {
-            // (v0.6.0) step 2 = the port's tools (44 MB), step 3 = the game copied in + Sony's update and firmware (433 MB)
+            // (v0.6.0) step 2 = the port's tools (48 MB), step 3 = the game copied in + Sony's update and firmware (433 MB)
             static readonly double[] StepWeight = { 0, 1, 4, 25, 1, 0, 0, 1, 66, 1, 1 };
             static readonly double[] StepWeightPgo = { 0, 1, 3, 17, 1, 0, 0, 1, 30, 25, 20, 1, 1 };
             static readonly string[] StepText = { "", "Checking your PC and your game", "Downloading the port's tools",
@@ -2756,7 +2756,7 @@ namespace Inf2Setup
             status = Center("", Theme.Bold, Theme.Text, S(352), S(28));
             line = Center(Intro, Theme.Body, Theme.Dim, S(392), S(70));
             // (no license to accept any more: nothing of Microsoft's is downloaded)
-            license = Theme.Link("Downloads about 44 MB of the port's tools from GitHub, and your game's update from Sony", Theme.Small);
+            license = Theme.Link("Downloads about 48 MB of the port's tools from GitHub, and your game's update from Sony", Theme.Small);
             license.LinkArea = new LinkArea(0, 0);
             license.Location = new Point((cw - license.PreferredWidth) / 2, S(520));
 
@@ -3260,7 +3260,7 @@ namespace Inf2Setup
         // ---------------------------------------------------------- progress
 
         // How much of the whole build each step of setup_build.ps1 is (percent, on the test PC).
-        // (v0.6.0) step 2 = the port's tools (44 MB), step 3 = the game copied in + Sony's update and firmware (433 MB)
+        // (v0.6.0) step 2 = the port's tools (48 MB), step 3 = the game copied in + Sony's update and firmware (433 MB)
         static readonly double[] StepWeight = { 0, 1, 3, 30, 1, 0, 0, 1, 62, 1, 1 };
         // With "Optimise for this PC" (-Pgo, 12 steps): 8 = translate + the training build, 9 = the training
         // (the game plays by itself), 10 = the final compile.

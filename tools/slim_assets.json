@@ -1,7 +1,7 @@
 {
  "format": 1,
- "made": "2026-11-17 06:30:58",
- "release": "v0.6.0",
+ "made": "2026-11-17 18:55:38",
+ "release": "v0.6.1",
  "engine_kit": "b566b3ab491f",
  "module": {
   "abi": 2,
@@ -25,45 +25,8 @@
   "built_by": "tools/rebuild_win.py with PORT_ENGINE_EXE=<engine exe> PORT_LLVM=<toolchain> (steps inputs..compile; compile = tools/build_module.py)",
   "sample_build": "clang 22.1.8 (https://github.com/llvm/llvm-project ca7933e47d3a3451d81e72ac174dcb5aa28b59d1), no PGO"
  },
- "total_download_bytes": 45949429,
+ "total_download_bytes": 49985695,
  "assets": [
-  {
-   "role": "engine",
-   "name": "Infamous2-engine-win-x64.zip",
-   "unpack": "zip",
-   "into": "tools-cache\\slim\\engine",
-   "contents": [
-    "Infamous2Recomp.exe",
-    "SDL2.dll"
-   ],
-   "files_sha256": {
-    "Infamous2Recomp.exe": "31D4F86E7AD02EF340B667EB833D8E1CC04023E51AE8D4BC6042886D0DA31251",
-    "SDL2.dll": "F1A82C299206D5BD3231F5EDB16FB7F33AAF4DC7C20BF57C25CF8E92EDA6EC72"
-   },
-   "release": "v0.6.0",
-   "size": 3693658,
-   "sha256": "7F70542D05A904B93C574DB98774F746790E0A4C4876FD12CD1E18F3164437E7"
-  },
-  {
-   "role": "toolchain",
-   "name": "llvm-22.1.8-slim-win-x64.7z",
-   "unpack": "7z (Windows tar.exe: tar -xf <file> -C <dir>)",
-   "into": "tools-cache\\slim\\llvm",
-   "version": "22.1.8",
-   "unpacked_bytes": 185486710,
-   "contents": [
-    "bin/clang.exe",
-    "bin/lld.exe",
-    "bin/llvm-profdata.exe",
-    "lib/clang/22/include/ (177 x86 headers)",
-    "lib/clang/22/lib/windows/clang_rt.profile-x86_64.lib",
-    "LICENSE.TXT"
-   ],
-   "use": "PORT_LLVM=<that folder> (tools/build_module.py: clang.exe --driver-mode=cl, lld.exe -flavor link)",
-   "release": "v0.6.0",
-   "size": 29139370,
-   "sha256": "C8BA2E2E45E63C2ECEDC1D7C75E337793094D60BA420A679FE7A4AAB25D5F5D7"
-  },
   {
    "role": "python",
    "name": "python-3.13.17-embed-amd64.zip",
@@ -88,6 +51,48 @@
    "release": "v0.6.0",
    "size": 1675134,
    "sha256": "195C9D781905605B3B9DE8567C47986A9D0EE513566B5150EB9400692465B610"
+  },
+  {
+   "role": "toolchain",
+   "name": "llvm-22.1.8-slim-win-x64.tar.xz",
+   "unpack": "tar.xz (the port's own Python: tarfile; tools/slim_tools.ps1)",
+   "into": "tools-cache\\slim\\llvm",
+   "version": "22.1.8",
+   "unpacked_bytes": 185486710,
+   "contents": [
+    "bin/clang.exe",
+    "bin/lld.exe",
+    "bin/llvm-profdata.exe",
+    "lib/clang/22/include/ (177 x86 headers)",
+    "lib/clang/22/lib/windows/clang_rt.profile-x86_64.lib",
+    "LICENSE.TXT"
+   ],
+   "use": "PORT_LLVM=<that folder> (tools/build_module.py: clang.exe --driver-mode=cl, lld.exe -flavor link)",
+   "release": "v0.6.1",
+   "size": 33175636,
+   "sha256": "109482E22835BE89638DDCFF25FDB94F45CA5DFCB2989D63F7D3C44732966E0F",
+   "same_as": [
+    "C8BA2E2E45E63C2ECEDC1D7C75E337793094D60BA420A679FE7A4AAB25D5F5D7"
+   ],
+   "same_as_note": "llvm-22.1.8-slim-win-x64.7z of v0.6.0: the same files (an install that unpacked it keeps them)"
+  },
+  {
+   "role": "engine",
+   "name": "Infamous2-engine-win-x64.zip",
+   "unpack": "zip",
+   "into": "tools-cache\\slim\\engine",
+   "contents": [
+    "Infamous2Recomp.exe",
+    "SDL2.dll"
+   ],
+   "files_sha256": {
+    "Infamous2Recomp.exe": "31D4F86E7AD02EF340B667EB833D8E1CC04023E51AE8D4BC6042886D0DA31251",
+    "SDL2.dll": "F1A82C299206D5BD3231F5EDB16FB7F33AAF4DC7C20BF57C25CF8E92EDA6EC72"
+   },
+   "release": "v0.6.0",
+   "size": 3693658,
+   "sha256": "7F70542D05A904B93C574DB98774F746790E0A4C4876FD12CD1E18F3164437E7"
   }
- ]
+ ],
+ "release_note": "each asset names the release that holds it (\"release\"): only the compiler is new in v0.6.1"
 }

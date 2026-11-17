@@ -405,7 +405,7 @@ function Get-GameSource([string]$Path, [string]$Rpcs3 = "") {
         $o.Kind = "pkg"; $o.Layout = "psn"; $o.Encrypted = $true
         $o.ContentId = ([Text.Encoding]::ASCII.GetString($h, 0x30, 0x24)).TrimEnd([char]0)
         if ($o.ContentId.Length -ge 16) { $o.Title = $o.ContentId.Substring(7, 9) }
-        if ($o.Title -like "BC*") { $o.Problem = "this is an update package of the disc version ($($o.ContentId)): Setup gets the updates by itself; choose your game (the disc's folder or .iso) instead" }
+        if ($o.Title -like "BC*") { $o.Problem = "this is an update or DLC package of the disc version ($($o.ContentId)), not the game: choose your game (the disc's folder or .iso) instead. Setup gets the updates by itself. For DLC: install the package in RPCS3 (File > Install Packages) and run Setup again, it copies the DLC from there; or put the DLC's unlock files (*.edat) in the port's dlc folder" }
         return $o
     }
     if ($Path -match '\.pkg$') { $o.Kind = "pkg"; $o.Problem = "this is not a PS3 package"; return $o }
@@ -589,6 +589,23 @@ function Get-SetupChecks([string]$Disc, [string]$Rpcs3, [string]$DiscKey = "", [
         elseif ($script:SonyUpdates -contains $title) {
             Add $null "Game update 1.04" "downloaded from Sony's servers during the build: the updates 1.01, 1.03 and 1.04 (236 MB)$(if ($ver) { " (RPCS3 has version $ver)" })"
         } else { Add $false "Game update 1.04" "Setup knows no update packages for $title" }
+        # DLC (GitHub #48, #56; optional, never blocking): the game's unlock files (tools\port_paths.ps1). Setup
+        # copies RPCS3's into the port's folder during the build; the dlc folder's are copied then and at each start.
+        try {
+            $dOwn = @(Get-DlcFiles (Join-Path $root "game\dev_hdd0\game\$title\USRDIR\dlc"))
+            $dRpHdd = if ($rpOk) { Get-Rpcs3Dir $Rpcs3 "dev_hdd0" "game\$title\USRDIR\dlc" } else { $null }
+            $dRp = if ($dRpHdd) { @(Get-DlcFiles (Join-Path $dRpHdd "game\$title\USRDIR\dlc")) } else { @() }
+            $dDrop = @(Get-DlcFiles (Join-Path $root "dlc"))
+            $dSrc = if ($digital -and $src.Kind -eq "folder" -and $Disc) { @(Get-DlcFiles (Join-Path (Get-GameRoot $Disc) "USRDIR\dlc")) } else { @() }
+            $nf = { param($n) "$n file$(if ($n -ne 1) { 's' })" }
+            $parts = @($(if ($dRp.Count) { "$(& $nf $dRp.Count) found in RPCS3 (copied into the port's folder during the build)" }),
+                       $(if ($dSrc.Count) { "$(& $nf $dSrc.Count) in your game copy" }),
+                       $(if ($dDrop.Count) { "$(& $nf $dDrop.Count) in the dlc folder" }),
+                       $(if ($dOwn.Count) { "$(& $nf $dOwn.Count) in the port's folder already" })) | Where-Object { $_ }
+            $lic = Get-DlcNeedLicense (@($dRp) + @($dSrc) + @($dDrop) + @($dOwn))
+            if ($parts) { Add $true "DLC" "$($parts -join '; ')$(if ($lic) { '. Some of this DLC needs its license (.rap): not supported yet' })" }
+            else { Add $null "DLC" "none (optional: install your DLC in RPCS3 and run Setup again, or put its unlock files, *.edat, in the port's dlc folder)" }
+        } catch {}
     }
     $ps3tool = Join-Path $root "tools\ps3tool.py"
     Add $null "ps3tool" $(if (Test-Path -LiteralPath $ps3tool) { "tools\ps3tool.py (unpacks and decrypts your game's files)" } else { "downloaded from GitHub during the build (tools\ps3tool.py: unpacks and decrypts your game's files)" })

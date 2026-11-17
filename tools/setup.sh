@@ -195,6 +195,43 @@ fi
 if fw_ok "$root/game/dev_flash"; then ok ok "PS3 firmware files" "in game/dev_flash"
 elif [ -n "$flash" ] && fw_ok "$flash"; then ok ok "PS3 firmware files" "copied from RPCS3 ($flash)"
 else ok note "PS3 firmware files" "downloaded from Sony's servers during the setup: the system software 4.93 (197 MB), of which 3 modules are kept"; fi
+# DLC (GitHub #48, #56; optional): the game's unlock files, <dev_hdd0>/game/<ID>/USRDIR/dlc/ulf/unlock_*.edat. RPCS3's
+# are copied into the port's folder in step 3 (on a first setup and on every later run), the dlc folder's too.
+dlc_files() { [ -d "$1" ] && find "$1" -type f -iname '*.edat' 2>/dev/null | sort; return 0; }
+dlc_count() { dlc_files "$1" | wc -l | tr -d ' '; }
+dlc_copy() {   # dlc_copy <from> <to> [flat]: missing or different files only, lower-case names; says how many
+    local f rel dst n=0
+    while IFS= read -r f; do
+        rel="${f#"$1"/}"; [ "${3:-}" = flat ] && rel="$(basename "$f")"
+        dst="$2/${rel,,}"
+        if ! cmp -s "$f" "$dst"; then
+            mkdir -p "$(dirname "$dst")" && rm -f "$dst" "$dst.dec" && cp "$f" "$dst" && chmod u+rw "$dst" && n=$((n + 1))
+        fi
+    done < <(dlc_files "$1")
+    printf '%s' "$n"
+}
+dlc_need_license() {   # how many of a folder's unlock files are bound to a license (.rap): header byte 11 is 1 or 2
+    local f n=0
+    while IFS= read -r f; do
+        if [ "$(head -c 3 "$f" 2>/dev/null)" = NPD ]; then
+            case "$(od -An -tu1 -j11 -N1 "$f" 2>/dev/null | tr -d ' ')" in 1|2) n=$((n + 1)) ;; esac
+        fi
+    done < <(dlc_files "$1")
+    printf '%s' "$n"
+}
+nfiles() { [ "$1" = 1 ] && printf '1 file' || printf '%s files' "$1"; }
+rpdlc=""
+if [ -n "$rpcs3" ] && [ -n "$title" ]; then rpdlc="$(vfs_dir dev_hdd0 "game/$title/USRDIR/dlc")/game/$title/USRDIR/dlc"; fi
+if [ -n "$title" ]; then
+    d_rp=0; [ -n "$rpdlc" ] && d_rp=$(dlc_count "$rpdlc")
+    d_drop=$(dlc_count "$root/dlc"); d_own=$(dlc_count "$root/game/dev_hdd0/game/$title/USRDIR/dlc")
+    d=""
+    [ "$d_rp" -gt 0 ] && d="$(nfiles "$d_rp") found in RPCS3 (copied into the port's folder during the setup)"
+    [ "$d_drop" -gt 0 ] && d="${d:+$d; }$(nfiles "$d_drop") in the dlc folder"
+    [ "$d_own" -gt 0 ] && d="${d:+$d; }$(nfiles "$d_own") in the port's folder already"
+    if [ -n "$d" ]; then ok ok DLC "$d"
+    else ok note DLC "none (optional: install your DLC in RPCS3 and run setup again, or put its unlock files, *.edat, in the port's dlc folder)"; fi
+fi
 # RPCS3's program decrypts only when ps3tool cannot (step 4)
 if [ $norpcs3 = 0 ]; then
     [ -z "$rpcs3bin" ] && rpcs3bin=$(command -v rpcs3 || true)
@@ -337,6 +374,23 @@ if [ -n "$sony" ]; then [ -n "$rpcs3" ] && echo "  from Sony's servers: $sony (R
 if ! "$venv/bin/python" -I "$root/tools/sony_files.py" "${sony:-ps3tool}" --root "$root" --disc "$disc"; then
     [ -n "$sony" ] && fail "getting the game's files from Sony's servers failed (the reason is above). Check your internet connection and run setup again: it goes on where it stopped. (Only if Sony's servers can't be reached from your network at all: an RPCS3 that has the 1.04 update and firmware 4.93 installed works too, give --rpcs3 <its folder>.)"
     echo "  note: no ps3tool: step 4 decrypts with RPCS3 instead"
+fi
+# DLC: RPCS3's unlock files and the dlc folder's, copied in (wherever the update came from; nothing is ever deleted)
+dlcdst="$game/dev_hdd0/game/$title/USRDIR/dlc"; n_rp=0
+if [ -n "$rpdlc" ] && [ -d "$rpdlc" ]; then n_rp=$(dlc_copy "$rpdlc" "$dlcdst"); fi
+mkdir -p "$root/dlc"
+[ -f "$root/dlc/README.txt" ] || cp "$root/tools/dlc_readme.txt" "$root/dlc/README.txt" 2>/dev/null || true
+n_drop=$(dlc_copy "$root/dlc" "$dlcdst/ulf" flat)
+n_dlc=$(dlc_count "$dlcdst")
+if [ "$n_dlc" -gt 0 ]; then
+    from=""
+    [ "$n_rp" -gt 0 ] && from="$n_rp copied from RPCS3 ($rpdlc)"
+    [ "$n_drop" -gt 0 ] && from="${from:+$from, }$n_drop copied from the dlc folder"
+    echo "  DLC: $n_dlc unlock file(s) in game/dev_hdd0/game/$title/USRDIR/dlc${from:+ ($from)}"
+    n_lic=$(dlc_need_license "$dlcdst")
+    [ "$n_lic" -gt 0 ] && echo "  note: $n_lic of the DLC files need their license (.rap): not supported yet (the game will not show that DLC)"
+else
+    echo "  DLC: none found (optional: install it in RPCS3 and run setup again, or put its unlock files, *.edat, in the port's dlc folder)"
 fi
 inst="${hdd0:+$hdd0/game/${title}_INSTALL}"
 if [ -n "$inst" ] && [ -d "$inst" ] && [ ! -d "$game/dev_hdd0/game/${title}_INSTALL" ]; then copy_tree "$inst" "$game/dev_hdd0/game/${title}_INSTALL" "the game's HDD install from RPCS3 (2.4 GB)"

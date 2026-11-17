@@ -40,7 +40,7 @@ controller or keyboard and mouse, an in-game settings menu, mods, cheats, a save
 3. Press **Install**, wait, press **Play**.
 
 That's all. No RPCS3, no Git, no Python, no Visual Studio, no admin rights, and nothing is installed into Windows.
-Setup downloads about 81 MB from GitHub (the port and its own tools) and 433 MB from Sony's servers (the game's
+Setup downloads about 85 MB from GitHub (the port and its own tools) and 433 MB from Sony's servers (the game's
 1.04 update and the PS3 system software, the same files a PS3 downloads), copies your game into the port's folder
 and builds it once. On the test PC the whole install took 12 to 15 minutes.
 
@@ -48,10 +48,21 @@ and builds it once. On the test PC the whole install took 12 to 15 minutes.
 
 Linux and the Steam Deck: [see below](#linux-and-steam-deck). More detail on copies and keys: [FAQ](#faq).
 
+## What's new in v0.6.1
+
+- **Windows 10: Setup installs again.** v0.6.0 stopped on Windows 10 with *"unpacking llvm-22.1.8-slim-win-x64.7z
+  failed: tar.exe: LZMA codec is unsupported"* ([#62](../../issues/62), [#70](../../issues/70)): it used Windows'
+  own tar.exe, and only Windows 11's can read that file. Setup now unpacks its compiler with its own Python and
+  needs nothing from Windows for it. If v0.6.0 stopped there for you: get this `Setup.exe` and run it in the
+  same folder, or just press **Try again**.
+- **DLC is picked up** ([#56](../../issues/56), [#48](../../issues/48)): Setup copies your DLC's unlock files
+  from RPCS3 when it has them, and files you put in the port's `dlc` folder are used at the next start
+  ([FAQ](#faq)).
+
 ## What's new in v0.6.0
 
 **Install**
-- **One small Setup, one pick.** About 81 MB from GitHub instead of 1.3 GB of build tools, and no Microsoft
+- **One small Setup, one pick.** About 85 MB from GitHub instead of 1.3 GB of build tools, and no Microsoft
   license to accept.
 - **No RPCS3 needed.** The update and firmware come from Sony's servers.
 - **PSN copies and encrypted disc images are supported,** new in this version: a PSN copy with your `.rap`
@@ -226,7 +237,7 @@ session's later unlocks Casual. Picking or saving a spot and Black lightning don
 - **A PC with:** Windows 10/11 64-bit (or [Linux](#linux-and-steam-deck)), a CPU with AVX2 (Intel 4th gen / AMD
   Ryzen or newer), a Vulkan graphics card, 16 GB RAM, about 16 GB free disk space on a local drive (not a network
   drive).
-- **Internet for the install:** about 81 MB from GitHub and 433 MB from Sony.
+- **Internet for the install:** about 85 MB from GitHub and 433 MB from Sony.
 
 Tested PCs: the test PC above at 1080p to 4K; players on Windows 10 and 11 up to an RTX 5070 at 1440p; Linux on
 Ubuntu 22.04 with a Radeon RX 550 (RADV), and a player's Steam Deck ([#24](../../issues/24)).
@@ -322,7 +333,16 @@ A decrypted image is read directly. An encrypted one (a raw copy of the disc) ne
 `Setup.exe` is not code-signed, because signing a program costs money. So Windows SmartScreen or an antivirus may
 warn about it, as they can for any new, unsigned file. On the Windows message, click **More info**, then **Run
 anyway**. The source is open (`tools/setup_exe/` in this repository), and here is the VirusTotal scan of this
-release's `Setup.exe`: https://www.virustotal.com/gui/file/8dcea7a49d85a43d5ff91f8264f0779e361ddc9ac07adfe734262447d848eded
+release's `Setup.exe`: https://www.virustotal.com/gui/file/756d6f24fa0eba885f12a8d5993db466578f3189bf7674d09b9aae9372f5e233
+
+**Does DLC work?**
+Yes, when its unlock files are in the port's folder. inFAMOUS 2's DLC (the extra skins, amps and powers) is a set
+of small unlock files, `dev_hdd0\game\<your game's ID>\USRDIR\dlc\ulf\unlock_*.edat`; the content itself is
+already in the game. A game copy that carries them (a PSN folder with the DLC installed) brings them along. From
+v0.6.1 Setup also copies them from RPCS3 when it is on your PC and has the DLC installed, on install and on every
+update (added DLC to RPCS3 later? run Setup again). And there is a `dlc` folder in the port's folder: put the
+`.edat` files there and they are picked up the next time the game starts. The DLC must be for the same version
+(region) of the game as your copy. DLC that needs a license (`.rap`) is not supported yet.
 
 **Where are my saves and settings?**
 All in the port's folder. Saves: `game\gamedata\dev_hdd0\home\00000001\savedata`, backed up to `saves-backup\`

@@ -1,6 +1,6 @@
 # The work behind Setup.exe and Setup.cmd (also usable on its own). v0.6.0, the slim Setup:
 #   1. check this PC and the game                                    (tools\setup_common.ps1)
-#   2. the port's tools: the prebuilt engine, clang + lld, an embeddable Python (and pycryptodome), about 44 MB from
+#   2. the port's tools: the prebuilt engine, clang + lld, an embeddable Python (and pycryptodome), about 48 MB from
 #      the GitHub release in tools\slim_assets.json, SHA-256 checked, into tools-cache\slim\ (tools\slim_tools.ps1).
 #      The 2 GB build tools of v0.5.x (MSVC, the Windows SDK, CMake, Ninja, full LLVM) are deleted when found.
 #   3. your game INTO the port's folder (game\disc: a copy of the game folder, the disc image extracted, the PSN
@@ -178,7 +178,7 @@ if ((Test-Path -LiteralPath $cfgPath) -and -not (Test-Path -LiteralPath (Join-Pa
 }
 if ($Rpcs3) { $env:PORT_RPCS3 = $Rpcs3 }   # for this build only (tools\rebuild_win.py, tools\decrypt.ps1)
 
-Step 2 "the port's tools: the prebuilt engine, clang + lld and Python (about 44 MB, nothing is installed)"
+Step 2 "the port's tools: the prebuilt engine, clang + lld and Python (about 48 MB, nothing is installed)"
 Remove-OldBuildTools
 Install-SlimTools
 $slim = Get-SlimPaths
@@ -320,6 +320,27 @@ if ($sony.Count) {
                "an RPCS3 on this PC that has the game's 1.04 update and firmware 4.93 installed works too, Setup copies them from it.)")
     }
 }
+# DLC (GitHub #48, #56): the game's unlock files (...\USRDIR\dlc\ulf\unlock_*.edat, tools\port_paths.ps1). Copied
+# from RPCS3 when it has them, on a first install and on every later run, wherever the update came from (Sony's
+# update has none), and from the drop folder <port>\dlc (the launcher does that too, at each start). Files only
+# ever get added: the install's dlc folder is never deleted. Nothing here can make Setup fail.
+try {
+    $dlcDst = Join-Path $updDst "USRDIR\dlc"
+    $rpDlcHdd = if ($Rpcs3) { Get-Rpcs3Dir $Rpcs3 "dev_hdd0" "game\$title\USRDIR\dlc" } else { $null }
+    $rpDlc = if ($rpDlcHdd) { Join-Path $rpDlcHdd "game\$title\USRDIR\dlc" } else { $null }
+    $nRp = 0; $nDrop = 0
+    if ($rpDlc -and @(Get-DlcFiles $rpDlc).Count) { $nRp = Copy-DlcTree $rpDlc $dlcDst }
+    $drop = New-DlcDropFolder $root
+    $nDrop = Copy-DlcDrop $drop (Join-Path $dlcDst "ulf")
+    $dlcHave = @(Get-DlcFiles $dlcDst)
+    if ($dlcHave.Count) {
+        $from = @($(if ($nRp) { "$nRp copied from RPCS3 ($rpDlc)" }), $(if ($nDrop) { "$nDrop copied from the dlc folder" })) | Where-Object { $_ }
+        "  DLC: $($dlcHave.Count) unlock file(s) in game\dev_hdd0\game\$title\USRDIR\dlc$(if ($from) { ' (' + ($from -join ', ') + ')' })"
+        $lic = Get-DlcNeedLicense $dlcHave
+        if ($lic) { "  note: $lic of the DLC files need their license (.rap): not supported yet (the game will not show that DLC)" }
+    }
+    else { "  DLC: none found (optional: install it in RPCS3 and run Setup again, or put its unlock files, *.edat, in the port's dlc folder)" }
+} catch { "  note: the DLC files could not be copied ($_): the game plays without them" }
 # The game copies 2.4 GB to the HDD on its first boot (<title>_INSTALL): RPCS3's copy if there is one, else the
 # game does the install itself (about a minute, behind the title screen).
 $instDst = Join-Path $game "dev_hdd0\game\${title}_INSTALL"
