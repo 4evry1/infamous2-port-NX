@@ -196,6 +196,13 @@ if [ -z "${MESA_VK_WSI_DEBUG+x}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && command -
     export MESA_VK_WSI_DEBUG=sw
 fi
 
+# Built inside a Distrobox container (tools/setup.sh notes it) and started outside: the program may not find the
+# container's libraries (a player's Steam Deck, GitHub #24: sound but no window). Said, not refused.
+if [ -f "$root/work/built-in-container" ] && [ ! -f /run/.containerenv ] && [ ! -f /.dockerenv ] && [ -z "${CONTAINER_ID:-}" ]; then
+    box="$(head -n 1 "$root/work/built-in-container")"; [ -n "$box" ] || box="<the container's name>"
+    echo "Note: the game was built inside a container ($box). If it does not start or shows no window here, start it from there:"
+    echo "  distrobox enter $box -- \"$root/setup.sh\""
+fi
 echo "Starting inFAMOUS 2... F1 = FPS counter, F2 = settings."
 [ $nolog = 0 ] && echo "Press F9 in the game window whenever something feels slow or stutters. Session folder: $out"
 t0=$(date +%s)

@@ -2334,7 +2334,7 @@ static void pad_trace_packet(u32 port, const CellPadData* d)
  * "game-side" hitches, caught by PS3_STALL_MS (main: hle=cellPadGetData,
  * rip=ntdll ZwCreateFile). A watcher thread now does the file work every 4 ms
  * and the poll reads its results from memory. Players never set these
- * variables; the tests measured stalls Sami's game does not have.
+ * variables; the tests measured stalls real play does not have.
  * PS3_PAD_FILE_THREAD=0 = the old reads on the polling thread. */
 #ifdef _WIN32
 #define PAD_WATCH_PATHS 4
@@ -2405,7 +2405,7 @@ static int pad_watch_exists(const char* path) { return access(path, F_OK) == 0; 
 #endif
 
 /* PS3_PAD_RECORD=<file> / PS3_PAD_REPLAY=<file> -- a recorded route (testspeed, 2026-11-08).
- * Sami drives a route through New Marais once; tests replay it. Time-indexed, not frame-indexed:
+ * A route through New Marais is driven once by hand; tests replay it. Time-indexed, not frame-indexed:
  * the game moves with a variable dt, so a slower or faster build covers the same distance in the
  * same milliseconds, while a frame-indexed replay would not. The clock (ms) starts when the file
  * named by PAD_SCRIPT_WAIT appears (tools\fast_driver.ps1 creates it the moment the gameplay HUD

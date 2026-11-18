@@ -4253,7 +4253,7 @@ static int vk_create_swapchain(void)
 
     /* Present mode. FIFO (vsync) queues finished frames behind the display: with
      * three images and two frames in flight, up to 2-3 frames waited between the
-     * game reading the controller and the picture showing it (Sami: "input lag
+     * game reading the controller and the picture showing it (feedback: "input lag
      * using the controller", 2026-11-07). MAILBOX shows the newest finished frame
      * at the next refresh and drops a waiting one -- no tearing, no queue -- and
      * the frame cap (vk_frame_limit) does the pacing. PS3RECOMP_VK_PRESENT=fifo |

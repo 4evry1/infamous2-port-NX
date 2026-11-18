@@ -276,8 +276,13 @@ cd infamous2-port
 - **Fedora, openSUSE** and other `lib64` distributions work since v0.6.0 ([#64](../../pull/64)).
 - **NixOS:** build and play inside the FHS environment in [`tools/nixos/fhs-env.nix`](tools/nixos/fhs-env.nix)
   (the commands are at the top of that file). Tested by its author on NixOS 26.05 with a Radeon 780M.
-- **Steam Deck:** a player built it inside an Ubuntu Distrobox container in Desktop Mode and plays it in Game Mode
-  ([#24](../../issues/24)).
+- **Steam Deck (SteamOS 3.5 and later):** `./setup.sh` in Desktop Mode, nothing to install first (new on 18 Nov,
+  not confirmed on a Deck yet: please report how it goes in [#81](../../issues/81)). SteamOS comes
+  without the C library's headers and its system folders are read-only, so setup downloads them (12 MB, from Valve's
+  package mirror, SHA-256 checked) into the port's own `tools-cache/` ([#81](../../issues/81)). The other way still
+  works: a player built it inside an Ubuntu Distrobox container and plays it in Game Mode
+  ([#24](../../issues/24)); a game built in a container is started from that container too
+  (`distrobox enter <name> -- <port folder>/setup.sh`).
 - **v0.6.0 on Linux was built and run by us on Ubuntu 22.04 with a Radeon RX 550 (RADV)**: it installs, starts and
   plays there (slowly: that card is the limit). No Linux frame rate is claimed. Please [report](../../issues) how it runs on
   your distribution and GPU.

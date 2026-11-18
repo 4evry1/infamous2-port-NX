@@ -1,5 +1,5 @@
 /*
- * vk_overlay_menu.inc -- the F2 settings menu, design "E" (Sami's pick, 2026-11-16:
+ * vk_overlay_menu.inc -- the F2 settings menu, design "E" (picked 2026-11-16:
  * "it's a setting for gamers, no need for all the text"). Included by vk_overlay.cpp
  * after every page helper (light, update, lowend, aa, remap, mouse).
  *
