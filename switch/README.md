@@ -9,18 +9,11 @@ Nothing of the game is in this repository: you build it from **your own copy**, 
 
 ## Status
 
-Playable, slow. Tested on one console with the CPU at 1785 MHz:
+**hz-0.114** builds two launchers for Atmosphère title takeover. The opening, bridge reveal and early city are playable. Heavy scenes still have uneven frame pacing and occasional audio crackle. The first appearance of an effect can pause while shaders compile.
 
-- **Frame rate:** about 9-10 fps in light scenes and 7-8 fps in heavy ones. Cutscenes run at real time, at a low
-  frame rate. The port is limited by the CPU (all four cores busy), not the GPU: a lower resolution does not help.
-- **Audio:** mostly smooth; a crackle in places.
-- **Picture:** correct in the areas played (the opening, the first city areas, fights).
-- **Known issues:**
-  - Low frame rate, with slowdowns in heavy scenes.
-  - If the console starts the game at a lower CPU clock (1224 MHz shows in the log), everything runs about 30%
-    slower until the clock rises.
-  - The first time an effect appears, its shaders are built (a short pause); later starts load them from the card.
-- **Runs as:** a title takeover (start the homebrew menu from a game, for the full memory), with Atmosphère.
+A 20-second hardware capture on hz-0.111 measured **8.20 game FPS** in a stationary tower view with 6,720 draws per frame. The median frame took 119.9 ms. The render thread spent about 91 ms per frame processing graphics commands. This run used a 1785 MHz CPU and 960 × 540 internal rendering. The FPS figure counts frames produced by the game and excludes interpolated frames.
+
+Since that capture, the renderer has reduced vertex-cache checking, recycled Vulkan descriptor sets and reused prior uniform-buffer offsets when shader constants match. The hz-0.114 emulator intro avoided 19 additional constant uploads in 147,456 checks. The hardware frame-time impact of these changes is still unmeasured.
 
 ## What you need
 
@@ -55,18 +48,22 @@ Each step can also be run on its own: `switch/build.sh glslang | lift | compile 
 After a code change, `compile` and `link` are enough; after a change to the engine's SPU or PPU translation, run
 `lift` again. `switch/build.sh sdcard <dir> --program-only` copies only the program and EBOOT (for updates).
 
-The result is `work/build-switch/Infamous2Recomp.nro` (with logs) and `Infamous2Recomp-quiet.nro` (the same program,
-no log files: its file name turns logging off).
+The build writes both launchers to `work/build-switch/`. To update an existing installation, keep the two original filenames in `switch/infamous2-port/` so the new launchers replace the old pair.
 
 ## Play
 
-Start **inFAMOUS 2 port** from the homebrew menu, opened through a game (title takeover). The first start shows a
-text screen while it loads; the game follows.
+Open the homebrew menu through a game for title takeover. Choose **inFAMOUS 2 port** for a diagnostic run or **inFAMOUS 2 port (no logs)** for ordinary play. The logged launcher buffers routine diagnostics in RAM and writes them in batches. Both launchers retain immediate crash reporting. Settings are read from `switch/infamous2-port/env.txt` at startup.
 
-- **Settings:** `switch/infamous2-port/env.txt` on the card (from `switch/env.txt.example`, where each setting is
-  explained): native SPU jobs, audio, the frame and game-step limits, profiling.
-- **Logs:** `switch/infamous2-port/logs/` (`stderr.log` has the port's status lines every 10 s: frame rate, CPU
-  clock, cores busy, audio). They are what to attach to a bug report.
+### Resolution and optional frame generation
+
+The default internal resolution is 1280 × 720. For the 960 × 540 configuration used in the tower capture, add the following lines to `env.txt`.
+
+```ini
+PS3RECOMP_RENDER_SCALE=0.75
+PS3RECOMP_UPSCALE=fsr
+```
+
+FSR scales each rendered frame to the output size. LSFG can insert an interpolated frame between game frames. It requires the optional native SDK at build time and your own copy of `Lossless.dll` on the SD card. The port can run without either. [LSFG build options and DLL location](lsfg/README.md)
 
 ## How it is built
 

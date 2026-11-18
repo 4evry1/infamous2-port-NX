@@ -36,7 +36,11 @@ extern "C" {
 #endif
 
 /* 0 off, 1 on, 2 shadow. Installs the fault handler on first use. */
+#if defined(__SWITCH__) && !defined(RSX_WTRACK_IMPLEMENTATION)
+static inline int rsx_wt_mode(void) { return 0; }
+#else
 int  rsx_wt_mode(void);
+#endif
 /* Every page of [p, p+n) protected and unwritten: adds their version sum to
  * *stamp and returns 1. Otherwise returns 0. */
 int  rsx_wt_query(const void* p, size_t n, uint64_t* stamp);

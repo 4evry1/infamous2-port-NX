@@ -24,7 +24,13 @@ in_container() {   # in_container <script> [args...]
         t="$(readlink -f "$R/$d" 2>/dev/null || true)"
         case "$t" in ""|"$R"/*) ;; *) mounts+=(-v "$t:$t") ;; esac
     done
-    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e JOBS="$jobs" "${mounts[@]}" -w "$R" "$SWITCH_DEV_IMAGE" \
+    if [ -n "${SWITCH_LSFG_SDK:-}" ]; then
+        [ -d "$SWITCH_LSFG_SDK/include" ] && [ -f "$SWITCH_LSFG_SDK/lib/liblsfg-vk.a" ] || {
+            echo "== FAILED: SWITCH_LSFG_SDK must contain include/ and lib/liblsfg-vk.a"; exit 1;
+        }
+        mounts+=(-v "$SWITCH_LSFG_SDK:$SWITCH_LSFG_SDK:ro")
+    fi
+    docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e JOBS="$jobs" -e SWITCH_LSFG_SDK "${mounts[@]}" -w "$R" "$SWITCH_DEV_IMAGE" \
         sh "$R/switch/scripts/$1" "${@:2}"
 }
 step="${1:-all}"

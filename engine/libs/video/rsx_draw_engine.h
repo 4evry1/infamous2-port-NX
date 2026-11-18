@@ -27,6 +27,9 @@
  */
 #ifndef PS3RECOMP_RSX_DRAW_ENGINE_H
 #define PS3RECOMP_RSX_DRAW_ENGINE_H
+#ifdef __SWITCH__
+#include "rsx_constant_plan.h"
+#endif
 
 #include <stdio.h>   /* FILE: rsx_lim_summary */
 #include "rsx_dispatch.h"
@@ -315,7 +318,9 @@ typedef struct rsx_draw_backend {
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
-     * it gets here, so the topology is only ever one a host API has. */
+     * it gets here, so the topology is only ever one a host API has.
+     * CPU vertex/index pointers are borrowed for the callback duration;
+     * deferred backends copy their contents before returning. */
     void (*draw)(void* user, rsx_topology topology, const void* vertices,
                  u32 vertex_count, u32 stride, const u32* indices,
                  u32 index_count);
@@ -437,6 +442,20 @@ typedef struct rsx_draw_backend {
      * backend's own fast path). */
     void (*draw_vbuf_ib_again)(void* user, rsx_topology topology, u32 vbuf,
                                u32 vertex_count, u32 stride, u32 ibuf, u32 index_count);
+#ifdef __SWITCH__
+    /* Optional sparse form of bind_vs_constants_range. The immutable plan
+     * names every row the shader may read inside the original interval.
+     * Rows/plan live until the draw; implementations retaining them copy the
+     * plan. NULL capability keeps the existing contiguous bind contract. */
+    void (*bind_vs_constants_sparse)(void* user, const void* rows, u32 first,
+                                    u32 count, const void* tail, u32 tail_bytes,
+                                    u32 total_bytes, const rsx_constant_plan* plan);
+#endif
+    u64 (*thread_cpu_ns)(void); /* optional, UINT64_MAX when unavailable */
+    /* Optional diagnostic. On this calling thread add explicit GPU wait durations
+     * to the supplied nanosecond counter until detached with NULL. */
+    void (*set_wait_counter)(void* user, u64* nanoseconds);
+    void (*tag_depth_offset)(void* user, u32 handle, u32 location, u32 offset);
 } rsx_draw_backend;
 
 /* The light pass's constants, as the backend's shader reads them. */

@@ -3,6 +3,7 @@
 #include "rsx_vertex_formats.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -186,7 +187,9 @@ void rsx_vertex_fetch_plan_init_layout(
         if (attr >= RSX_DSP_NUM_VERTEX_ATTR)
             continue;
         rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
-        memset(fetch, 0, sizeof *fetch);
+        fetch->stable_base = NULL;
+        fetch->stable_first = 0;
+        fetch->stable_last = 0;
         rsx_dsp_get_vertex_attr(rsx, attr, &fetch->desc);
         fetch->elem_size =
             rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
@@ -293,13 +296,32 @@ void rsx_vertex_fetch_plan_prepare_ex(
             }
             first = plain_first;
             last = plain_last;
-        } else for (u32 i = 0; i < count; i++) {
-            const u32 element = rsx_vertex_element_index(
-                refs[i].vertex_id, refs[i].base_index,
-                fetch->desc.frequency,
-                (plan->divider_mask >> attr) & 1u);
-            if (element < first) first = element;
-            if (element > last) last = element;
+        } else {
+            const u32 e0 = rsx_vertex_element_index(
+                refs[0].vertex_id, refs[0].base_index, 0, 0);
+            if (consecutive && (u64)e0 + count - 1u <= 0x000FFFFFu) {
+                const u32 end = e0 + count - 1u;
+                const u32 frequency = fetch->desc.frequency;
+                first = e0 / frequency;
+                last = end / frequency;
+                if ((plan->divider_mask >> attr) & 1u) {
+                    if (first == last) {
+                        first = e0 % frequency;
+                        last = end % frequency;
+                    } else {
+                        /* Crossing a modulo boundary includes both extrema. */
+                        first = 0;
+                        last = frequency - 1u;
+                    }
+                }
+            } else for (u32 i = 0; i < count; i++) {
+                const u32 element = rsx_vertex_element_index(
+                    refs[i].vertex_id, refs[i].base_index,
+                    fetch->desc.frequency,
+                    (plan->divider_mask >> attr) & 1u);
+                if (element < first) first = element;
+                if (element > last) last = element;
+            }
         }
 
         const u64 prefix =
@@ -393,6 +415,40 @@ static inline u16 rsx_be16(const u8* p)
     return (u16)((p[0] << 8) | p[1]);
 }
 
+static inline void rsx_decode_cmp32(const u8* source, void* output)
+{
+    const u32 word = rsx_be32(source);
+    const s32 x = (s32)(word << 21) >> 21;
+    const s32 y = (s32)(word << 10) >> 21;
+    const s32 z = (s32)word >> 22;
+    const float decoded[4] = {
+        (float)x / 1023.0f, (float)y / 1023.0f,
+        (float)z / 511.0f, 1.0f
+    };
+    memcpy(output, decoded, sizeof decoded);
+}
+
+static inline void rsx_decode_snorm16x3(const u8* source, void* output)
+{
+    const float decoded[4] = {
+        (s16)rsx_be16(source) / 32767.0f,
+        (s16)rsx_be16(source + 2) / 32767.0f,
+        (s16)rsx_be16(source + 4) / 32767.0f, 1.0f
+    };
+    memcpy(output, decoded, sizeof decoded);
+}
+
+static inline void rsx_decode_snorm16x4(const u8* source, void* output)
+{
+    const float decoded[4] = {
+        (s16)rsx_be16(source) / 32767.0f,
+        (s16)rsx_be16(source + 2) / 32767.0f,
+        (s16)rsx_be16(source + 4) / 32767.0f,
+        (s16)rsx_be16(source + 6) / 32767.0f
+    };
+    memcpy(output, decoded, sizeof decoded);
+}
+
 /* The source element for one reference, exactly as rsx_vertex_fetch_one
  * resolves it; NULL when there is none. */
 static inline const u8* rsx_fetch_source(
@@ -457,19 +513,7 @@ static int rsx_vertex_fetch_slot(
             }
         })
     } else if (type == RSX_VTX_TYPE_CMP32) {
-        RSX_FETCH_LOOP({
-            const u32 word = rsx_be32(src);
-            s32 x = (s32)(word & 0x7FF);
-            s32 y = (s32)((word >> 11) & 0x7FF);
-            s32 z = (s32)((word >> 22) & 0x3FF);
-            if (x & 0x400) x -= 0x800;
-            if (y & 0x400) y -= 0x800;
-            if (z & 0x200) z -= 0x400;
-            v[0] = (float)x / 1023.0f;
-            v[1] = (float)y / 1023.0f;
-            v[2] = (float)z / 511.0f;
-            v[3] = 1.0f;
-        })
+        RSX_FETCH_LOOP({ rsx_decode_cmp32(src, v); })
     } else if (type == RSX_VTX_TYPE_HALF && size <= 4) {
         RSX_FETCH_LOOP({
             v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
@@ -489,8 +533,14 @@ static int rsx_vertex_fetch_slot(
             for (u32 k = 0; k < size; k++) v[k] = src[k] / 255.0f;
         })
     } else if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
-        /* inFAMOUS 2's most common attribute (snorm16x3 positions and
-         * normals) used to take the per-element reference decoder. */
+        if (size == 3) {
+            RSX_FETCH_LOOP({ rsx_decode_snorm16x3(src, v); })
+            return 1;
+        }
+        if (size == 4) {
+            RSX_FETCH_LOOP({ rsx_decode_snorm16x4(src, v); })
+            return 1;
+        }
         RSX_FETCH_LOOP({
             v[0] = v[1] = v[2] = 0.0f; v[3] = 1.0f;
             for (u32 k = 0; k < size; k++)
@@ -549,8 +599,9 @@ int rsx_vertex_fetch_all(
  * the normalised formats run four lanes at a time (SSE2 divps: every lane is
  * the IEEE division the scalar divss does), UNORM8 reads a table built with
  * the very division, HALF and FLOAT are the same integer bit moves. Anything
- * else (a wrap of the 20-bit element index, a divider, no span, a size the
- * decoder clamps, an inline stream) takes the attribute's ordinary loop.
+ * else (a wrap of the 20-bit element index, a modulo divider, no span or
+ * an inline stream) takes the attribute's ordinary loop. Divide mode decodes
+ * once per repeated source group within a covered, non-overlapping span.
  * Bit-identical to rsx_vertex_fetch_all (tests/test_vertex_fetch.c). */
 #if defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
 #include <emmintrin.h>
@@ -575,6 +626,98 @@ static void rsx_u8n_init(void)
         __VA_ARGS__                                                          \
     }
 
+/* Integer masks preserve the RSX decoder's signed-zero subnormal flush and
+ * NaN payloads while allowing four components to expand together on A57. */
+static inline u32 rsx_half_component_bits(u16 half)
+{
+    const u32 sign = (u32)(half >> 15) << 31;
+    const u32 exponent = (half >> 10) & 0x1fu;
+    const u32 mantissa = (half & 0x3ffu) << 13;
+    u32 value = ((exponent + 112u) << 23) | mantissa;
+    value ^= (value ^ (0x7f800000u | mantissa)) & (0u - (exponent == 31u));
+    return sign | (value & (0u - (exponent != 0u)));
+}
+
+/* Keep this whole-run kernel separate on A57: inlining spills constants in
+ * the shared format dispatcher and reloads them for every vertex. */
+#if defined(__clang__) && defined(__aarch64__)
+__attribute__((noinline))
+#endif
+static void rsx_vertex_fetch_half4(const u8* base, u8* out, u32 count,
+    u32 source_stride, u32 output_stride)
+{
+    for (u32 i = 0; i < count; ++i) {
+        const u8* source = base + (u64)i * source_stride;
+        const u32 bits[4] = {
+            rsx_half_component_bits(rsx_be16(source)),
+            rsx_half_component_bits(rsx_be16(source + 2)),
+            rsx_half_component_bits(rsx_be16(source + 4)),
+            rsx_half_component_bits(rsx_be16(source + 6))
+        };
+        memcpy(out + (u64)i * output_stride, bits, sizeof bits);
+    }
+}
+
+/* A divided attribute repeats each source element across a run of vertices.
+ * Keep its group decoder out of the ordinary A57 fetch dispatcher's frame. */
+#if defined(__clang__) && defined(__aarch64__)
+__attribute__((noinline))
+#endif
+static int rsx_vertex_fetch_consecutive_fallback(
+    const rsx_vertex_fetch_plan* plan, u32 slot, const rsx_vertex_ref* refs,
+    u32 count, u8* out)
+{
+    const u32 attr = plan->layout.attrs[slot];
+    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+    const u32 frequency = fetch->desc.frequency;
+    const u32 type = fetch->desc.type, size = fetch->desc.size;
+    if (count < 2 || frequency <= 1 || (plan->divider_mask & (1u << attr)) ||
+        !type || !size || !fetch->elem_size || !fetch->stable_base)
+        goto general;
+    const u32 e0 = rsx_vertex_element_index(refs[0].vertex_id, refs[0].base_index, 0, 0);
+    if ((u64)e0 + count - 1u > 0x000fffffu) goto general;
+    u32 element = e0 / frequency;
+    const u32 last = (e0 + count - 1u) / frequency;
+    if (element < fetch->stable_first || last > fetch->stable_last ||
+        last - element + 1u >= count)
+        goto general;
+    const u32 output_stride = plan->layout.stride;
+    const uintptr_t source_begin = (uintptr_t)fetch->stable_base +
+        (u64)(element - fetch->stable_first) * fetch->stride;
+    const u64 source_bytes = (u64)(last - element) * fetch->stride + fetch->elem_size;
+    const uintptr_t output_begin = (uintptr_t)out + slot * 16u;
+    const u64 output_bytes = (u64)(count - 1u) * output_stride + 16u;
+    /* Sequential decoding must remain observable if output aliases input. */
+    if (source_begin <= output_begin ? output_begin - source_begin < source_bytes
+                                    : source_begin - output_begin < output_bytes)
+        goto general;
+    u32 remaining = count;
+    u32 group_count = frequency - e0 % frequency;
+    while (remaining) {
+        if (group_count > remaining) group_count = remaining;
+        const u8* source = fetch->stable_base +
+            (u64)(element - fetch->stable_first) * fetch->stride;
+        float decoded[4];
+        if (type == RSX_VTX_TYPE_CMP32)
+            rsx_decode_cmp32(source, decoded);
+        else if (type == RSX_VTX_TYPE_SNORM16 && size == 3)
+            rsx_decode_snorm16x3(source, decoded);
+        else if (type == RSX_VTX_TYPE_SNORM16 && size == 4)
+            rsx_decode_snorm16x4(source, decoded);
+        else if (!rsx_vertex_decode_element(type, size, source, decoded))
+            goto general;
+        u8* destination = out + (u64)(count - remaining) * output_stride + slot * 16u;
+        for (u32 i = 0; i < group_count; ++i)
+            memcpy(destination + (u64)i * output_stride, decoded, sizeof decoded);
+        remaining -= group_count;
+        ++element;
+        group_count = frequency;
+    }
+    return 1;
+general:
+    return rsx_vertex_fetch_slot(plan, slot, refs, count, out);
+}
+
 /* 1 = the slot was filled, 0 = it has no fast form here (the caller runs the
  * ordinary loop). Never fails a draw: a fast form only reads a stable span. */
 static int rsx_vertex_fetch_slot_fast(
@@ -590,7 +733,13 @@ static int rsx_vertex_fetch_slot_fast(
     const u32 sstride = fetch->stride;
     const u8* const base = fetch->stable_base + (u64)(e0 - fetch->stable_first) * sstride;
     if (type == RSX_VTX_TYPE_FLOAT && size <= 4) {
-        if (size == 3) {
+        if (size == 4) {
+            RSX_FAST_LOOP({
+                const u32 w[4] = { rsx_be32(src), rsx_be32(src + 4),
+                                   rsx_be32(src + 8), rsx_be32(src + 12) };
+                memcpy(vo, w, sizeof w);
+            })
+        } else if (size == 3) {
             RSX_FAST_LOOP({
                 const u32 w[4] = { rsx_be32(src), rsx_be32(src + 4), rsx_be32(src + 8), 0x3F800000u };
                 memcpy(vo, w, 16);
@@ -605,6 +754,10 @@ static int rsx_vertex_fetch_slot_fast(
         return 1;
     }
     if (type == RSX_VTX_TYPE_HALF && size <= 4) {
+        if (size == 4) {
+            rsx_vertex_fetch_half4(base, out + slot * 16u, count, sstride, ostride);
+            return 1;
+        }
         RSX_FAST_LOOP({
             u32 w[4] = { 0u, 0u, 0u, 0x3F800000u };
             for (u32 k = 0; k < size; k++) {
@@ -675,6 +828,28 @@ static int rsx_vertex_fetch_slot_fast(
         })
         return 1;
     }
+#else
+    if (type == RSX_VTX_TYPE_SNORM16 && size <= 4) {
+        if (size == 4) {
+            RSX_FAST_LOOP({ rsx_decode_snorm16x4(src, vo); })
+            return 1;
+        }
+        if (size == 3) {
+            RSX_FAST_LOOP({ rsx_decode_snorm16x3(src, vo); })
+            return 1;
+        }
+        RSX_FAST_LOOP({
+            float decoded[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (u32 k = 0; k < size; k++)
+                decoded[k] = (s16)rsx_be16(src + k * 2u) / 32767.0f;
+            memcpy(vo, decoded, sizeof decoded);
+        })
+        return 1;
+    }
+    if (type == RSX_VTX_TYPE_CMP32) {
+        RSX_FAST_LOOP({ rsx_decode_cmp32(src, vo); })
+        return 1;
+    }
 #endif
     return 0;
 }
@@ -692,7 +867,11 @@ int rsx_vertex_fetch_all_ex(
     const int run = (u64)e0 + count - 1u <= 0x000FFFFFu;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
         if (run && rsx_vertex_fetch_slot_fast(plan, slot, e0, count, out)) continue;
-        if (!rsx_vertex_fetch_slot(plan, slot, refs, count, out)) return 0;
+        const u32 attr = plan->layout.attrs[slot];
+        if (run && plan->attr[attr].desc.frequency > 1 &&
+            !(plan->divider_mask & (1u << attr))) {
+            if (!rsx_vertex_fetch_consecutive_fallback(plan, slot, refs, count, out)) return 0;
+        } else if (!rsx_vertex_fetch_slot(plan, slot, refs, count, out)) return 0;
     }
     return 1;
 }
@@ -711,6 +890,37 @@ static u64 rsx_vertex_remap_hash(u64 value)
  * index buffer always fits; a span past this goes to the hash table. */
 #define RSX_REMAP_DIRECT_MAX (1u << 20)
 
+void rsx_vertex_decode_index_run(const u8* source, rsx_vertex_ref* refs,
+    u32 count, int is_u32, u32 base_index, rsx_vertex_ref_bounds* bounds)
+{
+    u32 low = UINT32_MAX, high = 0;
+    /* Wider interleaving makes A57 save eight SIMD registers for this loop. */
+    if (is_u32) {
+#if defined(__clang__) && defined(__aarch64__)
+#pragma clang loop interleave_count(1) unroll(disable)
+#endif
+        for (u32 i = 0; i < count; ++i) {
+            u32 raw; memcpy(&raw, source + (size_t)i * sizeof raw, sizeof raw);
+            const u32 index = __builtin_bswap32(raw);
+            refs[i] = (rsx_vertex_ref){index, base_index};
+            if (index < low) low = index;
+            if (index > high) high = index;
+        }
+    } else {
+#if defined(__clang__) && defined(__aarch64__)
+#pragma clang loop interleave_count(1) unroll(disable)
+#endif
+        for (u32 i = 0; i < count; ++i) {
+            u16 raw; memcpy(&raw, source + (size_t)i * sizeof raw, sizeof raw);
+            const u32 index = __builtin_bswap16(raw);
+            refs[i] = (rsx_vertex_ref){index, base_index};
+            if (index < low) low = index;
+            if (index > high) high = index;
+        }
+    }
+    *bounds = (rsx_vertex_ref_bounds){low, high, base_index};
+}
+
 int rsx_vertex_remap_build_range(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* out_count)
@@ -719,12 +929,25 @@ int rsx_vertex_remap_build_range(
         return 0;
     const u32 base = refs[0].base_index;
     u32 lo = refs[0].vertex_id, hi = lo;
+    u32 base_difference = 0;
     for (u32 i = 1; i < count; i++) {
         const u32 v = refs[i].vertex_id;
-        if (refs[i].base_index != base) return 0;
+        base_difference |= refs[i].base_index ^ base;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
     }
+    if (base_difference) return 0;
+    const rsx_vertex_ref_bounds bounds = {lo, hi, base};
+    return rsx_vertex_remap_build_range_with_bounds(remap, refs, count, &bounds, out_count);
+}
+
+int rsx_vertex_remap_build_range_with_bounds(rsx_vertex_remap* remap,
+    rsx_vertex_ref* refs, u32 count, const rsx_vertex_ref_bounds* bounds,
+    u32* out_count)
+{
+    if (!remap || !refs || !count || !bounds || !out_count || bounds->low > bounds->high)
+        return 0;
+    const u32 lo = bounds->low, hi = bounds->high, base = bounds->base_index;
     const u64 span = (u64)hi - lo + 1u;
     if (span > count)
         return 0;

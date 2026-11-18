@@ -18,9 +18,7 @@ the native PC port of inFAMOUS 2. It adds a Switch target (`switch/`) next to th
 the port's engine, a build for aarch64 with devkitA64 and libnx, and rendering through Vulkan on Mesa's NVK driver.
 For the PC port itself, its releases and its bug reports, go to the upstream repository.
 
-> 🧪 **Experimental: playable, slow.** About 9-10 fps in light scenes and 7-8 fps in heavy ones on one tested
-> console (CPU at 1785 MHz); the CPU is the limit, not the GPU. Audio is mostly smooth. Details and known issues:
-> **[switch/README.md](switch/README.md)**.
+> **Switch build hz-0.114 is experimental.** The opening and bridge-to-city route are playable, with uneven frame pacing and occasional audio crackle. In a heavy tower view, hz-0.111 delivered **8.2 game frames per second** at 6,720 draws per frame. The latest renderer changes have passed local tests. Their effect at the tower still needs a console measurement. [Switch setup, graphics options and known issues](switch/README.md)
 
 **Nothing of the game is in this repository, and there are no ready-made downloads.** You build the program from
 your own copy of the game, on a Linux PC:
@@ -457,15 +455,7 @@ runs on your distribution and GPU.
 
 ## 🎮 Nintendo Switch (homebrew, experimental)
 
-The port also builds for the Nintendo Switch as a homebrew program (`.nro`, Atmosphère, title takeover), from your
-own copy of the game, on a Linux PC. It is playable but slow: about 9-10 fps in light scenes and 7-8 in heavy ones,
-CPU bound; audio is mostly smooth. How to build it, what it needs and its known issues: **[switch/README.md](switch/README.md)**.
-
-```
-tools/setup.sh --prepare-only --disc <your game folder> --rpcs3 <RPCS3's data folder>
-SWITCH_DEV_IMAGE=<Switch build image> switch/build.sh
-switch/build.sh sdcard <your SD card's root>
-```
+For the native Switch build, source requirements, SD layout and graphics options, see the [Switch guide](switch/README.md).
 
 ## 🔄 Updates
 

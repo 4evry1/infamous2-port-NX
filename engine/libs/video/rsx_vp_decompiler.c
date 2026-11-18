@@ -268,6 +268,10 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
 {
     if (!usage) return -1;
     usage->lo = 1; usage->hi = 0; usage->relative = 0; usage->valid = 0;
+#ifdef __SWITCH__
+    memset(&usage->sparse, 0, sizeof usage->sparse);
+    u64 rows[8] = {0};
+#endif
     if (!ucode) return -1;
     u32 off = 0;
     int instrs = 0;
@@ -289,10 +293,20 @@ int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
             if ((src[i] & 3u) != 3u) continue;
             if (index_const) { usage->relative = 1; continue; }
             const u32 c = const_src & 511u;
+#ifdef __SWITCH__
+            rows[c / 64] |= 1ull << (c % 64);
+#endif
             if (usage->lo > usage->hi) { usage->lo = usage->hi = c; }
             else { if (c < usage->lo) usage->lo = c; if (c > usage->hi) usage->hi = c; }
         }
-        if (d3 & 1u) { usage->valid = 1; return instrs; }
+        if (d3 & 1u) {
+            usage->valid = 1;
+#ifdef __SWITCH__
+            if (!usage->relative && usage->lo <= usage->hi)
+                rsx_constant_plan_build(&usage->sparse, rows, usage->lo, usage->hi - usage->lo + 1u);
+#endif
+            return instrs;
+        }
     }
     return -1;
 }

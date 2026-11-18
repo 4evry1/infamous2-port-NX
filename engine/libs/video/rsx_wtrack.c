@@ -1,5 +1,6 @@
 /* rsx_wtrack.c -- see rsx_wtrack.h. Windows only; elsewhere every query says
  * "not clean" and the caches hash as before. */
+#define RSX_WTRACK_IMPLEMENTATION
 #include "rsx_wtrack.h"
 
 #include <stdio.h>

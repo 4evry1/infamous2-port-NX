@@ -183,6 +183,12 @@ u32 rsx_fp_sanitize_constant_word(u32 w)
     return 0;
 }
 
+void rsx_fp_read_constant_vec4(const u8* source, u32* output)
+{
+    for (u32 component = 0; component < 4u; ++component)
+        output[component] = rsx_fp_sanitize_constant_word(rsx_fp_read_word(source + component * 4u));
+}
+
 static int fp_collect_constants_impl(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
 
@@ -221,8 +227,9 @@ static int fp_collect_constants_impl(
             if (off + 16 > max_bytes ||
                 out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
                 return -1;
+            u32* values = out->values[out->count];
             for (u32 component = 0; component < 4; ++component)
-                out->values[out->count][component] =
+                values[component] =
                     rsx_fp_sanitize_constant_word(
                         rsx_fp_read_word(ucode + off + component * 4));
             out->count++;

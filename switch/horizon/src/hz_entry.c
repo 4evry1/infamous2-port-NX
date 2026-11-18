@@ -10,6 +10,8 @@
  *   - the game's main() runs on its own thread with a large stack; this thread keeps the screen.
  * Nothing here draws the game: the Vulkan surface is a later step. */
 #include <hz_layer.h>
+#include <hz_target.h>
+#include "hz_log_batch.h"
 #include <switch.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +24,7 @@
 #include <unistd.h>
 
 #define HZ_APP "sdmc:/switch/infamous2-port"
-#define HZ_VERSION "hz-0.56"
+#define HZ_VERSION "hz-0.114"
 
 int __real_main(int argc, char **argv);
 int __real_pthread_attr_setstacksize(pthread_attr_t *attr, size_t size);
@@ -30,6 +32,17 @@ int __real_pthread_attr_setstacksize(pthread_attr_t *attr, size_t size);
 /* ---- the game's own output, live: every line it prints goes to its log file AND into a ring of
  *      the most recent lines, which the status screen shows under the status line -------------- */
 #include <reent.h>
+
+/* CPU residency of this thread across all cores, for sampled draw diagnostics. */
+uint64_t hz_draw_thread_cpu_ns(void)
+{
+    u64 ticks;
+    const u32 info = hosversionAtLeast(13, 0, 0) ? InfoType_ThreadTickCount : InfoType_ThreadTickCountDeprecated;
+    if (R_FAILED(svcGetInfo(&ticks, info, CUR_THREAD_HANDLE, TickCountInfo_Total)))
+        return UINT64_MAX;
+    return armTicksToNs(ticks);
+}
+
 enum { HZ_RING_LINES = 64, HZ_RING_WIDTH = 100, HZ_SCREEN_COLUMNS = 79, HZ_SCREEN_LOG_ROWS = 31 };
 static char s_ring[HZ_RING_LINES][HZ_RING_WIDTH];
 static volatile uint32_t s_ring_count;       /* lines ever stored; the newest is (count - 1) % LINES */
@@ -161,9 +174,75 @@ Result __wrap_nwindowQueueBuffer(NWindow *nw, s32 slot, const NvMultiFence *fenc
 static unsigned s_profile_at[8];
 static int s_profile_at_count;
 static volatile int s_screen_owned;
+enum { LOG_OUT, LOG_ERR, LOG_PLAY, LOG_COUNT };
+static hz_log_sink *s_logs[LOG_COUNT];
+static FILE *s_log_stdout;
+static Thread s_writer;
+static UEvent s_stop_writer;
+static int s_writer_started;
+
+/* Renderer bridge. The launcher opens the configured path before the guest starts. */
+int hz_playlog_available(void) { return s_logs[LOG_PLAY] != NULL; }
+void hz_playlog_append(const char *text, size_t length)
+{
+    hz_log_append(s_logs[LOG_PLAY], text, length);
+}
+
+static void flush_logs(void)
+{
+    for (int i = 0; i < LOG_COUNT; ++i) hz_log_flush(s_logs[i]);
+}
+
+static void log_writer(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        Result rc = waitSingle(waiterForUEvent(&s_stop_writer), 2000000000ull);
+        if (R_SUCCEEDED(rc)) break;
+        flush_logs();
+    }
+}
+
+static void finish_logs(void)
+{
+    if (s_writer_started) {
+        ueventSignal(&s_stop_writer);
+        threadWaitForExit(&s_writer);
+        threadClose(&s_writer);
+        s_writer_started = 0;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    flush_logs();
+    /* Other game threads may still unwind. Sinks and descriptors live until process exit. */
+}
+
+static void start_log_writer(void)
+{
+    /* Avoid counting the diagnostic writer as a guest thread or changing guest core assignment. */
+    extern Result __real_threadCreate(Thread *, ThreadFunc, void *, void *, size_t, int, int);
+    ueventCreate(&s_stop_writer, false);
+    if (R_SUCCEEDED(__real_threadCreate(&s_writer, log_writer, NULL, NULL, 0x8000, 59, -2))) {
+        if (R_SUCCEEDED(threadStart(&s_writer))) s_writer_started = 1;
+        else threadClose(&s_writer);
+    }
+    atexit(finish_logs);
+}
+
+static int open_log_sink(int channel, const char *path)
+{
+    if (s_quiet || !path || !*path) return -1;
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0666);
+    if (fd >= 0) {
+        s_logs[channel] = hz_log_create(fd);
+        if (!s_logs[channel]) { close(fd); return -1; }
+    }
+    return fd;
+}
+
 static _ssize_t stream_write(struct _reent *reent, void *cookie, const char *text, _READ_WRITE_BUFSIZE_TYPE length)
 {
-    FILE *stream = cookie;
+    (void)reent;
     if (s_quiet) {
         /* the no-logs build: nothing goes to the card; the text screen still shows the boot */
         if (length > 0 && s_screen_owned) ring_add(text, (size_t)length);
@@ -171,16 +250,16 @@ static _ssize_t stream_write(struct _reent *reent, void *cookie, const char *tex
     }
     if (length > 0) {
         ring_add(text, (size_t)length);
+        hz_log_append(s_logs[cookie == s_log_stdout ? LOG_OUT : LOG_ERR], text, (size_t)length);
         __atomic_fetch_add(&s_log_bytes, (uint64_t)length, __ATOMIC_RELAXED);
     }
-    return _write_r(reent, stream->_file, text, (size_t)length);
+    return length;
 }
 /* Point a standard stream at a log file on its own descriptor, with the ring in front of it.
  * Not freopen(): it closes descriptor 1 and the file then gets that number back, so everything
  * written "to the screen" landed in stdout.log and the screen stayed black (hz-0.1, hz-0.2). */
-static void stream_to_log(FILE *stream, const char *path)
+static void stream_to_log(FILE *stream, int fd)
 {
-    const int fd = s_quiet ? -1 : open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     fflush(stream);
     if (fd > 2) stream->_file = (short)fd;
     stream->_cookie = stream;
@@ -189,7 +268,27 @@ static void stream_to_log(FILE *stream, const char *path)
 }
 
 /* ---- the screen: fd 1 stays libnx's console after stdout itself is reopened on a file -------- */
-static volatile int s_screen_owned = 1;   /* the text console has the screen (see hz_screen_handover) */
+static int s_text_console_enabled = 1;
+static volatile int s_screen_owned;   /* see hz_screen_handover */
+
+static void text_console_start(void)
+{
+    if (!s_text_console_enabled || s_screen_owned) return;
+    consoleInit(NULL);
+    s_screen_owned = 1;
+}
+
+static void text_console_refresh(void)
+{
+    if (s_screen_owned) consoleUpdate(NULL);
+}
+
+static void text_console_stop(void)
+{
+    if (!s_screen_owned) return;
+    consoleExit(NULL);
+    s_screen_owned = 0;
+}
 volatile int hz_screen_request;           /* 1 = the renderer wants the screen, 2 = it gave it back */
 /* Called by the renderer's window shim (any thread): ask the main thread and wait until it did it. */
 void hz_screen_handover(int request)
@@ -336,7 +435,7 @@ void __libnx_exception_handler(ThreadExceptionDump *ctx)
                (unsigned long long)hz_mman_stats[2]);
     fault_line("*** stopped. Logs are in " HZ_APP "/logs. Press HOME to leave.\n");
     if (s_fault_fd >= 0) fsync(s_fault_fd);
-    consoleUpdate(NULL);
+    text_console_refresh();
     for (;;) svcSleepThread(1000000000ull);
 }
 
@@ -377,6 +476,28 @@ static long long file_bytes(const char *path)
  *  - how busy each core really is. The sampling profiler counts a thread as busy when it is
  *    runnable, which says nothing about cores; the kernel's idle tick counters do. Horizon only
  *    answers for the core the caller is on, so this thread visits each allowed core in turn. */
+static unsigned module_clock_mhz(PcvModuleId module_id, PcvModule legacy_module)
+{
+    u32 hz = 0;
+    if (R_SUCCEEDED(clkrstInitialize())) {
+        ClkrstSession session;
+        if (R_SUCCEEDED(clkrstOpenSession(&session, module_id, 3))) {
+            const int read_ok = R_SUCCEEDED(clkrstGetClockRate(&session, &hz));
+            clkrstCloseSession(&session);
+            clkrstExit();
+            if (read_ok) return (unsigned)(hz / 1000000u);
+        } else {
+            clkrstExit();
+        }
+    }
+    hz = 0;
+    if (R_SUCCEEDED(pcvInitialize())) {
+        if (R_FAILED(pcvGetClockRate(legacy_module, &hz))) hz = 0;
+        pcvExit();
+    }
+    return (unsigned)(hz / 1000000u);
+}
+
 static unsigned cpu_mhz(void)
 {
     static int state;               /* 0 = not tried, 1 = clkrst, 2 = pcv, -1 = neither */
@@ -418,8 +539,7 @@ int __wrap_main(int argc, char **argv)
     PadState pad;
     u64 start, total_memory = 0, used_memory = 0;
     int spu_selftest_failed = 0;
-    int from_file, tick = 0, fast_tick = 0, keep_tick = 0, quiet_ticks = 0, stall_reports = 0;
-    uint64_t quiet_bytes = 0;
+    int from_file, tick = 0, fast_tick = 0, keep_tick = 0, stall_reports = 0;
     int combo_was = 0;
 
     mkdir(HZ_APP, 0777);
@@ -434,16 +554,36 @@ int __wrap_main(int argc, char **argv)
         name = name ? name + 1 : self;
         s_quiet = strstr(name, "quiet") != NULL || strstr(name, "nolog") != NULL;
         if (getenv("HZ_QUIET")) s_quiet = (int)env_number("HZ_QUIET", 0) != 0;
-        if (s_quiet) { unsetenv("PS3RECOMP_PLAYLOG"); unsetenv("AUDIO_PEAK"); }
+        if (s_quiet) {
+            unsetenv("PS3RECOMP_PLAYLOG"); unsetenv("AUDIO_PEAK");
+            /* Both launchers share env.txt; the route probes have no consumer in quiet mode. */
+            unsetenv("PS3RECOMP_SHADOW_TIMING");
+            unsetenv("PS3RECOMP_ROUTE_TIMING");
+            setenv("PS3RECOMP_ENG_TEX_TIMING", "0", 0);
+        }
     }
     /* The console keeps descriptors 1 and 2; the stdout and stderr STREAMS are pointed at log files
      * on descriptors of their own. Not freopen(): it closes descriptor 1 and the file then gets
      * that number back, so everything written "to the screen" landed in stdout.log and the screen
      * stayed black (console runs 1 and 2, hz-0.1 / hz-0.2). */
-    consoleInit(NULL);
-    stream_to_log(stdout, HZ_APP "/logs/stdout.log");
-    stream_to_log(stderr, HZ_APP "/logs/stderr.log");
+    s_text_console_enabled = env_number("HZ_TEXT_CONSOLE", 1) != 0;
+    text_console_start();
+    s_log_stdout = stdout;
+    stream_to_log(stdout, open_log_sink(LOG_OUT, HZ_APP "/logs/stdout.log"));
+    stream_to_log(stderr, open_log_sink(LOG_ERR, HZ_APP "/logs/stderr.log"));
     s_fault_fd = open(HZ_APP "/logs/fault.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (!s_quiet) {
+        const char *playlog = getenv("PS3RECOMP_PLAYLOG");
+        open_log_sink(LOG_PLAY, playlog);
+        start_log_writer();
+        screen("diagnostic writer %s, stdout %s, stderr %s, playlog %s\n",
+               s_writer_started ? "background" : "status fallback",
+               s_logs[LOG_OUT] ? "open" : "unavailable", s_logs[LOG_ERR] ? "open" : "unavailable",
+               s_logs[LOG_PLAY] ? "open" : "off/unavailable");
+        fprintf(stderr, "[hz-log] writer=%s stdout=%d stderr=%d playlog=%d capacity=%u per stream\n",
+                s_writer_started ? "background" : "status", !!s_logs[LOG_OUT], !!s_logs[LOG_ERR],
+                !!s_logs[LOG_PLAY], HZ_LOG_CAPACITY);
+    }
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     /* any controller id: no REPORT fired in runs 14-23 (hz-0.18 .. hz-0.24) with only player 1 +
      * handheld read here, while the game's SDL input layer sets the controllers up its own way */
@@ -481,7 +621,7 @@ int __wrap_main(int argc, char **argv)
 
     svcGetInfo(&total_memory, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
     svcGetInfo(&used_memory, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    screen("inFAMOUS 2 port, Switch boot probe " HZ_VERSION "%s\n", s_quiet ? "  [NO LOGS: nothing is written to the card]" : "  [logging]");
+    screen("inFAMOUS 2 port, Switch boot probe " HZ_VERSION "%s\n", s_quiet ? "  [quiet; crash reporting active]" : "  [logging]");
     screen("folder  " HZ_APP "\n");
     screen("memory  %llu MiB for this process, %llu MiB used at start%s\n", (unsigned long long)(total_memory >> 20),
            (unsigned long long)(used_memory >> 20),
@@ -491,10 +631,18 @@ int __wrap_main(int argc, char **argv)
     screen("cores   allowed mask 0x%llx (%d core(s))%s\n", (unsigned long long)hz_core_mask,
            __builtin_popcountll(hz_core_mask), (hz_core_mask & 8) ? ", core 3 unlocked" : ", core 3 not available (no forwarder)");
     fprintf(stderr, "[hz] core mask 0x%llx, core mode %d\n", (unsigned long long)hz_core_mask, hz_core_mode);
+    {
+        u64 program_id = 0;
+        const Result result = svcGetInfo(&program_id, InfoType_ProgramId, CUR_PROCESS_HANDLE, 0);
+        if (R_SUCCEEDED(result))
+            fprintf(stderr, "[hz] program id %016llX (sys-clk profile key)\n", (unsigned long long)program_id);
+        else
+            fprintf(stderr, "[hz] program id unavailable (result=0x%X)\n", (unsigned)result);
+    }
     screen("clock   CPU %u MHz at start (1020 = stock, 1785 = sys-clk maximum; read again every 10 s in the log)\n", cpu_mhz());
     screen("EBOOT   %s\n", file_bytes(HZ_APP "/EBOOT.elf") > 0 ? "found" : "MISSING: " HZ_APP "/EBOOT.elf");
     screen("disc    %s\n", file_bytes(HZ_APP "/game/disc/PS3_GAME/PARAM.SFO") > 0 ? "found" : "not on the card (boot stops at the first disc file)");
-    consoleUpdate(NULL);
+    text_console_refresh();
     fprintf(stderr, "[hz] " HZ_VERSION " process memory %llu MiB, env.txt settings %d\n",
             (unsigned long long)(total_memory >> 20), from_file);
     /* The SPU float forms of this build against the exact ones, on this CPU (hz_spu_selftest.c).
@@ -507,7 +655,7 @@ int __wrap_main(int argc, char **argv)
         screen("spu     float self-test: %ld results checked in %u ms, %ld differ%s\n", checked, ms, bad,
                bad ? "  <-- BUILD IS WRONG, game not started" : " (good)");
         fprintf(stderr, "[hz] spu float self-test: %ld results checked in %u ms, %ld differ, %ld speculative vectors passed their verdict\n", checked, ms, bad, hz_spu_spec_ok);
-        consoleUpdate(NULL);
+        text_console_refresh();
         spu_selftest_failed = bad != 0;
     }
     {   /* hz-0.32: the NEON vmaddfp / vnmsubfp of ppu_vmx.h against their scalar forms (hz_vmx_selftest.c) */
@@ -519,10 +667,11 @@ int __wrap_main(int argc, char **argv)
         screen("vmx     self-test: %ld lanes checked in %u ms, %ld differ%s\n", checked, ms, bad,
                bad ? "  <-- BUILD IS WRONG, game not started" : " (good)");
         fprintf(stderr, "[hz] vmx self-test: %ld lanes checked in %u ms, %ld differ\n", checked, ms, bad);
-        consoleUpdate(NULL);
+        text_console_refresh();
         if (bad) spu_selftest_failed = 1;
     }
 
+    if (!s_quiet) hz_target_configure(getenv("HZ_TARGET_DRAWS"));
     pthread_attr_init(&attr);
     __real_pthread_attr_setstacksize(&attr, (size_t)(env_number("HZ_MAIN_STACK_MB", 16) << 20));
     if (spu_selftest_failed) {
@@ -544,9 +693,10 @@ int __wrap_main(int argc, char **argv)
         /* The screen is one window: the text console has it until the renderer opens its surface
          * (hz_window.c asks, this thread lets go), and gets it back when that surface is dropped
          * or the game ends. All console calls stay on this thread. */
-        if (request == 1 && s_screen_owned) { consoleExit(NULL); s_screen_owned = 0; }
-        if ((request == 2 || done) && !s_screen_owned) { consoleInit(NULL); s_screen_owned = 1; fast_tick = 0; }
+        if (request == 1) text_console_stop();
+        if ((request == 2 || done) && !s_screen_owned) { text_console_start(); fast_tick = 0; }
         if (request) __atomic_store_n(&hz_screen_request, 0, __ATOMIC_RELEASE);
+        if (done && !s_text_console_enabled) break;
         if (s_screen_owned && !s_faulted && (fast_tick++ % 5) == 0) {
             const uint32_t count = __atomic_load_n(&s_ring_count, __ATOMIC_ACQUIRE);
             fflush(stdout); fflush(stderr);
@@ -572,30 +722,36 @@ int __wrap_main(int argc, char **argv)
             if (done) {
                 screen("\x1b[45;1Hmain() returned %d (precommit failures %llu, failed slabs %llu). Press + to exit.\x1b[K",
                        s_game_result, (unsigned long long)hz_mman_precommit_failed, (unsigned long long)hz_mman_stats[1]);
-                consoleUpdate(NULL);
+                text_console_refresh();
                 while (appletMainLoop()) {
                     padUpdate(&pad);
                     if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
-                    consoleUpdate(NULL);
+                    text_console_refresh();
                     svcSleepThread(50000000ull);
                 }
                 break;
             }
         }
-        if (s_screen_owned) consoleUpdate(NULL);
+        if (s_screen_owned) text_console_refresh();
+        hz_target_poll(HZ_APP "/logs", (uintptr_t)&__libnx_exception_handler);
         hz_game_step_patch();
         hz_detail_patch();
-        /* Every 2 s, whoever has the screen: the logs are made durable. fflush() alone leaves the
-         * tail in the file system's own buffers, and a game closed with HOME lost it (run 5). */
         if (!s_quiet && ++keep_tick % 20 == 0) {
-            const uint64_t bytes = __atomic_load_n(&s_log_bytes, __ATOMIC_RELAXED);
             fflush(stdout); fflush(stderr);
-            fsync(stdout->_file); fsync(stderr->_file);
-            (void)bytes; (void)quiet_bytes; (void)quiet_ticks;
+            if (!s_writer_started) flush_logs();
             if (keep_tick % 100 == 0) {
+                unsigned long long dropped = 0, errors = 0;
+                for (int i = 0; i < LOG_COUNT; ++i) {
+                    dropped += hz_log_dropped(s_logs[i]);
+                    errors += hz_log_errors(s_logs[i]);
+                }
+                fprintf(stderr, "[hz-log] dropped_bytes=%llu io_errors=%llu\n", dropped, errors);
                 core_usage_sample();
                 fprintf(stderr, "[hz] t=%us CPU %u MHz, cores busy %d%% %d%% %d%% %d%% over the last 10 s\n", seconds, cpu_mhz(),
                         s_core_busy[0], s_core_busy[1], s_core_busy[2], s_core_busy[3]);
+                fprintf(stderr, "[hz-clocks] t=%us GPU %u MHz, memory %u MHz (0=unavailable; read-only)\n", seconds,
+                        module_clock_mhz(PcvModuleId_GPU, PcvModule_GPU),
+                        module_clock_mhz(PcvModuleId_EMC, PcvModule_EMC));
             }
             if (keep_tick % 100 == 0)
                 fprintf(stderr, "[hz] t=%us guest %llu MiB, locks queued %llu, stack clamps %llu, audio: %llu buffers played, %llu frames dropped, %llu append failures; threads %llu made, %llu reaped, %llu failed\n",
@@ -644,14 +800,14 @@ int __wrap_main(int argc, char **argv)
                         stall_reports, seconds, stalled ? "FRAME STALL: no picture for HZ_STALL_MS" : timed ? "HZ_PROFILE_AT" : "MINUS+PLUS",
                         (unsigned long)(uintptr_t)&__libnx_exception_handler);
                 hz_thread_report(log_line);
-                fflush(stderr); fsync(stderr->_file);
+                fflush(stderr); hz_log_flush(s_logs[LOG_ERR]);
                 {   /* then 20 s of sampling at 100 Hz (10 s for a stall): where the time goes (tools: hz_profile.py) */
                     char path[96];
                     uint64_t taken;
                     snprintf(path, sizeof path, HZ_APP "/logs/profile-%d.bin", stall_reports);
                     taken = hz_profile_run(path, stalled ? 10 : 20, 100, (uintptr_t)&__libnx_exception_handler);
                     fprintf(stderr, "[hz] PROFILE %d: %llu samples in %s\n", stall_reports, (unsigned long long)taken, path);
-                    fflush(stderr); fsync(stderr->_file);
+                    fflush(stderr); hz_log_flush(s_logs[LOG_ERR]);
                 }
             }
             combo_was = combo;
@@ -659,6 +815,7 @@ int __wrap_main(int argc, char **argv)
         svcSleepThread(100000000ull);
     }
     fflush(stdout); fflush(stderr);
-    if (s_screen_owned) consoleExit(NULL);
+    if (!s_quiet) flush_logs();
+    text_console_stop();
     return s_game_result;
 }

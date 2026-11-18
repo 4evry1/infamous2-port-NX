@@ -230,7 +230,7 @@ static void fd_draw(u32 prim, rsx_topology topology, const rsx_vertex_layout_pla
         g.zdepths[zslot].had_write = 0;
     }
     if (g.be->vs_constants_gen) g.be->vs_constants_gen(g.be->user, p.gen);
-    g.be->bind_vs_constants_range(g.be->user, g.rsx.constants, g.vpc_lo, g.vpc_n, p.xf, sizeof p.xf, ENG_VP_CB_BYTES);
+    eng_bind_vs_range(p.xf, sizeof p.xf);
     g.be->bind_ps_constants(g.be->user, g.fp_cb, p.fp_bytes);
     if (p.sc_send) g.be->set_scissor(g.be->user, p.sc[0], p.sc[1], p.sc[2], p.sc[3]);
     if (p.sref_send) g.be->set_stencil_ref(g.be->user, p.sref);
@@ -238,6 +238,7 @@ static void fd_draw(u32 prim, rsx_topology topology, const rsx_vertex_layout_pla
     if (p.clamp_send) eng_apply_depth_clip(s_dl.sf.zeta_offset, &s_dl.rs, s_dl.vpt.scale[1]);
     DL_MARK(8);
     DL_MARK_DRAW0();
+    eng_shadow_start_draw();
     if (g.be->draw_vbuf_ib_again)
         g.be->draw_vbuf_ib_again(g.be->user, p.topology, p.vbuf, p.vcount, p.stride, p.ibuf, p.icount);
     else
@@ -281,6 +282,9 @@ static struct {
     /* this draw's sends */
     u32 n_gen, gen, n_vsr, n_vsf, n_ps, ps_bytes, n_draw, kind;
     const void* rows; u32 first, count, tail_bytes, total; u8 tail[64];
+#ifdef __SWITCH__
+    rsx_constant_plan sparse;
+#endif
     rsx_topology topo; u32 vbuf, vcount, stride, ibuf, icount;
     u64 checked, diffs;
 } s_fdv;
@@ -298,13 +302,29 @@ static void fdv_vs_constants_gen(void* u, u32 gen) { s_fdv.n_gen++; s_fdv.gen = 
 static void fdv_bind_vs_constants(void* u, const void* d, u32 b) { s_fdv.n_vsf++; if (!s_fdv.dry) FDV_REAL->bind_vs_constants(u, d, b); }
 static void fdv_clear_depth_stencil(void* u, u32 d, u32 f, float z, u8 st)
 { s_fdv.n_clear++; if (!s_fdv.dry) FDV_REAL->clear_depth_stencil(u, d, f, z, st); }
-static void fdv_bind_vs_constants_range(void* u, const void* rows, u32 first, u32 count, const void* tail, u32 tb, u32 total)
+static void fdv_note_vs_range(const void* rows, u32 first, u32 count, const void* tail, u32 tb, u32 total)
 {
     s_fdv.n_vsr++; s_fdv.rows = rows; s_fdv.first = first; s_fdv.count = count; s_fdv.total = total; s_fdv.tail_bytes = tb;
     memset(s_fdv.tail, 0, sizeof s_fdv.tail);
     if (tail) memcpy(s_fdv.tail, tail, tb < sizeof s_fdv.tail ? tb : sizeof s_fdv.tail);
+#ifdef __SWITCH__
+    memset(&s_fdv.sparse, 0, sizeof s_fdv.sparse);
+#endif
+}
+static void fdv_bind_vs_constants_range(void* u, const void* rows, u32 first, u32 count, const void* tail, u32 tb, u32 total)
+{
+    fdv_note_vs_range(rows, first, count, tail, tb, total);
     if (!s_fdv.dry) FDV_REAL->bind_vs_constants_range(u, rows, first, count, tail, tb, total);
 }
+#ifdef __SWITCH__
+static void fdv_bind_vs_constants_sparse(void* u, const void* rows, u32 first, u32 count,
+                                       const void* tail, u32 tb, u32 total, const rsx_constant_plan* plan)
+{
+    fdv_note_vs_range(rows, first, count, tail, tb, total);
+    s_fdv.sparse = *plan;
+    if (!s_fdv.dry) FDV_REAL->bind_vs_constants_sparse(u, rows, first, count, tail, tb, total, plan);
+}
+#endif
 static void fdv_bind_ps_constants(void* u, const void* d, u32 b)
 {
     s_fdv.n_ps++; s_fdv.ps_bytes = b;
@@ -377,6 +397,9 @@ static void fdv_install(void)
 #define FDV_SET(name) if (g.be->name) s_fdv.be.name = fdv_##name;
     FDV_SET(bind_targets) FDV_SET(bind_pipeline) FDV_SET(vs_constants_gen) FDV_SET(bind_vs_constants)
     FDV_SET(bind_vs_constants_range) FDV_SET(bind_ps_constants) FDV_SET(bind_textures) FDV_SET(bind_vertex_textures)
+#ifdef __SWITCH__
+    FDV_SET(bind_vs_constants_sparse)
+#endif
     FDV_SET(set_viewport) FDV_SET(set_scissor) FDV_SET(set_stencil_ref) FDV_SET(set_hud) FDV_SET(set_depth_bias)
     FDV_SET(set_depth_clamp) FDV_SET(draw) FDV_SET(draw_vbuf) FDV_SET(draw_vbuf_ib) FDV_SET(draw_vbuf_ib_again)
     FDV_SET(clear_depth_stencil)
@@ -398,6 +421,9 @@ static struct {
     fdv_state sent;
     u32 n_gen, gen, n_vsr, n_vsf, n_ps, ps_bytes, n_draw, kind, n_clear;
     const void* rows; u32 first, count, tail_bytes, total; u8 tail[64];
+#ifdef __SWITCH__
+    rsx_constant_plan sparse;
+#endif
     u8* ps; u32 ps_cap;
     rsx_topology topo; u32 vbuf, vcount, stride, ibuf, icount;
     u64 runs, skipped, diffs;
@@ -442,6 +468,9 @@ static void fdv_dry_run(rsx_topology topology, const rsx_vertex_layout_plan* lay
     s_fdv2.sent = s_fdv.sent;
     s_fdv2.n_gen = s_fdv.n_gen; s_fdv2.gen = s_fdv.gen; s_fdv2.n_vsr = s_fdv.n_vsr; s_fdv2.n_vsf = s_fdv.n_vsf;
     s_fdv2.rows = s_fdv.rows; s_fdv2.first = s_fdv.first; s_fdv2.count = s_fdv.count;
+#ifdef __SWITCH__
+    s_fdv2.sparse = s_fdv.sparse;
+#endif
     s_fdv2.tail_bytes = s_fdv.tail_bytes; s_fdv2.total = s_fdv.total; memcpy(s_fdv2.tail, s_fdv.tail, sizeof s_fdv2.tail);
     s_fdv2.n_ps = s_fdv.n_ps; s_fdv2.ps_bytes = s_fdv.ps_bytes;
     if (s_fdv.n_ps && s_fdv.ps_bytes <= s_fdv.psc_cap) {
@@ -493,6 +522,9 @@ static void fdv_dry_check(void)
     FDV_W(s_fdv.n_vsr != s_fdv2.n_vsr || s_fdv.n_vsf != s_fdv2.n_vsf || s_fdv.rows != s_fdv2.rows || s_fdv.first != s_fdv2.first ||
           s_fdv.count != s_fdv2.count || s_fdv.tail_bytes != s_fdv2.tail_bytes || s_fdv.total != s_fdv2.total ||
           memcmp(s_fdv.tail, s_fdv2.tail, sizeof s_fdv.tail), "vertex-constants");
+#ifdef __SWITCH__
+    FDV_W(!rsx_constant_plan_equal(&s_fdv.sparse, &s_fdv2.sparse), "vertex-constant-spans");
+#endif
     FDV_W(s_fdv.n_ps != s_fdv2.n_ps || s_fdv.ps_bytes != s_fdv2.ps_bytes || s_fdv.ps_bytes > s_fdv.psc_cap ||
           s_fdv2.ps_bytes > s_fdv2.ps_cap || memcmp(s_fdv.psc, s_fdv2.ps, s_fdv.ps_bytes), "fragment-constants");
     FDV_W(s_fdv.n_clear != s_fdv2.n_clear, "depth-clear");
@@ -562,6 +594,11 @@ static void fdv_check(void)
     FDV_W(s_fdv.n_vsf || s_fdv.n_vsr != 1 || s_fdv.rows != (const void*)g.rsx.constants || s_fdv.first != g.vpc_lo ||
           s_fdv.count != g.vpc_n || s_fdv.tail_bytes != sizeof p->xf || memcmp(s_fdv.tail, p->xf, sizeof p->xf) ||
           s_fdv.total != ENG_VP_CB_BYTES, "vertex-constants");
+#ifdef __SWITCH__
+    const rsx_constant_plan* sparse_plan = eng_sparse_vs_plan();
+    FDV_W(sparse_plan ? !rsx_constant_plan_equal(sparse_plan, &s_fdv.sparse) : s_fdv.sparse.count != 0,
+          "vertex-constant-spans");
+#endif
     FDV_W(s_fdv.n_ps != 1 || s_fdv.ps_bytes != p->fp_bytes || s_fdv.ps_bytes > s_fdv.psc_cap ||
           memcmp(s_fdv.psc, s_fdv.ps, p->fp_bytes), "fragment-constants");
 #undef FDV_W

@@ -36,6 +36,9 @@ typedef struct rsx_fp_constant_block {
  * word. The decoder operates on host-order words. */
 u32 rsx_fp_read_word(const u8* p);
 u32 rsx_fp_sanitize_constant_word(u32 w);
+/* Decode/sanitize four components in order; read 16 bytes and write four words.
+ * Overlap follows the same sequential reads/stores as four scalar calls. */
+void rsx_fp_read_constant_vec4(const u8* source, u32* output);
 extern unsigned long long g_rsx_fp_nonfinite_constants;
 
 /* Decompile an NV40 fragment program into an HLSL pixel shader.

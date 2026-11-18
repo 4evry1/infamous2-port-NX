@@ -29,6 +29,10 @@
  * low-end set ~0.65 GB (targets ~200 MB, postfx 13 MB).
  */
 
+#ifdef __SWITCH__
+#include <malloc.h>
+#endif
+
 #define VK_VRAM_TAB 16384u                    /* power of two; the driver allows ~4096 allocations */
 typedef struct { VkDeviceMemory h; VkDeviceSize size; u8 heap, tag; } vk_vram_ent;
 enum { VK_VRAM_TAG_BE = 0, VK_VRAM_TAG_PFX = 1, VK_VRAM_TAGS = 2 };
@@ -117,6 +121,11 @@ static VkResult vk_vram_alloc_tag(VkDevice d, const VkMemoryAllocateInfo* ai, co
     } else if (r != VK_SUCCESS) {
         const u32 n = __atomic_add_fetch(&s_vram.fails, 1u, __ATOMIC_RELAXED);
         if (n <= 16u || !(n & 255u)) {
+#ifdef __SWITCH__
+            const struct mallinfo heap = mallinfo();
+            fprintf(stderr, "[vram-host] allocation=%llu heap_used=%zu heap_free=%zu heap_top=%zu\n",
+                    (unsigned long long)ai->allocationSize, heap.uordblks, heap.fordblks, heap.keepcost);
+#endif
             VkDeviceSize use = 0, bud = 0;
             const int b = vk_vram_budget(&use, &bud);
             fprintf(stderr, "[vram] allocation #%u FAILED (VkResult %d): %llu KB in memory type %u (heap %d)%s; "

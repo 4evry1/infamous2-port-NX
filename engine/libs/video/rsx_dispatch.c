@@ -160,12 +160,28 @@ void (*g_rsx_dsp_limit_hook)(int what, u32 n);
 /* (rsx-par) the counters belong to the instance (rsx->tgen / rsx->mgen): the
  * walker's own instance (PS3RECOMP_RSX_SPLIT) keeps separate ones, which the
  * draw engine's thread copies into these two at each draw event. */
+enum {
+    DSP_REGISTER_COLD = 0,
+    DSP_REGISTER_PLAIN,
+    DSP_REGISTER_TEXTURE,
+    DSP_REGISTER_MISC
+};
+static inline u8 register_generation_kind(u32 idx)
+{
+    if ((idx - (M_TEX_SIZE1 >> 2)) < 16u ||
+        (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u)
+        return DSP_REGISTER_TEXTURE;
+    if ((idx - (0x0900u >> 2)) < (0x80u >> 2) || idx == (0x1478u >> 2))
+        return DSP_REGISTER_MISC;
+    return DSP_REGISTER_PLAIN;
+}
 static inline void tex_gen_note(rsx_dispatch* rsx, u32 idx, u32 old, u32 arg)
 {
     if (old != arg) {
-        if ((idx - (M_TEX_SIZE1 >> 2)) < 16u || (idx - (M_TEX_OFFSET >> 2)) < RSX_DSP_NUM_TEXTURES * 8u)
+        const u8 kind = register_generation_kind(idx);
+        if (kind == DSP_REGISTER_TEXTURE)
             ++*(rsx->tgen ? rsx->tgen : &g_rsx_dsp_tex_gen);
-        else if ((idx - (0x0900u >> 2)) < (0x80u >> 2) || idx == (0x1478u >> 2))
+        else if (kind == DSP_REGISTER_MISC)
             ++*(rsx->mgen ? rsx->mgen : &g_rsx_dsp_misc_gen);
     }
 }
@@ -695,7 +711,7 @@ static void plain_init(void)
             (m >= 0x1E40 && m < 0x1E80) || (m >= 0x0A80 && m < 0x0B00)) p = 0;   /* imm_method */
         if (m == M_CLEAR_BUFFERS || m == M_VERTEX_BEGIN_END || m == M_INLINE_ARRAY ||
             m == M_VB_VERTEX_BATCH || m == M_VB_INDEX_BATCH) p = 0;
-        s_plain[m >> 2] = (u8)p;
+        s_plain[m >> 2] = p ? register_generation_kind(m >> 2) : DSP_REGISTER_COLD;
     }
     s_plain_ready = 1;
 }
@@ -708,6 +724,30 @@ static __attribute__((noinline)) void dispatch_method_cold(rsx_dispatch* rsx, u3
 {
     rsx_dispatch_method(rsx, method, arg);
 }
+static inline void burst_store_plain_register(rsx_dispatch* rsx, u32 idx, u32 arg,
+                                               u8 kind, int count_seen)
+{
+    if (count_seen) rsx->seen[idx]++;
+    if (kind != DSP_REGISTER_PLAIN && rsx->regs[idx] != arg) {
+        if (kind == DSP_REGISTER_TEXTURE)
+            ++*(rsx->tgen ? rsx->tgen : &g_rsx_dsp_tex_gen);
+        else
+            ++*(rsx->mgen ? rsx->mgen : &g_rsx_dsp_misc_gen);
+    }
+    rsx->regs[idx] = arg;
+}
+static inline u32 burst_store_constant_word(rsx_dispatch* rsx, u32 index, u8* destination,
+                                            const u32* be_word, int count_seen)
+{
+    const u32 arg = __builtin_bswap32(__atomic_load_n(be_word, __ATOMIC_RELAXED));
+    if (count_seen) rsx->seen[index]++;
+    rsx->regs[index] = arg;
+    u32 previous;
+    memcpy(&previous, destination, sizeof previous);
+    memcpy(destination, &arg, sizeof arg);
+    return previous ^ arg;
+}
+
 /* A run of words in the transform-constant upload window (n words from method m). */
 static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, const u32* be_words, u32 n)
 {
@@ -715,7 +755,18 @@ static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, 
     const u32 base = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
     const int cs = !rsx->no_seen;
     u32 chg = 0;   /* (rsx-vtx) const_gen: any word that changed value */
-    for (u32 k = 0; k < n; k++) {
+    const u64 first_word = (u64)base * 4u + w0;
+    if (first_word + n <= (u64)RSX_DSP_NUM_CONSTANTS * 4u) {
+        u8* destination = (u8*)rsx->constants + first_word * sizeof(u32);
+        /* Select once to avoid a diagnostic-mode branch for every word. */
+        if (cs) {
+            for (u32 k = 0; k < n; ++k, destination += sizeof(u32))
+                chg |= burst_store_constant_word(rsx, idx0 + k, destination, &be_words[k], 1);
+        } else {
+            for (u32 k = 0; k < n; ++k, destination += sizeof(u32))
+                chg |= burst_store_constant_word(rsx, idx0 + k, destination, &be_words[k], 0);
+        }
+    } else for (u32 k = 0; k < n; k++) {
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[k], __ATOMIC_RELAXED));
         if (cs) rsx->seen[idx0 + k]++;
         rsx->regs[idx0 + k] = arg;
@@ -733,6 +784,9 @@ static __attribute__((noinline)) void burst_const_run(rsx_dispatch* rsx, u32 m, 
         if (s0 < RSX_DSP_NUM_CONSTANTS)
             dsp_dirty_range(rsx, RSX_DSP_BLK_CONST0 + s0 / 4u,
                             RSX_DSP_BLK_CONST0 + (s1 < RSX_DSP_NUM_CONSTANTS ? s1 : RSX_DSP_NUM_CONSTANTS - 1u) / 4u);
+        else if (s1 < RSX_DSP_NUM_CONSTANTS)
+            /* Unsigned slot arithmetic can wrap from an invalid base into slot zero. */
+            dsp_dirty_range(rsx, RSX_DSP_BLK_CONST0, RSX_DSP_BLK_CONST0 + s1 / 4u);
     }
 }
 /* A run of words in the transform-program upload window. */
@@ -744,9 +798,13 @@ static __attribute__((noinline)) void burst_inst_run(rsx_dispatch* rsx, u32 m, c
     /* (rsx-par) the program words these n words land on: consecutive from here */
     if (rsx->dirty && n) {
         const u32 p0 = *load * 4u + (((m - M_VP_UPLOAD_INST) >> 2) & 3u);
+        const u32 p1 = p0 + n - 1u;
         if (p0 < RSX_DSP_VP_WORDS)
             dsp_dirty_range(rsx, RSX_DSP_BLK_VP0 + p0 / 16u,
-                            RSX_DSP_BLK_VP0 + (p0 + n - 1u < RSX_DSP_VP_WORDS ? p0 + n - 1u : RSX_DSP_VP_WORDS - 1u) / 16u);
+                            RSX_DSP_BLK_VP0 + (p1 < RSX_DSP_VP_WORDS ? p1 : RSX_DSP_VP_WORDS - 1u) / 16u);
+        else if (p1 < RSX_DSP_VP_WORDS)
+            /* The program-word cursor wraps independently of the method window. */
+            dsp_dirty_range(rsx, RSX_DSP_BLK_VP0, RSX_DSP_BLK_VP0 + p1 / 16u);
         dsp_dirty(rsx, M_VP_UPLOAD_FROM_ID >> 6);
     }
     for (u32 k = 0; k < n; k++) {
@@ -774,7 +832,21 @@ static __attribute__((noinline)) void burst_slow(rsx_dispatch* rsx, u32 method, 
                              __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED)));
 }
 
-void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+static inline void burst_lean_words(rsx_dispatch* rsx, u32 method, int incr,
+                                    const u32* be_words, u32 count, int count_seen)
+{
+#pragma clang loop vectorize(disable) interleave(disable)
+    for (u32 i = 0; i < count; ++i) {
+        const u32 m = incr ? method + i * 4u : method;
+        const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
+        const u8 kind = s_plain[m >> 2];
+        if (kind) burst_store_plain_register(rsx, m >> 2, arg, kind, count_seen);
+        else dispatch_method_cold(rsx, m, arg);
+    }
+}
+
+/* Keep the general dispatcher's saved registers off the single-word path. */
+static __attribute__((noinline)) void dispatch_burst_general(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
 {
     if (!count) return;
     method &= 0xFFFFC;
@@ -799,13 +871,8 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
              * (stores ahead of an event a cold word fires) and after (stores
              * behind it) */
             if (rsx->dirty) dsp_dirty_range(rsx, method >> 6, hi >> 6);
-#pragma clang loop vectorize(disable) interleave(disable)
-            for (; i < count; i++) {
-                const u32 m = incr ? method + i * 4u : method;
-                const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-                if (s_plain[m >> 2]) { if (cs) rsx->seen[m >> 2]++; tex_gen_note(rsx, m >> 2, rsx->regs[m >> 2], arg); rsx->regs[m >> 2] = arg; }
-                else dispatch_method_cold(rsx, m, arg);
-            }
+            if (cs) burst_lean_words(rsx, method, incr, be_words, count, 1);
+            else burst_lean_words(rsx, method, incr, be_words, count, 0);
             if (rsx->dirty) dsp_dirty_range(rsx, method >> 6, hi >> 6);
             return;
         }
@@ -827,16 +894,84 @@ void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_w
             continue;
         }
         const u32 arg = __builtin_bswap32(__atomic_load_n(&be_words[i], __ATOMIC_RELAXED));
-        if (s_plain[m >> 2]) {
-            if (cs) rsx->seen[m >> 2]++;
-            tex_gen_note(rsx, m >> 2, rsx->regs[m >> 2], arg);
-            rsx->regs[m >> 2] = arg;
+        const u8 kind = s_plain[m >> 2];
+        if (kind) {
+            burst_store_plain_register(rsx, m >> 2, arg, kind, cs);
             if (rsx->dirty) dsp_dirty(rsx, m >> 6);   /* (rsx-par) */
         }
         else dispatch_method_cold(rsx, m, arg);
         i++;
     }
 }
+/* Complete upload headers need no general-dispatch loop or saved registers. */
+static __attribute__((noinline)) void dispatch_burst_fallback(rsx_dispatch* rsx, u32 method,
+    int incr, const u32* be_words, u32 count)
+{
+    if (!count) return;
+    if (!incr) {
+        dispatch_burst_general(rsx, method, incr, be_words, count);
+        return;
+    }
+    const u32 masked_method = method & 0xffffcu;
+    const u32 offset = masked_method - M_VP_UPLOAD_CONST;
+    if (offset < 32u * 4u && count <= (32u * 4u - offset) / 4u &&
+        s_ed_on == 0 && s_plain_ready && s_clog_lo < 0 && s_clog_lo != -2) {
+        burst_const_run(rsx, masked_method, be_words, count);
+        return;
+    }
+    const u32 instruction_offset = masked_method - M_VP_UPLOAD_INST;
+    if (instruction_offset < 32u * 4u && count <= (32u * 4u - instruction_offset) / 4u &&
+        s_ed_on == 0 && s_plain_ready && s_clog_lo != -2) {
+        burst_inst_run(rsx, masked_method, be_words, count);
+        return;
+    }
+    dispatch_burst_general(rsx, method, incr, be_words, count);
+}
+
+/* Tail-called only for count == 2; preserve each read after the prior store. */
+static __attribute__((noinline)) void dispatch_burst_pair(rsx_dispatch* rsx, u32 method,
+    int incr, const u32* be_words, u32 count)
+{
+    const u32 first = method & 0xffffcu;
+    const u32 last = first + (incr ? 4u : 0u);
+    if (last < 0x2000u && s_ed_on == 0 && s_clog_lo != -2 &&
+        s_plain_ready && s_burst_lean > 0) {
+        const u32 index0 = first >> 2, index1 = last >> 2;
+        const u8 kind0 = s_plain[index0], kind1 = s_plain[index1];
+        if (kind0 && kind1) {
+            const int count_seen = !rsx->no_seen;
+            if (rsx->dirty) dsp_dirty_range(rsx, first >> 6, last >> 6);
+            const u32 arg0 = __builtin_bswap32(__atomic_load_n(&be_words[0], __ATOMIC_RELAXED));
+            burst_store_plain_register(rsx, index0, arg0, kind0, count_seen);
+            const u32 arg1 = __builtin_bswap32(__atomic_load_n(&be_words[1], __ATOMIC_RELAXED));
+            burst_store_plain_register(rsx, index1, arg1, kind1, count_seen);
+            if (rsx->dirty) dsp_dirty_range(rsx, first >> 6, last >> 6);
+            return;
+        }
+    }
+    dispatch_burst_fallback(rsx, method, incr, be_words, count);
+}
+
+void rsx_dispatch_burst(rsx_dispatch* rsx, u32 method, int incr, const u32* be_words, u32 count)
+{
+    const u32 masked_method = method & 0xffffcu;
+    if (count == 1 && masked_method < 0x2000u && s_ed_on == 0 &&
+        s_clog_lo != -2 && s_plain_ready && s_burst_lean > 0) {
+        const u32 index = masked_method >> 2;
+        const u8 kind = s_plain[index];
+        if (kind) {
+            const int count_seen = !rsx->no_seen;
+            if (rsx->dirty) dsp_dirty(rsx, masked_method >> 6);
+            const u32 arg = __builtin_bswap32(__atomic_load_n(be_words, __ATOMIC_RELAXED));
+            burst_store_plain_register(rsx, index, arg, kind, count_seen);
+            if (rsx->dirty) dsp_dirty(rsx, masked_method >> 6);
+            return;
+        }
+    }
+    if (count == 2) dispatch_burst_pair(rsx, method, incr, be_words, count);
+    else dispatch_burst_fallback(rsx, method, incr, be_words, count);
+}
+
 /* ---- getters ----------------------------------------------------------- */
 
 u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)

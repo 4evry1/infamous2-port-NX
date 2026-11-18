@@ -16,6 +16,9 @@
 #define PS3RECOMP_RSX_VP_DECOMPILER_H
 
 #include "ps3emu/ps3types.h"
+#ifdef __SWITCH__
+#include "rsx_constant_plan.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +65,9 @@ typedef struct rsx_vp_const_usage {
     u32 lo, hi;
     int relative;
     int valid;
+#ifdef __SWITCH__
+    rsx_constant_plan sparse;
+#endif
 } rsx_vp_const_usage;
 int rsx_vp_analyze_constants(const u8* ucode, u32 max_bytes,
                              rsx_vp_const_usage* usage);

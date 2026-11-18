@@ -148,6 +148,8 @@ int rsx_vertex_fetch_all(
  * refs[0].vertex_id + i with one base_index (what the ranged remap leaves):
  * then the ordinary attributes whose stable span covers the run are read
  * straight down the span, without a per-vertex element index or resolver.
+ * Covered divide-mode attributes decode once per repeated source group when
+ * their input does not overlap the output. Modulo/wrapped runs fall back.
  * Same output bit for bit and the same verdict; consecutive == 0 is
  * rsx_vertex_fetch_all itself. */
 int rsx_vertex_fetch_all_ex(
@@ -176,6 +178,21 @@ u32 rsx_vertex_remap_index(
  * refs[rsx_vertex_remap_index(remap, i)] == the original refs[i]. */
 int rsx_vertex_remap_build_range(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count);
+
+typedef struct rsx_vertex_ref_bounds {
+    u32 low, high, base_index;
+} rsx_vertex_ref_bounds;
+
+/* Decode a fully mapped, non-overlapping BE index run with no restart markers.
+ * Bounds describe all count references; an empty run has low > high. */
+void rsx_vertex_decode_index_run(const u8* source, rsx_vertex_ref* refs,
+    u32 count, int is_u32, u32 base_index, rsx_vertex_ref_bounds* bounds);
+
+/* As build_range, but the caller must supply complete bounds of the unchanged
+ * references, all sharing bounds->base_index. No second source scan is made. */
+int rsx_vertex_remap_build_range_with_bounds(rsx_vertex_remap* remap,
+    rsx_vertex_ref* refs, u32 count, const rsx_vertex_ref_bounds* bounds,
     u32* out_count);
 
 /* The hash-table form of rsx_vertex_remap_build, always. The ordinary call

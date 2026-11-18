@@ -626,10 +626,17 @@ static void audio_submit_mix(void)
     audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 }
 
-#ifdef __SWITCH__   /* only the Switch's late-block hold (audio_mix_thread_func) calls it */
-/* 1 when at least one port is running and the block at every running port's read index is still
- * cleared (all sampled values zero): the title has not written the next block yet. Consumed blocks are
- * cleared below, so a zero block is one the producer has not refilled. Sampled every 16 floats. */
+#ifdef __SWITCH__
+/* PCM is interleaved. Skipping samples can miss an entire channel. */
+static int audio_block_has_signal(const float* pcm, u32 samples)
+{
+    for (u32 i = 0; i < samples; ++i)
+        if (pcm[i] != 0.0f) return 1;
+    return 0;
+}
+
+/* Consumed blocks are cleared. Intentional digital silence is indistinguishable
+ * from an unwritten block here, so the mixer's hold must remain bounded. */
 static int audio_next_block_empty(void)
 {
     int running = 0, empty = 1;
@@ -641,8 +648,7 @@ static int audio_next_block_empty(void)
         if (!nblock) continue;
         const float* bp = port->buffer + (u32)(port->read_index % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
         running = 1;
-        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES * nch; s += 16)
-            if (bp[s] != 0.0f) { empty = 0; break; }
+        empty = !audio_block_has_signal(bp, CELL_AUDIO_BLOCK_SAMPLES * nch);
     }
     mutex_unlock(&s_audio_mutex);
     return running && empty;
@@ -697,10 +703,14 @@ static void audio_mix_one_block(void)
                 char map[36]; u32 b;
                 for (b = 0; b < nblock && b < 32; b++) {
                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+#ifdef __SWITCH__
+                    map[b] = audio_block_has_signal(bp, CELL_AUDIO_BLOCK_SAMPLES * nch) ? '#' : '.';
+#else
                     int nz = 0;
                     for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES * nch; s2 += 16)
                         if (bp[s2] != 0.0f) { nz = 1; break; }
                     map[b] = nz ? '#' : '.';
+#endif
                 }
                 map[b] = 0;
                 fprintf(stderr, "[audio-ring] port %d ridx=%llu blk=%u ring=[%s]\n",
@@ -851,6 +861,29 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+#ifdef __SWITCH__
+#include "audio_route_trace.h"
+extern uint32_t hz_audio_outstanding_frames(void) __attribute__((weak));
+static unsigned audio_device_queue_frames(void)
+{
+    return hz_audio_outstanding_frames ? hz_audio_outstanding_frames() : audio_backend_queued_samples();
+}
+static void audio_route_report(audio_route_trace *trace, uint64_t now)
+{
+    if (now - trace->report_ns < 1000000000ull) return;
+    const audio_route_gap *gaps[] = { &trace->longest, &trace->active };
+    for (unsigned i = 0; i < 2; ++i) {
+        const audio_route_gap *g = gaps[i];
+        if (!g->start_ns) continue;
+        fprintf(stderr, "[audio-route] mono_ns=%llu start_ns=%llu ready_ns=%llu queue_first=%u queue_min=%u queue_last=%u mixed_empty=%u recovered=%u\n",
+                (unsigned long long)now, (unsigned long long)g->start_ns, (unsigned long long)g->ready_ns,
+                g->first_queue, g->min_queue, g->last_queue, g->mixed_empty, trace->recovered);
+    }
+    trace->report_ns = now;
+    trace->longest = (audio_route_gap){0};
+    trace->recovered = 0;
+}
+#endif
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
@@ -886,6 +919,11 @@ static void* audio_mix_thread_func(void* arg)
      * forever and the device bound alone would spin. */
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     unsigned long long mixed = 0;
+#ifdef __SWITCH__
+    const char *route_env = getenv("PS3RECOMP_ROUTE_TIMING");
+    const int trace_route = route_env && !strcmp(route_env, "1");
+    audio_route_trace route = {0};
+#endif
     while (s_mix_thread_running) {
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         unsigned long long el_us = (unsigned long long)(now.tv_sec - t0.tv_sec) * 1000000ull
@@ -910,22 +948,30 @@ static void* audio_mix_thread_func(void* arg)
                 hold_ms = e && *e ? atoi(e) : 20;
                 printf("[cellAudio] late-block hold: up to %d ms\n", hold_ms);
             }
-            if (hold_ms > 0) {
+            if (hold_ms > 0 || trace_route) {
+                const uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
                 if (audio_next_block_empty()) {
                     /* hz-0.43: gate on what audout really holds. The queue the mixer is told about leaves
                      * out the Horizon layer's 2048-frame reserve and reads 0 whenever it is at or under it,
                      * so "more than 2 blocks" was almost never true: run 44 waited 0.3 ms per hold and 99.5%
                      * of holds still mixed silence. */
-                    extern uint32_t hz_audio_outstanding_frames(void) __attribute__((weak));
-                    const unsigned queued_now = hz_audio_outstanding_frames ? hz_audio_outstanding_frames()
-                                                                             : audio_backend_queued_samples();
+                    const unsigned queued_now = audio_device_queue_frames();
                     if (!hold_t0) { hold_t0 = el_us; holds++; }
-                    if (queued_now > CELL_AUDIO_BLOCK_SAMPLES * 2u &&
-                        el_us - hold_t0 < (unsigned long long)hold_ms * 1000ull) {
+                    const int should_hold = hold_ms > 0 && queued_now > CELL_AUDIO_BLOCK_SAMPLES * 2u &&
+                        el_us - hold_t0 < (unsigned long long)hold_ms * 1000ull;
+                    if (trace_route) {
+                        audio_route_observe(&route, now_ns, 1, queued_now, !should_hold);
+                        audio_route_report(&route, now_ns);
+                    }
+                    if (should_hold) {
                         usleep(500);
                         continue;
                     }
                     silent++;
+                } else if (trace_route) {
+                    if (route.active.start_ns)
+                        audio_route_observe(&route, now_ns, 0, audio_device_queue_frames(), 0);
+                    audio_route_report(&route, now_ns);
                 }
                 if (hold_t0) { held_us += el_us - hold_t0; hold_t0 = 0; }
                 if (el_us - last_report >= 10000000ull) {

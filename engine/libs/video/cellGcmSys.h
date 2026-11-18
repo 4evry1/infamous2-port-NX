@@ -280,6 +280,8 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* Nonblocking readiness hint; does not consume commands or publish fences. */
+int cellGcm_fifo_work_ready(void);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);

@@ -1,0 +1,34 @@
+diff --git a/main.cpp b/main.cpp
+--- a/main.cpp
++++ b/main.cpp
+@@ -118,6 +118,9 @@
+ void     cellGcmTickFlip(void);
+ int      cellGcm_take_flip_pending(void);
+ void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
++#ifdef __SWITCH__
++int      cellGcm_fifo_work_ready(void);
++#endif
+ unsigned cellGcm_flip_request_count(void);
+ int      cellGcm_drain_sema_blocked(void);
+ }
+@@ -271,6 +274,10 @@
+      * Default 1000; 4000 is the old pacing. Read live (PS3_TOGGLE_FILE). */
+     int clock_us_env = 1000;
+     { const char* e = getenv("PS3_FRAMECLOCK_US"); if (e && atoi(e) > 0) clock_us_env = atoi(e); }
++#ifdef __SWITCH__
++    const char* ready_skip_env = getenv("PS3RECOMP_GCM_READY_SKIP");
++    const int skip_ready_sleep = !(ready_skip_env && *ready_skip_env == '0');
++#endif
+     /* PS3_HOT_QOS=1: this thread walks the FIFO and encodes every draw; keep
+      * it on a performance core alongside the SPU threads (lv2_register.c). */
+     { const char* e = getenv("PS3_HOT_QOS");
+@@ -300,6 +307,9 @@
+              * for its frame-N-1 fence every frame. GCM_FIFO_KICK=0 = the old
+              * plain Sleep. */
+             cellGcm_fifo_kick_wait((unsigned)((us + 999) / 1000));
++#elif defined(__SWITCH__)
++            if (!rsx_ok || !skip_ready_sleep || !cellGcm_fifo_work_ready())
++                usleep((useconds_t)us);
+ #else
+             usleep((useconds_t)us);
+ #endif

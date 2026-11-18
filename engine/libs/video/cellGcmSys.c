@@ -2033,6 +2033,15 @@ static int gcm_kw_ready(void)
     return 0;
 }
 
+/* A hint for the frame-clock owner; the drain still acquires published FIFO data. */
+int cellGcm_fifo_work_ready(void)
+{
+    if (!TryAcquireSRWLockExclusive(&s_gcm_fifo_lock)) return 0;
+    const int ready = s_gcm_initialized && (s_gcm_context_ea || s_gcm_syscall_mode) && gcm_kw_ready();
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    return ready;
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
@@ -2245,6 +2254,37 @@ void cellGcm_hattr_take(unsigned long long* drain_ns, unsigned long long* sema_n
     s_ha_drain_ns = s_ha_sema_ns = s_ha_sema_gaveup = 0;
 }
 
+#ifdef __SWITCH__
+/* First observed PPU PUT store between drain entries. Park/label changes have
+ * independent readiness, so a zero publication marker is meaningful. */
+static int route_fifo_enabled;
+static uint64_t route_put_ns;
+static _Thread_local struct {
+    uint64_t check_ns, wake_ns, previous_end_ns, previous_cpu_ns;
+    unsigned requested_us, window_lines;
+    uint64_t window_id;
+    int ready;
+} route_clock;
+
+void cellGcm_route_enable(void) { __atomic_store_n(&route_fifo_enabled, 1, __ATOMIC_RELEASE); }
+void cellGcm_route_put_written(void)
+{
+    if (!__atomic_load_n(&route_fifo_enabled, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&route_put_ns, __ATOMIC_RELAXED)) return;
+    uint64_t empty = 0, now = ps3_ft_now();
+    __atomic_compare_exchange_n(&route_put_ns, &empty, now, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+void cellGcm_route_sleep(unsigned us, int ready)
+{
+    route_clock.check_ns = ps3_ft_now();
+    route_clock.requested_us = ready ? 0 : us;
+    route_clock.ready = ready;
+    if (!ready) usleep(us);
+    route_clock.wake_ns = ps3_ft_now();
+}
+extern uint64_t hz_draw_thread_cpu_ns(void) __attribute__((weak));
+#endif
+
 void cellGcm_rsx_process_fifo(void)
 {
     /* The host's frame clock thread drains the FIFO and encodes the draws:
@@ -2263,13 +2303,53 @@ void cellGcm_rsx_process_fifo(void)
     const unsigned long long bytes0 = s_walk_bytes;
     if (long_dbg) clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0);
 #endif
+#ifdef __SWITCH__
+    const int route = __atomic_load_n(&route_fifo_enabled, __ATOMIC_ACQUIRE);
+    const uint64_t enter_ns = route ? ps3_ft_now() : 0;
+    const uint64_t enter_cpu = route && hz_draw_thread_cpu_ns ? hz_draw_thread_cpu_ns() : UINT64_MAX;
+#endif
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+#ifdef __SWITCH__
+    const uint64_t locked_ns = route ? ps3_ft_now() : 0;
+    const uint64_t put_ns = route ? __atomic_exchange_n(&route_put_ns, 0, __ATOMIC_ACQ_REL) : 0;
+    const int ready_on_entry = route && s_gcm_initialized &&
+        (s_gcm_context_ea || s_gcm_syscall_mode) && gcm_kw_ready();
+    const uint64_t start_cpu = route && hz_draw_thread_cpu_ns ? hz_draw_thread_cpu_ns() : UINT64_MAX;
+#endif
     s_ha_drain_t0 = ps3_ft_now();
     gcm_rsx_process_fifo_unlocked();
     if (g_rsx_drain_end_hook) g_rsx_drain_end_hook();   /* (rsx-par) PS3RECOMP_VK_BT: the recording worker idle */
     s_ha_drain_ns += ps3_ft_now() - s_ha_drain_t0;   /* (the present inside may have taken a part) */
     s_ha_drain_t0 = 0;
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+#ifdef __SWITCH__
+    if (route) {
+        const uint64_t end = ps3_ft_now();
+        const uint64_t cpu = start_cpu != UINT64_MAX ? hz_draw_thread_cpu_ns() : UINT64_MAX;
+        /* Bound SD writes even during an idle polling burst. */
+        const uint64_t window = enter_ns / 3000000000ull;
+        if (window != route_clock.window_id) {
+            route_clock.window_id = window;
+            route_clock.window_lines = 0;
+        }
+        if ((enter_ns % 3000000000ull < 250000000ull && route_clock.window_lines < 24) ||
+            end - enter_ns >= 25000000ull) {
+            ++route_clock.window_lines;
+            fprintf(stderr, "[fifo-route] prev_end=%llu check=%llu ready=%d sleep_us=%u wake=%llu put=%llu enter=%llu locked=%llu pending=%d end=%llu gap_cpu_us=%lld cpu_us=%lld\n",
+                (unsigned long long)route_clock.previous_end_ns, (unsigned long long)route_clock.check_ns,
+                route_clock.ready, route_clock.requested_us, (unsigned long long)route_clock.wake_ns,
+                (unsigned long long)put_ns, (unsigned long long)enter_ns, (unsigned long long)locked_ns,
+                ready_on_entry, (unsigned long long)end,
+                route_clock.previous_end_ns && enter_cpu != UINT64_MAX && enter_cpu >= route_clock.previous_cpu_ns ?
+                    (long long)((enter_cpu-route_clock.previous_cpu_ns)/1000) : -1ll,
+                cpu != UINT64_MAX && cpu >= start_cpu ? (long long)((cpu-start_cpu)/1000) : -1ll);
+        }
+        route_clock.previous_end_ns = end;
+        route_clock.previous_cpu_ns = cpu;
+        route_clock.check_ns = route_clock.wake_ns = route_clock.requested_us = 0;
+        route_clock.ready = -1;
+    }
+#endif
     s_drain_end_ms = ps3_ms_now();
 #if !defined(_WIN32)
     if (long_dbg && s_drain_end_ms - s_drain_in_ms >= 250) {
@@ -2540,7 +2620,9 @@ walk_more:
                         const u32 hi = type == 0 ? method + (count - 1u) * 4u : method;
                         if (hi > 0x1FFCu || (method <= 0x0050u && hi >= 0x0050u) ||
                             (method <= 0x1800u && hi >= 0x1800u) || (method <= 0x1D74u && hi >= 0x1D6Cu)) break;
-                        if (((g + 4u) >> 20) != pg || ((g + count * 4u) >> 20) != pg) break;
+                        /* A nonempty packet spans at most 8188 bytes: if its last
+                         * word stays on this page, its first word does too. */
+                        if (((g + count * 4u) >> 20) != pg) break;
                     }
                     if (g < put) s_last_ring_off = g + 4;
                     s_tr_off[s_tr_i % GCM_TRACE_N] = g;

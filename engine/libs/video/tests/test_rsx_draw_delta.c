@@ -21,11 +21,13 @@
  * for the counters): the three logs must be byte-identical, and the verify
  * run must print no [delta-verify] line. Usage: test_rsx_draw_delta <log>.
  */
+#include "ps3emu/ps3_ftrace.h"
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"
 #include "rsx_test_programs.h"
 
 #include <stdarg.h>
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -129,9 +131,24 @@ static void r_bind_targets(void* u, const u32* s, u32 n, u32 d)
     for (u32 i = 0; i < RSX_BE_MAX_COLOR_TARGETS; i++) s_st.tgt[i] = (i < n && s) ? s[i] : 0u;
     s_st.ntgt = n; s_st.depth = d;
 }
+/* A real blocking interval under the recorder makes overlap/subtraction observable. */
+static u64 *s_record_wait;
+static void r_set_wait_counter(void* u, u64* counter)
+{
+    (void)u;
+    assert((s_record_wait == NULL) != (counter == NULL));
+    s_record_wait = counter;
+}
+static void r_test_wait(void)
+{
+    if (!s_record_wait) return;
+    const u64 start = ps3_ft_now();
+    while (ps3_ft_now() - start < 100000u) {}
+    *s_record_wait += ps3_ft_now() - start;
+}
 static void r_bind_pipeline(void* u, u32 p) { (void)u; s_st.pipe = p; }
 static void r_bind_vs(void* u, const void* d, u32 n) { (void)u; s_st.ranged = 0; s_st.vs_n = n; s_st.vs_h = h64(d, n); }
-static void r_bind_ps(void* u, const void* d, u32 n) { (void)u; s_st.ps_n = n; s_st.ps_h = h64(d, n); }
+static void r_bind_ps(void* u, const void* d, u32 n) { r_test_wait(); (void)u; s_st.ps_n = n; s_st.ps_h = h64(d, n); }
 static void r_bind_vs_range(void* u, const void* rows, u32 first, u32 count, const void* tail, u32 tb, u32 total)
 {
     (void)u;
@@ -139,6 +156,20 @@ static void r_bind_vs_range(void* u, const void* rows, u32 first, u32 count, con
     s_st.vs_h = h64((const u8*)rows + (size_t)first * 16u, (size_t)count * 16u); s_st.vs_tail = h64(tail, tb);
 }
 static void r_vs_gen(void* u, u32 gen) { (void)u; s_st.gen = gen; }
+#ifdef __SWITCH__
+static u32 s_sparse_binds;
+static void r_bind_vs_sparse(void* u, const void* rows, u32 first, u32 count,
+                             const void* tail, u32 tb, u32 total, const rsx_constant_plan* plan)
+{
+    assert(rsx_constant_plan_valid(plan, first, count));
+    assert(plan->count == 2 && plan->rows == 5);
+    assert(plan->spans[0].first == 256 && plan->spans[0].count == 4);
+    assert(plan->spans[1].first == 467 && plan->spans[1].count == 1);
+    s_sparse_binds++;
+    /* This recorder compares logical bindings; the Vulkan fixture tests copies. */
+    r_bind_vs_range(u, rows, first, count, tail, tb, total);
+}
+#endif
 static void r_bind_textures(void* u, const u32* t, const rsx_be_sampler_desc* s, u32 mask)
 {
     (void)u;
@@ -187,7 +218,17 @@ static void log_state(void)
 static void r_draw(void* u, rsx_topology t, const void* v, u32 nv, u32 stride, const u32* idx, u32 ni)
 { (void)u; LOGF("draw %d %u x %u %016llX idx %u %016llX\n", (int)t, nv, stride, (unsigned long long)h64(v, (size_t)nv * stride),
                  ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); log_state(); }
-static u32  r_vbuf_create(void* u, const void* d, u32 n) { (void)u; const u32 hd = s_next++; LOGF("vbuf_create h%u %u %016llX\n", hd, n, (unsigned long long)h64(d, n)); return hd; }
+static u32 r_vbuf_create(void* u, const void* d, u32 n)
+{
+    (void)u;
+    if (getenv("DELTA_VBUF_FAIL")) {
+        LOGF("vbuf_create_failed %u %016llX\n", n, (unsigned long long)h64(d, n));
+        return 0;
+    }
+    const u32 hd = s_next++;
+    LOGF("vbuf_create h%u %u %016llX\n", hd, n, (unsigned long long)h64(d, n));
+    return hd;
+}
 static void r_draw_vbuf(void* u, rsx_topology t, u32 vb, u32 nv, u32 stride, const u32* idx, u32 ni)
 { (void)u; LOGF("draw_vbuf %d h%u %u x %u idx %u %016llX\n", (int)t, vb, nv, stride, ni, (unsigned long long)h64(idx, (size_t)ni * 4u)); log_state(); }
 static void r_draw_vbuf_ib(void* u, rsx_topology t, u32 vb, u32 nv, u32 stride, u32 ib, u32 ni)
@@ -199,8 +240,20 @@ static void r_present(void* u, u32 s) { (void)u; LOGF("present h%u\n", s); }
 static void r_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h, void* out, u32 pitch)
 { (void)u; LOGF("readback h%u %u %u %u %u\n", s, x, y, w, h); if (out) for (u32 r = 0; r < h; r++) memset((u8*)out + (size_t)r * pitch, 0x40, (size_t)w * 4u); }
 
+static int r_image_save(void* user, const char* path, const u8* rgba, u32 w, u32 h, u32 row_bytes)
+{
+    (void)user;
+    const char* name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    LOGF("image_save %s %u %u %016llX\n", name, w, h,
+         (unsigned long long)h64(rgba, (size_t)row_bytes * h));
+    return 1;
+}
+
 static const rsx_draw_backend g_rec = {
+    .set_wait_counter = r_set_wait_counter,
     .init = r_init, .shutdown = r_shutdown, .submit_and_wait = r_submit,
+    .image_save = r_image_save,
     .texture_create = r_tex_create, .texture_upload = r_tex_upload, .texture_release = r_release,
     .color_target_create = r_color_create, .color_target_release = r_release, .surface_view = r_surface_view,
     .depth_target_create = r_depth_create, .depth_target_release = r_release, .depth_snapshot = r_depth_snapshot,
@@ -211,6 +264,9 @@ static const rsx_draw_backend g_rec = {
     .set_viewport = r_viewport, .set_scissor = r_scissor, .set_stencil_ref = r_stencil, .draw = r_draw,
     .clear_color = r_clear_color, .clear_depth_stencil = r_clear_ds, .present = r_present, .readback = r_readback,
     .bind_vs_constants_range = r_bind_vs_range,
+#ifdef __SWITCH__
+    .bind_vs_constants_sparse = r_bind_vs_sparse,
+#endif
     .vbuf_create = r_vbuf_create, .vbuf_release = r_release, .draw_vbuf = r_draw_vbuf,
     .set_hud = r_hud, .set_depth_bias = r_bias, .set_depth_clamp = r_clamp,
     .draw_vbuf_ib = r_draw_vbuf_ib, .vbuf_prefetch = r_prefetch, .vs_constants_gen = r_vs_gen,
@@ -299,6 +355,14 @@ static void material(u32 k)
     m(0x0A74, 1u); m(0x0A70, (k & 2u) ? 0u : 1u);      /* depth test, write */
 }
 
+#ifdef RSX_TEST_ENGINE_PROBES
+extern unsigned rsx_test_index_bounds_calls(void);
+extern u32 rsx_test_index_capacity(void);
+extern int rsx_test_refs_remapped(void);
+extern u32 rsx_test_remap_capacity(void);
+extern unsigned long long rsx_test_index_cache_bytes(void);
+#endif
+
 static void run(void)
 {
     rsx_draw_engine_set_backend(&g_rec);
@@ -334,6 +398,55 @@ static void run(void)
     m(0x181C, IDX_MAIN);
     m(0x1820, 1u | (1u << 4));                          /* main, u16 */
     surface(RT_A_LOCAL);
+    if (getenv("DELTA_SHADOW_FIXTURE")) {
+        material(0);
+        m(0x0214, 0x0F2F0000u);
+        m(0x0220, 0);
+        for (u32 i = 0; i < 12; ++i) draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+        m(0x0A70, 0);
+        draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+        m(0x0A70, 1); m(0x0220, 1);
+        draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+        surface(RT_A_LOCAL);
+        rsx_draw_engine_present();
+        assert(!s_record_wait);
+    }
+
+    /* Repeated, single-base divided draws exercise index/vertex cache hits;
+     * the payload rewrite then forces the cached vertices to be rebuilt. */
+    material(0);
+    draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+#ifdef RSX_TEST_ENGINE_PROBES
+    assert(rsx_test_refs_remapped());
+    const char* direct = getenv("PS3RECOMP_ENG_DIRECT_TRI_INDICES");
+    if (direct && !strcmp(direct, "0")) assert(rsx_test_index_capacity() > 0);
+    else assert(rsx_test_index_capacity() == 0);
+#endif
+    /* Grow and shrink remaps, truncate incomplete triangles, then make the
+     * same index stream resident across frames. */
+    const u32 triangle_counts[] = {27, 72, 9, 11, 72, 72, 72, 72, 72, 72};
+    for (u32 i = 0; i < sizeof triangle_counts / sizeof triangle_counts[0]; ++i) {
+        draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, triangle_counts[i]);
+        rsx_draw_engine_present();
+    }
+#ifdef RSX_TEST_ENGINE_PROBES
+    assert(rsx_test_remap_capacity() >= 72);
+    if (getenv("DELTA_VBUF_FAIL")) assert(rsx_test_index_cache_bytes() == 0);
+    else assert(rsx_test_index_cache_bytes() > 0);
+    if (!(direct && !strcmp(direct, "0"))) assert(rsx_test_index_capacity() == 0);
+#endif
+    for (u32 frequency = 2; frequency <= 7; frequency += 5) {
+        m(0x1740, 2u | (4u << 4) | (16u << 8) | (frequency << 16));
+        m(0x1740 + 3 * 4u, 2u | (4u << 4) | (16u << 8) | (frequency << 16));
+        m(0x1FC0, 1u);
+        for (u32 repeat = 0; repeat < 12; ++repeat) {
+            if (repeat == 8) vm_base[VTX_MAIN + 3] ^= 1u;
+            draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+        }
+    }
+    m(0x1740, 2u | (4u << 4) | (16u << 8));
+    m(0x1740 + 3 * 4u, 2u | (4u << 4) | (16u << 8));
+    m(0x1FC0, 0u);
 
     const u32 frames = s_bench ? (u32)s_bench : 24u;
     for (u32 frame = 0; frame < frames; frame++) {
@@ -401,6 +514,30 @@ static void run(void)
         }
         rsx_draw_engine_present();
     }
+#ifdef __SWITCH__
+    u8 sparse_vp[80];
+    for (u32 i = 0; i < 5; i++) {
+        u8* p = sparse_vp + i * 16u;
+        rsx_test_vp_mov_out(p, 0, RSX_TEST_VP_SWZ_IDENT, 0, i == 4);
+        u32 d1, d2;
+        memcpy(&d1, p + 4, 4); memcpy(&d2, p + 8, 4);
+        d1 = (d1 & ~(0x3FFu << 12)) | ((i == 4 ? 467u : 256u + i) << 12);
+        d2 = (d2 & ~(3u << 23)) | (3u << 23);
+        memcpy(p + 4, &d1, 4); memcpy(p + 8, &d2, 4);
+    }
+    upload_vp(48, sparse_vp, 5); m(0x1EA0, 48); surface(RT_A_LOCAL); material(0);
+    for (u32 i = 0; i < 64; i++) {
+        constants(256, 4); constants(467, 1);
+        draw_mesh(RSX_PRIMITIVE_TRIANGLES, 0, 12);
+    }
+    const char* sparse = getenv("PS3RECOMP_VK_SPARSE_CONSTANTS");
+    if (sparse && *sparse == '1') assert(s_sparse_binds > 0);
+#endif
+#ifdef RSX_TEST_ENGINE_PROBES
+    const char* bounds_mode = getenv("PS3RECOMP_ENG_INDEX_BOUNDS");
+    if (bounds_mode && !strcmp(bounds_mode, "0")) assert(rsx_test_index_bounds_calls() == 0);
+    else assert(rsx_test_index_bounds_calls() > 0);
+#endif
     rsx_draw_engine_shutdown();
 }
 
@@ -417,6 +554,14 @@ int main(int argc, char** argv)
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 2; }
     ppu_vm_size = GUEST_BYTES;
     run();
+    const char* texture_timing = getenv("PS3RECOMP_ENG_TEX_TIMING");
+    if (texture_timing && !strcmp(texture_timing, "0")) {
+        assert(g_rsx_tstat.n == 0 && g_rsx_tstat.ns == 0 && g_rsx_tstat.worst_ns == 0);
+        assert(g_rsx_hattr.tex_new == 0 && g_rsx_hattr.tex_reup == 0);
+        assert(g_rsx_hattr.tex_bytes == 0 && g_rsx_hattr.tex_ns == 0 && g_rsx_hattr.hash_ns == 0);
+    } else {
+        assert(g_rsx_tstat.n > 0 && g_rsx_hattr.tex_new > 0);
+    }
     FILE* f = fopen(argv[1], "wb");
     if (!f) { printf("[FAIL] cannot write %s\n", argv[1]); return 2; }
     fwrite(s_log, 1, s_len, f);

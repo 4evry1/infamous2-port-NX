@@ -25,6 +25,12 @@
 #  include <unistd.h>
 #  include <sys/types.h>
 #  include <sys/statvfs.h>
+#  if defined(__SWITCH__) || defined(CELL_GAME_TEST_INSTALLED_SIZE)
+#    include <dirent.h>
+#  endif
+#  ifdef __SWITCH__
+#    include <reent.h>
+#  endif
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
@@ -762,6 +768,55 @@ s32 cellGameDeleteGameData(const char* dirName)
 /* cellGameSetExitParam is implemented in cellGameExec.c with the correct
  * PS3 SDK signature (CellGameExecBootParam*). Not duplicated here. */
 
+#if defined(__SWITCH__) || defined(CELL_GAME_TEST_INSTALLED_SIZE)
+/* A single path buffer bounds the walk. Use metadata only: installed archives
+ * can be several GiB and this query runs on the startup thread. */
+static int add_content_bytes(char* path, size_t used, size_t capacity, u64* bytes)
+{
+    struct stat info;
+#ifdef __SWITCH__
+    /* Count what occupies the SD. The port wraps guest stat() to substitute
+     * a shorter movie during playback. SD files cannot be symlinks. */
+    if (_stat_r(_REENT, path, &info) != 0) return -1;
+#else
+    if (lstat(path, &info) != 0) return -1;
+#endif
+    if (S_ISREG(info.st_mode)) {
+        const u64 limit = (u64)INT32_MAX * 1024;
+        const u64 length = (u64)info.st_size;
+        *bytes += length < limit - *bytes ? length : limit - *bytes;
+        return 0;
+    }
+    if (!S_ISDIR(info.st_mode)) return 0;
+
+    DIR* dir = opendir(path);
+    if (!dir) return -1;
+    int status = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent* entry = readdir(dir);
+        if (!entry) {
+            status = errno ? -1 : 0;
+#ifdef __SWITCH__
+            /* devkitPro directory iterators may signal EOF with ENOENT. */
+            if (errno == ENOENT) status = 0;
+#endif
+            break;
+        }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        int n = snprintf(path + used, capacity - used, "/%s", entry->d_name);
+        if (n < 0 || (size_t)n >= capacity - used ||
+            add_content_bytes(path, used + (size_t)n, capacity, bytes) != 0) {
+            status = -1;
+            break;
+        }
+    }
+    path[used] = 0;
+    if (closedir(dir) != 0) status = -1;
+    return status;
+}
+#endif
+
 s32 cellGameGetSizeKB(s32* sizeKB)
 {
     printf("[cellGame] GetSizeKB()\n");
@@ -770,8 +825,23 @@ s32 cellGameGetSizeKB(s32* sizeKB)
     if (!sizeKB_ea)
         return CELL_GAME_ERROR_PARAM;
 
-    /* Report the content directory's size (guest addr; 0 for now). */
     vm_write32(sizeKB_ea, 0);
+#if defined(__SWITCH__) || defined(CELL_GAME_TEST_INSTALLED_SIZE)
+    if (!s_check_is_disc && s_check_dir[0]) {
+        if (!strcmp(s_check_dir, ".") || !strcmp(s_check_dir, "..") ||
+            strpbrk(s_check_dir, "/\\:") || strlen(s_check_dir) >= CELL_GAME_DIRNAME_SIZE)
+            return CELL_GAME_ERROR_PARAM;
+        char path[1024];
+        int n = snprintf(path, sizeof(path), "%s/%s", content_root(), s_check_dir);
+        u64 bytes = 0;
+        if (n < 0 || (size_t)n >= sizeof(path) ||
+            add_content_bytes(path, (size_t)n, sizeof(path), &bytes) != 0)
+            return CELL_GAME_ERROR_ACCESS_ERROR;
+        const u32 installed_kb = (u32)((bytes + 1023) / 1024);
+        vm_write32(sizeKB_ea, installed_kb);
+        printf("[cellGame] GetSizeKB('%s') -> %u KiB\n", s_check_dir, installed_kb);
+    }
+#endif
     return CELL_OK;
 }
 

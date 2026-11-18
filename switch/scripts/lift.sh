@@ -34,4 +34,5 @@ for f in natives/spu/job204_native.c natives/spu/edge223_native.c natives/spu/jo
     printf '%s\n' '/* native SPU rewrite, built like the lifted SPU TUs */' "#include \"$R/$f\"" > "$W/spu_recomp.c"
 done
 "$R/work/venv/bin/python" -I "$R/switch/scripts/lift_post.py" "$P/spu" || fail "the post check"
+"$R/work/venv/bin/python" -I "$R/switch/scripts/route_put_sites.py" "$P/recompiled"
 echo "== lift ready: next switch/build.sh compile"

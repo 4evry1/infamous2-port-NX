@@ -1,0 +1,32 @@
+--- a/main.cpp
++++ b/main.cpp
+@@ -120,6 +120,8 @@
+ void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+ #ifdef __SWITCH__
+ int      cellGcm_fifo_work_ready(void);
++void     cellGcm_route_enable(void);
++void     cellGcm_route_sleep(unsigned us, int ready);
+ #endif
+ unsigned cellGcm_flip_request_count(void);
+ int      cellGcm_drain_sema_blocked(void);
+@@ -276,6 +278,9 @@
+     { const char* e = getenv("PS3_FRAMECLOCK_US"); if (e && atoi(e) > 0) clock_us_env = atoi(e); }
+ #ifdef __SWITCH__
+     const char* ready_skip_env = getenv("PS3RECOMP_GCM_READY_SKIP");
++    const char* route_setting = getenv("PS3RECOMP_ROUTE_TIMING");
++    const bool route_timing = route_setting && !strcmp(route_setting, "1");
++    if (route_timing) cellGcm_route_enable();
+     const int skip_ready_sleep = !(ready_skip_env && *ready_skip_env == '0');
+ #endif
+     /* PS3_HOT_QOS=1: this thread walks the FIFO and encodes every draw; keep
+@@ -308,7 +313,9 @@
+              * plain Sleep. */
+             cellGcm_fifo_kick_wait((unsigned)((us + 999) / 1000));
+ #elif defined(__SWITCH__)
+-            if (!rsx_ok || !skip_ready_sleep || !cellGcm_fifo_work_ready())
++            if (route_timing)
++                cellGcm_route_sleep(us, rsx_ok && skip_ready_sleep && cellGcm_fifo_work_ready());
++            else if (!rsx_ok || !skip_ready_sleep || !cellGcm_fifo_work_ready())
+                 usleep((useconds_t)us);
+ #else
+             usleep((useconds_t)us);

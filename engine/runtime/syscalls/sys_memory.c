@@ -238,6 +238,24 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         memset(vm_to_host(alloc_addr), 0, size);    /* still committed: zero it as a fresh commit is */
         ps3_lim_add(&s_lim_mem_reused, (long)(size / 1024u));
     } else {
+#ifdef __SWITCH__
+        alloc_addr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
+        if (alloc_addr < g_sys_mem_bump_ptr || alloc_addr > SYS_MEM_ALLOC_END ||
+            size > SYS_MEM_ALLOC_END - alloc_addr) {
+            ps3_lim_full(&s_lim_mem_window, "sys_memory_allocate 0x%X -> ENOMEM (%u KB in use, %u KB freed)",
+                         size, s_total_allocated / 1024u, s_mem_free_bytes / 1024u);
+            bump_unlock();
+            return (int64_t)(int32_t)CELL_ENOMEM;
+        }
+        /* Keep reservation and commit serialized. A failed commit may leave
+         * host pages backed, but no guest allocation owns them until success.
+         * Retrying this address lets the VM reuse any partially backed pages. */
+        if (vm_commit(alloc_addr, size) != CELL_OK) {
+            bump_unlock();
+            return (int64_t)(int32_t)CELL_ENOMEM;
+        }
+        g_sys_mem_bump_ptr = alloc_addr + size;
+#else
         /* Align bump pointer */
         g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
 
@@ -250,6 +268,7 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         }
         alloc_addr = g_sys_mem_bump_ptr;
         g_sys_mem_bump_ptr += size;
+#endif
     }
     s_total_allocated += size;
 
@@ -263,12 +282,14 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 
     bump_unlock();
 
+#ifndef __SWITCH__
     /* Commit the pages (window is outside the pre-committed main region);
      * fresh commits are already zeroed by the OS */
     if (vm_commit(alloc_addr, size) != CELL_OK) {
         a->active = 0;
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
+#endif
 
     fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
 

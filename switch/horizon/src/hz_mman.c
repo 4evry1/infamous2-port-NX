@@ -23,11 +23,13 @@
 #include <malloc.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 enum {
     HZ_SLAB_BYTES = 0x200000,
+    HZ_BACKING_ALIGNMENT = 0x1000,
     HZ_MAX_WINDOWS = 4,
     HZ_MAX_SLABS = 8192,            /* 16 GiB of window address space in 2 MiB slabs */
     HZ_SMALL_MAX = 64
@@ -104,23 +106,52 @@ static hz_window *window_of(uintptr_t address)
             return &s_windows[i];
     return NULL;
 }
+static void slab_map_failure_regions(void *backing, void *alias)
+{
+    const uintptr_t addresses[] = {(uintptr_t)backing, (uintptr_t)backing + HZ_SLAB_BYTES - 1,
+                                   (uintptr_t)alias, (uintptr_t)alias + HZ_SLAB_BYTES - 1};
+    for (unsigned i = 0; i < 4; ++i) {
+        MemoryInfo memory = {0};
+        u32 page = 0;
+        const Result query = svcQueryMemory(&memory, &page, addresses[i]);
+        fprintf(stderr, "[hz-memory-map] endpoint=%u address=0x%llx query=0x%x region=0x%llx+0x%llx type=%u attr=0x%x perm=0x%x\n",
+                i, (unsigned long long)addresses[i], query, (unsigned long long)memory.addr,
+                (unsigned long long)memory.size, memory.type, memory.attr, memory.perm);
+    }
+}
+
 static bool slab_acquire(hz_window *w, uint32_t index)
 {
     void *backing, *alias;
     Result result = 0;
+    const char *stage = "commit_cap";
     if (s_committed_bytes + HZ_SLAB_BYTES > hz_mman_commit_cap) goto failed;
-    backing = memalign(HZ_SLAB_BYTES, HZ_SLAB_BYTES);
+    stage = "aligned_heap";
+    /* The mapping syscalls require page alignment. Slab alignment makes newlib
+     * request an extra 2 MiB contiguous span and fragments the shared heap. */
+    backing = memalign(HZ_BACKING_ALIGNMENT, HZ_SLAB_BYTES);
     if (!backing) goto failed;
     memset(backing, 0, HZ_SLAB_BYTES);
+    stage = "code_alias";
     virtmemLock();
     alias = virtmemFindCodeMemory(HZ_SLAB_BYTES, HZ_SLAB_BYTES);
-    if (alias) result = svcMapProcessCodeMemory(s_process, (u64)(uintptr_t)alias, (u64)(uintptr_t)backing, HZ_SLAB_BYTES);
+    if (alias) {
+        stage = "map_code";
+        result = svcMapProcessCodeMemory(s_process, (u64)(uintptr_t)alias, (u64)(uintptr_t)backing, HZ_SLAB_BYTES);
+    }
     virtmemUnlock();
-    if (!alias || R_FAILED(result)) { free(backing); goto failed; }
+    if (!alias || R_FAILED(result)) {
+        if (alias && hz_mman_stats[1] < 4) slab_map_failure_regions(backing, alias);
+        free(backing);
+        goto failed;
+    }
+    stage = "permission";
     result = svcSetProcessMemoryPermission(s_process, (u64)(uintptr_t)alias, HZ_SLAB_BYTES, Perm_Rw);
-    if (R_SUCCEEDED(result))
+    if (R_SUCCEEDED(result)) {
+        stage = "map_process";
         result = svcMapProcessMemory((void *)(w->base + (uintptr_t)index * HZ_SLAB_BYTES), s_process,
                                      (u64)(uintptr_t)alias, HZ_SLAB_BYTES);
+    }
     if (R_FAILED(result)) {
         svcUnmapProcessCodeMemory(s_process, (u64)(uintptr_t)alias, (u64)(uintptr_t)backing, HZ_SLAB_BYTES);
         free(backing);
@@ -134,6 +165,14 @@ static bool slab_acquire(hz_window *w, uint32_t index)
 failed:
     ++hz_mman_stats[1];
     hz_mman_stats[2] = result;
+    const uint64_t failures = hz_mman_stats[1];
+    if (failures <= 4 || !(failures & (failures - 1))) {
+        const struct mallinfo heap = mallinfo();
+        fprintf(stderr, "[hz-memory] slab failure #%llu stage=%s result=0x%x slab=%u committed=%llu cap=%llu heap_used=%zu heap_free=%zu heap_top=%zu\n",
+                (unsigned long long)failures, stage, result, index,
+                (unsigned long long)s_committed_bytes, (unsigned long long)hz_mman_commit_cap,
+                heap.uordblks, heap.fordblks, heap.keepcost);
+    }
     return false;
 }
 /* Put memory behind [address, address + length) of a window. Already committed slabs stay as

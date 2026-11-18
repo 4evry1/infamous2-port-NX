@@ -86,6 +86,9 @@ static struct {
     const eng_vp_memo* vp; const eng_fp_memo* fp;
     rsx_vertex_layout_plan layout;
     int vpc_full; u32 vpc_lo, vpc_n;
+#ifdef __SWITCH__
+    rsx_constant_plan vpc_sparse;
+#endif
     /* RS */
     rsx_be_render_state rs;
     /* SURF */
@@ -474,6 +477,9 @@ static void dl_prog_restore(rsx_vertex_layout_plan* layout)
     eng_guest_programs_carry(s_dl.vp, s_dl.fp);
     *layout = s_dl.layout;
     g.vpc_full = s_dl.vpc_full; g.vpc_lo = s_dl.vpc_lo; g.vpc_n = s_dl.vpc_n;
+#ifdef __SWITCH__
+    g.vpc_sparse = s_dl.vpc_sparse;
+#endif
 }
 static void dl_prog_note(const rsx_vertex_layout_plan* layout, int check)
 {
@@ -485,11 +491,17 @@ static void dl_prog_note(const rsx_vertex_layout_plan* layout, int check)
              layout->count != s_dl.layout.count || memcmp(layout->attrs, s_dl.layout.attrs, sizeof layout->attrs) ||
              memcmp(layout->slot_by_attr, s_dl.layout.slot_by_attr, sizeof layout->slot_by_attr), "layout");
         DL_W(g.vpc_full != s_dl.vpc_full || g.vpc_lo != s_dl.vpc_lo || g.vpc_n != s_dl.vpc_n, "vp-constant-range");
+#ifdef __SWITCH__
+        DL_W(!rsx_constant_plan_equal(&g.vpc_sparse, &s_dl.vpc_sparse), "vp-constant-spans");
+#endif
         if (wp) dl_vfail("programs", w);
     }
     s_dl.vp = s_gp_vp; s_dl.fp = s_gp_fp;
     s_dl.layout = *layout;
     s_dl.vpc_full = g.vpc_full; s_dl.vpc_lo = g.vpc_lo; s_dl.vpc_n = g.vpc_n;
+#ifdef __SWITCH__
+    s_dl.vpc_sparse = g.vpc_sparse;
+#endif
 }
 
 static void dl_rs_note(const rsx_be_render_state* rs, int check)
@@ -584,12 +596,12 @@ static void dl_consts_take(void)
     eng_vc_entry* pv = d->pv;
     const u32 base_index = eng_idx_base();   /* (minimap2) the packets' (dl_consts_ok: one, the last draw's) */
     s_ic_cur = e; s_ic_hit = 1; s_ic_ranged = 0; s_ic_cur_content = e->wt_content;
-    ENG_CACHE_PREDICT(s_ic, s_ic_prev, e);
+    ENG_IC_PREDICT(e);
     ds_ic_wt_clean++;
     dc.n_refs = e->span; dc.n_source_refs = e->n_src; dc.refs_remapped = 1; dc.n_cuts = 0;
     dc.layout = s_dl.layout;
     dc.consecutive = 1;
-    ENG_CACHE_PREDICT(s_vc, s_vc_prev, pv);
+    ENG_VC_PREDICT(pv);
     dc.refs[0].vertex_id = e->lo; dc.refs[0].base_index = base_index;
     dc.refs_lazy = e->span > 1u; dc.lazy_base = base_index;
     dc.plan_stale = 1;

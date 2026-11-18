@@ -86,6 +86,15 @@ int main(void)
             const unsigned c = (unsigned)strtoul(idx, NULL, 10);
             CHECK(!u.relative ? (u.lo <= u.hi && c >= u.lo && c <= u.hi) : 1,
                   "program %d: shader reads vp_c[%u] outside [%u, %u]", n, c, u.lo, u.hi);
+#ifdef __SWITCH__
+            if (u.sparse.count) {
+                int covered = 0;
+                for (u32 s = 0; s < u.sparse.count; s++)
+                    covered |= c >= u.sparse.spans[s].first &&
+                               c - u.sparse.spans[s].first < u.sparse.spans[s].count;
+                CHECK(covered, "program %d: sparse plan misses shader read c%u", n, c);
+            }
+#endif
         }
         /* One-way: a relative read the analysis misses would leave rows
          * unwritten. Reporting relative for a source the opcode never reads

@@ -41,7 +41,7 @@
 enum {
     TQ_WRAP = 0, TQ_BARRIER, TQ_CLEARC, TQ_CLEARDS, TQ_CI2B, TQ_CB2I, TQ_BEGINRP, TQ_ENDRP,
     TQ_BINDPIPE, TQ_BINDVB, TQ_BINDDS, TQ_PUSHC, TQ_VIEWPORT, TQ_SCISSOR, TQ_DRAW, TQ_SREF,
-    TQ_BINDIB, TQ_DRAWIDX, TQ_DBIAS, TQ_BLIT, TQ_COPYIMG, TQ_RESETQ, TQ_TIMESTAMP,
+    TQ_BINDIB, TQ_DRAWIDX, TQ_DBIAS, TQ_BLIT, TQ_COPYIMG, TQ_RESETQ, TQ_TIMESTAMP, TQ_COPY_QUERY,
     TQ_BEGINCB, TQ_ENDCB, TQ_RESETCB, TQ_UPDDS, TQ_PRESENT, TQ_BCALL, TQ_NOPS
 };
 
@@ -84,7 +84,7 @@ static void vk_present_exec(const tq_present_rec* r);    /* rsx_vulkan_backend.c
     X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdSetViewport) X(vkCmdSetScissor) \
     X(vkCmdDraw) X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCmdSetDepthBias) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdResetQueryPool) \
-    X(vkCmdWriteTimestamp) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
+    X(vkCmdWriteTimestamp) X(vkCmdCopyQueryPoolResults) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkResetCommandBuffer) X(vkQueueSubmit) X(vkUpdateDescriptorSets)     X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyBuffer) X(vkFreeMemory)     X(vkDestroyFramebuffer) X(vkDestroySampler) X(vkDestroyPipeline) X(vkDestroyRenderPass)     X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkDestroyQueryPool)
 #define TQ_DECLARE(name) static PFN_##name r##name;
 TQ_FNS(TQ_DECLARE)
@@ -278,6 +278,14 @@ typedef struct { tq_hdr h; VkBuffer buf; VkDeviceSize off; VkIndexType type; } t
 typedef struct { tq_hdr h; float c, cl, s; } tq_dbias;
 typedef struct { tq_hdr h; VkImage src; VkImageLayout sl; VkImage dst; VkImageLayout dl; u32 n; VkFilter f; } tq_imgcopy;
 typedef struct { tq_hdr h; VkQueryPool pool; u32 a, b; VkPipelineStageFlagBits st; } tq_query;
+typedef struct {
+    tq_hdr h;
+    VkQueryPool pool;
+    VkBuffer dst;
+    VkDeviceSize offset, stride;
+    u32 first, count;
+    VkQueryResultFlags flags;
+} tq_query_copy;
 typedef struct { tq_hdr h; VkCommandBufferBeginInfo bi; } tq_begincb;
 typedef struct { tq_hdr h; VkDevice dev; u32 nw; } tq_updds;   /* VkWriteDescriptorSet[nw], then each one's infos */
 /* (rsx-par) PS3RECOMP_VK_BT (vk_threaded_be.h): one backend entry point the
@@ -347,6 +355,8 @@ static void tq_exec(const u8* p)
         rvkCmdBlitImage(cb, r->src, r->sl, r->dst, r->dl, r->n, (const VkImageBlit*)(r + 1), r->f); break; }
     case TQ_COPYIMG: { const tq_imgcopy* r = (const tq_imgcopy*)p;
         rvkCmdCopyImage(cb, r->src, r->sl, r->dst, r->dl, r->n, (const VkImageCopy*)(r + 1)); break; }
+    case TQ_COPY_QUERY: { const tq_query_copy* r = (const tq_query_copy*)p;
+        rvkCmdCopyQueryPoolResults(cb, r->pool, r->first, r->count, r->dst, r->offset, r->stride, r->flags); break; }
     case TQ_RESETQ: { const tq_query* r = (const tq_query*)p; rvkCmdResetQueryPool(cb, r->pool, r->a, r->b); break; }
     case TQ_TIMESTAMP: { const tq_query* r = (const tq_query*)p; rvkCmdWriteTimestamp(cb, r->st, r->pool, r->a); break; }
     case TQ_BEGINCB: { const tq_begincb* r = (const tq_begincb*)p;
@@ -556,6 +566,16 @@ static void VKAPI_CALL tq_vkCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImag
     if (!p) { rvkCmdCopyImage(cb, src, sl, dst, dl, n, rg); return; }
     tq_imgcopy* r = (tq_imgcopy*)p; r->src = src; r->sl = sl; r->dst = dst; r->dl = dl; r->n = n; r->f = VK_FILTER_NEAREST;
     memcpy(r + 1, rg, TQ_ARR(*rg, n));
+    tq_commit(p);
+}
+static void VKAPI_CALL tq_vkCmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool pool, u32 first, u32 count,
+    VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride, VkQueryResultFlags flags)
+{
+    u8* p = tq_alloc(TQ_COPY_QUERY, sizeof(tq_query_copy), cb);
+    if (!p) { rvkCmdCopyQueryPoolResults(cb, pool, first, count, dst, offset, stride, flags); return; }
+    tq_query_copy* r = (tq_query_copy*)p;
+    r->pool = pool; r->first = first; r->count = count; r->dst = dst;
+    r->offset = offset; r->stride = stride; r->flags = flags;
     tq_commit(p);
 }
 static void VKAPI_CALL tq_vkCmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, u32 first, u32 n)

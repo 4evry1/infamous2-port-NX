@@ -13,14 +13,25 @@ E="$R/engine"
 [ -f "$B/build.ninja" ] || { echo "== FAILED: no work/build-switch: run switch/build.sh compile first"; exit 1; }
 mkdir -p "$O"
 objs=""
+lsfg_flags=""
+if [ -n "${SWITCH_LSFG_SDK:-}" ]; then lsfg_flags="-DHZ_HAS_LSFG=1"; fi
+
 for src in "$S"/horizon/src/*.c; do
     obj="$O/$(basename "$src" .c).o"
     "$CC" -c -O2 -g -std=gnu17 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE \
-        -ffunction-sections -D__SWITCH__ -isystem "$S/horizon/include" -isystem $DKP/libnx/include \
-        -isystem $DKP/portlibs/switch/include -I "$E/runtime/spu" -I "$E/runtime/ppu" \
+        -ffunction-sections -D__SWITCH__ $lsfg_flags -isystem "$S/horizon/include" -isystem $DKP/libnx/include \
+        -isystem $DKP/portlibs/switch/include -I "$E/libs/video" -I "$E/runtime/spu" -I "$E/runtime/ppu" \
         -o "$obj" "$src" || { echo "== FAILED: $src"; exit 1; }
     objs="$objs $obj"
 done
+if [ -n "${SWITCH_LSFG_SDK:-}" ]; then
+    "$DKP/devkitA64/bin/aarch64-none-elf-g++" -c -O2 -g -std=gnu++23 -Wall -Wextra \
+        -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE -ffunction-sections -D__SWITCH__ \
+        -isystem "$S/horizon/include" -isystem "$DKP/libnx/include" \
+        -isystem "$DKP/portlibs/switch/include" -isystem "$SWITCH_LSFG_SDK/include" \
+        -I "$E/libs/video" -o "$O/lsfg_processor.o" "$S/lsfg/lsfg_processor.cpp" || exit 1
+    objs="$objs $O/lsfg_processor.o $SWITCH_LSFG_SDK/lib/liblsfg-vk.a"
+fi
 echo "== Horizon layer compiled:$(echo $objs | wc -w) objects"
 # Mesa's libvulkan.a carries its own munmap, posix_memalign and syscall, which collide with the Horizon layer's.
 # A private copy with those three weakened lets the layer's versions serve both the engine and the driver.
