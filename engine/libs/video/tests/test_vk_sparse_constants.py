@@ -47,7 +47,7 @@ def main():
             command += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
         command += [str(video / "tests/test_vk_sparse_constants.c"), "-o", str(binary)]
         subprocess.run(command, check=True)
-        for reuse, byte_reuse in (("1", "1"), ("1", "0"), ("0", "1")):
+        for reuse, byte_reuse in (("1", "unset"), ("1", "1"), ("1", "0"), ("0", "1")):
             subprocess.run([str(binary), reuse, byte_reuse], check=True)
 
 

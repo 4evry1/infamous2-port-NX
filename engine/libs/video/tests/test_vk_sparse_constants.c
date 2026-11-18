@@ -75,7 +75,10 @@ static VkDeviceSize draw(u32 slot, const rsx_constant_plan* p)
 int main(int argc, char** argv)
 {
     assert(argc == 3);
-    assert(!setenv("PS3RECOMP_VK_CONST_BYTE_REUSE", argv[2], 1));
+    if (!strcmp(argv[2], "unset"))
+        assert(!unsetenv("PS3RECOMP_VK_CONST_BYTE_REUSE"));
+    else
+        assert(!setenv("PS3RECOMP_VK_CONST_BYTE_REUSE", argv[2], 1));
     assert(!setenv("PS3RECOMP_VK_CONST_REUSE", argv[1], 1));
     assert(!setenv("PS3RECOMP_VK_SPARSE_VERIFY", "1", 1));
     assert(!setenv("PS3RECOMP_VK_CONSTANT_TIMING", "1", 1));
@@ -117,7 +120,7 @@ int main(int argc, char** argv)
     draw(6, &a); /* changed interval with the same sparse rows and generation */
 #endif
 #ifdef __SWITCH__
-    if (argv[1][0] != '0' && argv[2][0] != '0') {
+    if (argv[1][0] != '0' && !strcmp(argv[2], "1")) {
         ++s_dset_gen;
         bind_plan(&a, 100);
         const VkDeviceSize old_vs = draw(0, &a), old_ps = s_cm.ps_abs;

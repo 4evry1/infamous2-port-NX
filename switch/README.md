@@ -9,7 +9,7 @@ Nothing of the game is in this repository: you build it from **your own copy**, 
 
 ## Status
 
-**hz-0.115** builds two launchers for Atmosphère title takeover. The opening, bridge reveal and early city are playable. Heavy scenes still have uneven frame pacing and occasional audio crackle. The first appearance of an effect can pause while shaders compile.
+**hz-0.116** builds two launchers for Atmosphère title takeover. The opening, bridge reveal and early city are playable. Heavy scenes still have uneven frame pacing and occasional audio crackle. The first appearance of an effect can pause while shaders compile.
 
 A 20-second hardware capture on hz-0.111 measured **8.20 game FPS** in a stationary tower view with 6,720 draws per frame. The median frame took 119.9 ms. The render thread spent about 91 ms per frame processing graphics commands. This run used a 1785 MHz CPU and 960 × 540 internal rendering. The FPS figure counts frames produced by the game and excludes interpolated frames.
 
@@ -54,7 +54,9 @@ The build writes both launchers to `work/build-switch/`. To update an existing i
 
 Open the homebrew menu through a game for title takeover. Choose **inFAMOUS 2 port** for a diagnostic run or **inFAMOUS 2 port (no logs)** for ordinary play. The logged launcher buffers routine diagnostics in RAM and writes them in batches. Both launchers retain immediate crash reporting. Settings are read from `switch/infamous2-port/env.txt` at startup.
 
-The hz-0.115 candidate adds the build version and two FPS readings to the upper-left corner in both launchers. The overlay rendered in a host Vulkan test. Visibility on Switch hardware is awaiting confirmation. **BASE** counts completed guest frames. **TOTAL** counts frames accepted by the Switch window, including LSFG output. Both use the same elapsed-time window and refresh about once a second. Set `HZ_FPS_HUD=0` in `env.txt` to hide the display.
+Both launchers show the build version and two FPS readings in the upper-left corner. The HUD was verified during hz-0.115 gameplay on Switch. **BASE** counts completed guest frames. **TOTAL** counts frames accepted by the Switch window, including LSFG output. Both use the same elapsed-time window and refresh about once a second. Set `HZ_FPS_HUD=0` in `env.txt` to hide the display.
+
+The hz-0.116 candidate uses version-based constant reuse by default. To also compare the previous upload byte by byte when versions differ, set `PS3RECOMP_VK_CONST_BYTE_REUSE=1` and relaunch.
 
 ### Resolution and optional frame generation
 

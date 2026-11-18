@@ -7216,8 +7216,10 @@ static int vk_creuse_on(void)
 #ifdef __SWITCH__
         const char* bytes = getenv("PS3RECOMP_VK_CONST_BYTE_REUSE");
         const char* stats = getenv("PS3RECOMP_ROUTE_TIMING");
-        s_constant_byte_reuse = !(bytes && bytes[0] == '0');
-        s_constant_byte_stats = stats && stats[0] == '1';
+        /* The tower trace found no extra reuse for the cost of reading the
+         * mapped upload arena. Keep the byte fallback available for A/B. */
+        s_constant_byte_reuse = bytes && bytes[0] == '1';
+        s_constant_byte_stats = s_constant_byte_reuse && stats && stats[0] == '1';
 #endif
     }
     return s_creuse_on;

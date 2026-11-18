@@ -1,2 +1,2 @@
 #pragma once
-#define HZ_VERSION "hz-0.115"
+#define HZ_VERSION "hz-0.116"

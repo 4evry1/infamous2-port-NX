@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert info["wake_to_first_drain_cpu_ms"]["median"]==0.0004
     assert info["wake_phase_wall_ms_total"]["present"]==0.006
     assert info["wake_phase_cpu_ms_total"]["present"]==0.0001
-    for version in ("hz-0.108", "hz-0.109", "hz-0.110", "hz-0.111", "hz-0.112", "hz-0.113", "hz-0.114", "hz-0.115"):
+    for version in ("hz-0.108", "hz-0.109", "hz-0.110", "hz-0.111", "hz-0.112", "hz-0.113", "hz-0.114", "hz-0.115", "hz-0.116"):
         path.write_text("\n".join(rows).replace("# hz-0.107 ", f"# {version} ")+"\n")
         assert json.loads(subprocess.check_output(cmd,text=True)) == info
     path.write_text("\n".join(rows[:-1])+"\n")
