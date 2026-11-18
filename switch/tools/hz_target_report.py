@@ -3,6 +3,7 @@ import argparse
 import bisect
 import collections
 import json
+import re
 import statistics
 import subprocess
 from pathlib import Path
@@ -14,7 +15,9 @@ def main():
     parser.add_argument("--nm", default="nm")
     args = parser.parse_args()
     lines = args.capture.read_text().splitlines()
-    if not lines or not lines[0].startswith(("# hz-0.107 ", "# hz-0.108 ", "# hz-0.109 ", "# hz-0.110 ", "# hz-0.111 ", "# hz-0.112 ", "# hz-0.113 ")):
+    # The trace format is independent of the build that recorded it.
+    version = re.match(r"^# hz-0\.(\d{1,6}) ", lines[0]) if lines else None
+    if not version or int(version[1]) < 107:
         parser.error("expected a supported render-thread target capture")
     meta = dict(field.split("=") for field in lines[0].split()[2:])
     begin, end = int(meta["begin"]), int(meta["end"])

@@ -57,8 +57,8 @@ if [ ! -f "$B/Infamous2Recomp.elf" ] || [ -s "$B/undefined.txt" ]; then
     echo "== FAILED: link (see work/build-switch/link.log and undefined.txt)"; exit 1
 fi
 # With a NACP and an icon: launchers that build forwarders refuse an NRO without them. The version shown in the
-# homebrew menu is the one compiled in (HZ_VERSION in hz_entry.c).
-VERSION=$(sed -n 's/^#define HZ_VERSION "\(.*\)"/\1/p' "$S/horizon/src/hz_entry.c")
+# homebrew menu is the one compiled in (HZ_VERSION in hz_build.h).
+VERSION=$(sed -n 's/^#define HZ_VERSION "\(.*\)"/\1/p' "$S/horizon/include/hz_build.h")
 $DKP/tools/bin/nacptool --create "inFAMOUS 2 port" "ps3recomp / Horizon layer" "${VERSION:-hz-unknown}" "$B/Infamous2Recomp.nacp" \
     && $DKP/tools/bin/elf2nro "$B/Infamous2Recomp.elf" "$B/Infamous2Recomp.nro" \
         --nacp="$B/Infamous2Recomp.nacp" --icon=$DKP/libnx/default_icon.jpg || exit 1

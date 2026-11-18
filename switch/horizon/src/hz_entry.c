@@ -24,7 +24,8 @@
 #include <unistd.h>
 
 #define HZ_APP "sdmc:/switch/infamous2-port"
-#define HZ_VERSION "hz-0.114"
+#include <hz_build.h>
+#include <hz_fps_hud.h>
 
 int __real_main(int argc, char **argv);
 int __real_pthread_attr_setstacksize(pthread_attr_t *attr, size_t size);
@@ -168,8 +169,15 @@ static uint64_t hz_presents;
 Result __real_nwindowQueueBuffer(NWindow *nw, s32 slot, const NvMultiFence *fence);
 Result __wrap_nwindowQueueBuffer(NWindow *nw, s32 slot, const NvMultiFence *fence)
 {
-    __atomic_fetch_add(&hz_presents, 1, __ATOMIC_RELAXED);
-    return __real_nwindowQueueBuffer(nw, slot, fence);
+    Result rc = __real_nwindowQueueBuffer(nw, slot, fence);
+    if (R_SUCCEEDED(rc) && nw == nwindowGetDefault())
+        __atomic_fetch_add(&hz_presents, 1, __ATOMIC_RELAXED);
+    return rc;
+}
+
+uint64_t hz_output_frame_count(void)
+{
+    return __atomic_load_n(&hz_presents, __ATOMIC_RELAXED);
 }
 static unsigned s_profile_at[8];
 static int s_profile_at_count;

@@ -676,6 +676,7 @@ engine/libs/video/vk_postfx.c
 engine/libs/video/vk_postfx.h
 engine/libs/video/vk_shadow_queries.inc
 engine/libs/video/vk_staging_copy.h
+engine/libs/video/vk_switch_fps.inc
 engine/libs/video/vk_threaded_be.h
 engine/libs/video/vk_threaded_rec.h
 engine/libs/video/vk_vram.inc

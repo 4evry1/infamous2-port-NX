@@ -3776,12 +3776,14 @@ static int vk_env_on(const char* name)
 }
 
 #ifdef __SWITCH__
+#include "vk_switch_fps.inc"
 static void vk_processor_log(const char* message) { VK_LOG("%s\n", message); }
 static void vk_processor_drop(void)
 {
     rsx_present_processor_destroy(s_vk.present_processor);
     s_vk.present_processor = NULL;
     s_vk.present_processor_serial = 0;
+    vk_fps_hud_drop();
 }
 #endif
 
@@ -4302,10 +4304,11 @@ static int vk_create_swapchain(void)
     s_vk.sc_extent = ext;
     s_vk.sc_count = n;
 #ifdef __SWITCH__
+    VkExtent2D hud_corner = vk_fps_hud_init(fmt.format, ext, sci.imageUsage);
     if (s_vk.processor_requested && s_vk.processor_formats && s_vk.processor_compute) {
         const rsx_present_device device = {s_vk.instance, s_vk.phys, s_vk.device, s_vk.queue,
             s_vk.queue_family, pvkGetInstanceProcAddr, pvkGetDeviceProcAddr, vk_processor_log};
-        const rsx_present_swapchain swapchain = {sc, ext, fmt.format, sci.imageUsage, mode, s_vk.sc_images, n};
+        const rsx_present_swapchain swapchain = {sc, ext, fmt.format, sci.imageUsage, mode, s_vk.sc_images, n, hud_corner};
         s_vk.present_processor = rsx_present_processor_create(&device, &swapchain);
     } else if (s_vk.processor_requested) {
         VK_LOG("[LSFG] disabled: required storage-image formats or compute queue unavailable\n");
@@ -4512,6 +4515,20 @@ static void vk_rdoc_poll(void)
 #endif
 
 /* Blit the offscreen target into the next swapchain image and present it. */
+/* A drawn overlay owns the final transition to PRESENT_SRC. */
+static int vk_draw_window_overlay(VkCommandBuffer cmd, u32 idx)
+{
+    if (g_vk_overlay_active &&
+        vk_overlay_draw(cmd, idx, s_vk.sc_images[idx], s_vk.sc_extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT))
+        return 1;
+#ifdef __SWITCH__
+    return vk_fps_hud_record(cmd, idx);
+#else
+    return 0;
+#endif
+}
+
 static void vk_present_window_body(void);
 /* (freeze) outside the async-present block below: vk_present_window uses them on every path, and builds
  * without the async present (VK_TQ_NO_ASYNC_PRESENT, e.g. Linux) did not see them (v0.5.4 Linux build error) */
@@ -4601,9 +4618,7 @@ static void vk_present_finish(VkCommandBuffer cmd, VkFence fence, VkSemaphore ac
         b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         g_vk_overlay_on_worker = t_tq_worker;
-        const int ov = g_vk_overlay_active &&
-            vk_overlay_draw(cmd, idx, s_vk.sc_images[idx], s_vk.sc_extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const int ov = vk_draw_window_overlay(cmd, idx);
         g_vk_overlay_on_worker = 0;
         if (!ov)
             pvkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -4792,9 +4807,7 @@ static void vk_present_window_body(void)
     b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     /* [overlay] the HUD / menu on top (vk_overlay.cpp): when it draws, its render
      * pass leaves the image in PRESENT_SRC itself */
-    if (!(g_vk_overlay_active &&
-          vk_overlay_draw(s_vk.cmd, idx, s_vk.sc_images[idx], s_vk.sc_extent, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT)))
+    if (!vk_draw_window_overlay(s_vk.cmd, idx))
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                               0, 0, NULL, 0, NULL, 1, &b);
     vk_gprof_stamp(GP_BLIT, s_vk.sc_extent.width, s_vk.sc_extent.height);
@@ -9528,21 +9541,14 @@ static VkRenderPass vk_pass_render_pass(VkRenderPass* rp, VkFormat fmt, u32 n)
     return *rp;
 }
 
-/* The full-screen pipeline of pass `which`, built on first use; a failure is
- * logged once and not retried (the engine then falls back, as with Metal's
- * nil pipeline state). */
-static VkPipeline vk_pass_pipeline(u32 which, const char* glsl, const char* what, VkRenderPass rp, u32 n_att)
+static VkResult vk_fullscreen_pipeline(VkShaderModule vs, VkShaderModule fs, VkPipelineLayout layout,
+                                       VkRenderPass rp, u32 n_att, VkPipeline *out)
 {
-    if (s_lp.pipe[which] || s_lp.failed[which] || !rp) return s_lp.pipe[which];
-    s_lp.failed[which] = 1;
-    if (!s_lp.fs[which] &&
-        !(s_lp.fs[which] = vk_pass_module(glsl, RSX_SHADER_STAGE_FRAGMENT, what)))
-        return VK_NULL_HANDLE;
     VkPipelineShaderStageCreateInfo st[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = s_lp.vs, .pName = "main" },
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = s_lp.fs[which], .pName = "main" } };
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" } };
     VkPipelineVertexInputStateCreateInfo vi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia = {
@@ -9571,8 +9577,21 @@ static VkPipeline vk_pass_pipeline(u32 which, const char* glsl, const char* what
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pColorBlendState = &cb, .pDynamicState = &dy,
-        .layout = s_lp.pipe_layout, .renderPass = rp, .subpass = 0 };
-    if (vk_sc_create_pipeline(&gci, &s_lp.pipe[which], 3) != VK_SUCCESS) {
+        .layout = layout, .renderPass = rp, .subpass = 0 };
+    return vk_sc_create_pipeline(&gci, out, 3);
+}
+
+/* The full-screen pipeline of pass `which`, built on first use; a failure is
+ * logged once and not retried (the engine then falls back, as with Metal's
+ * nil pipeline state). */
+static VkPipeline vk_pass_pipeline(u32 which, const char* glsl, const char* what, VkRenderPass rp, u32 n_att)
+{
+    if (s_lp.pipe[which] || s_lp.failed[which] || !rp) return s_lp.pipe[which];
+    s_lp.failed[which] = 1;
+    if (!s_lp.fs[which] &&
+        !(s_lp.fs[which] = vk_pass_module(glsl, RSX_SHADER_STAGE_FRAGMENT, what)))
+        return VK_NULL_HANDLE;
+    if (vk_fullscreen_pipeline(s_lp.vs, s_lp.fs[which], s_lp.pipe_layout, rp, n_att, &s_lp.pipe[which]) != VK_SUCCESS) {
         VK_LOG("engine: %s pipeline failed\n", what);
         s_lp.pipe[which] = VK_NULL_HANDLE;
         return VK_NULL_HANDLE;

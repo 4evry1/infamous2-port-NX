@@ -183,8 +183,8 @@ struct FrameSlot {
 class BackendConnection {
  public:
   BackendConnection(lsfgvk::backend::Instance& instance, VkDevice device, VkSwapchainKHR swapchain,
-                    VkExtent2D extent)
-      : swapchain_(swapchain), extent_(extent), instance_(instance) {
+                    VkExtent2D extent, VkExtent2D hud_corner)
+      : swapchain_(swapchain), extent_(extent), hud_corner_(hud_corner), instance_(instance) {
     context_ = &instance_.openLocalContext(extent.width, extent.height, false, 1.0f / kFlowScale,
                                            true, kGeneratedFrameCount);
     const vk::Vulkan& vulkan_instance = instance_.vulkan();
@@ -206,6 +206,7 @@ class BackendConnection {
   lsfgvk::backend::Context& context() { return *context_; }
   VkSwapchainKHR swapchain() const { return swapchain_; }
   VkExtent2D extent() const { return extent_; }
+  VkExtent2D hud_corner() const { return hud_corner_; }
   const std::vector<VkImage>& images() const { return images_; }
 
   VkImage source_image(size_t index) const { return instance_.sourceImage(*context_, index); }
@@ -230,6 +231,7 @@ class BackendConnection {
  private:
   VkSwapchainKHR swapchain_;
   VkExtent2D extent_;
+  VkExtent2D hud_corner_;
   lsfgvk::backend::Instance& instance_;
   lsfgvk::backend::Context* context_ = nullptr;
   std::vector<VkImage> images_;
@@ -475,7 +477,7 @@ bool LsfgProcessor::ConfigureConnection(const Description& description) {
           borrowed, std::filesystem::path(context_.options.shader_dll_path), false);
       connection_ = std::make_unique<BackendConnection>(*backend_, context_.handles.device,
                                                         description.swapchain,
-                                                        description.swapchain_extent);
+                                                        description.swapchain_extent, description.hud_corner);
       for (size_t index = 0; index < kFrameSlotCount; ++index) {
         slots_.push_back(std::make_unique<FrameSlot>(backend_->vulkan(), fail_fatally_));
       }
@@ -776,6 +778,20 @@ VkResult LsfgProcessor::SubmitCapture(FrameSlot& slot, uint32_t image_index,
                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
          ImageBarrier(swapchain_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
+    // Keep the text from the real frame sharp when the numeric values change.
+    const VkExtent2D corner = connection_->hud_corner();
+    if (corner.width && corner.height) {
+      commands.blitImage(vulkan_instance,
+          {ImageBarrier(source, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+           ImageBarrier(swapchain_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)},
+          {source, swapchain_image}, corner,
+          {ImageBarrier(source, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+           ImageBarrier(swapchain_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)});
+    }
   }
   commands.end(vulkan_instance);
 
@@ -981,7 +997,7 @@ extern "C" rsx_present_processor *rsx_present_processor_create(
         const std::vector<VkImage> images(swapchain->images, swapchain->images + swapchain->image_count);
         rsx::lsfg::Description description{swapchain->swapchain, swapchain->extent, swapchain->format,
             swapchain->usage, device->queue_family,
-            swapchain->mode == VK_PRESENT_MODE_FIFO_KHR || swapchain->mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR, &images};
+            swapchain->mode == VK_PRESENT_MODE_FIFO_KHR || swapchain->mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR, &images, swapchain->hud_corner};
         if (!processor->implementation->Configure(description)) return nullptr;
         return processor.release();
     } catch (const std::exception &) {

@@ -25,6 +25,7 @@ typedef struct rsx_present_swapchain {
     VkPresentModeKHR mode;
     const VkImage* images;
     uint32_t image_count;
+    VkExtent2D hud_corner; /* top-left pixels to preserve on interpolated frames */
 } rsx_present_swapchain;
 
 /* Platform composition selects the implementation and reads startup settings. */

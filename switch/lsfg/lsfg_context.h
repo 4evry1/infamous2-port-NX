@@ -78,5 +78,6 @@ struct Description {
   uint32_t present_queue_family;
   bool fifo_presentation;
   const std::vector<VkImage>* swapchain_images;
+  VkExtent2D hud_corner;
 };
 } // namespace rsx::lsfg
